@@ -1,0 +1,22 @@
+[project]
+name = "orbit"
+version = "0.1.0"
+description = "Supervised Machine-Learning Phenotyping for multiplex pathology images."
+authors = [{name = "Michael Fotheringham"}]
+requires-python = ">=3.10"
+
+dependencies = [
+    "numpy",
+    "pandas",
+    "scikit-learn",
+    "joblib",
+    "tifffile",
+    "scikit-image",
+    "matplotlib",
+    "napari",
+    "qtpy",
+    "pyside6"
+]
+
+[project.scripts]
+orbit = "orbit.app:main"
