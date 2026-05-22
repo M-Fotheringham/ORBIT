@@ -56,6 +56,8 @@ pip install -e .
 
 ```
 
+## Making Modifications
+
 *Before developing new features, create a branch*
 
 ```bash
@@ -64,4 +66,16 @@ git checkout -b feature/your-new-feature
 Example:
 ```bash
 git checkout -b feature/load_segmentation
+```
+
+*Test your changes in the app:*
+```bash
+python -m orbit.app
+```
+
+*Push your branch changes for review:*
+```bash
+git add .
+git commit -m "single-line description"
+git push
 ```
