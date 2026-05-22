@@ -15,7 +15,10 @@ dependencies = [
     "matplotlib",
     "napari",
     "qtpy",
-    "pyside6"
+    "pyside6",
+    "qptifffile",
+    "tifffile",
+    "PySide6"
 ]
 
 [project.scripts]

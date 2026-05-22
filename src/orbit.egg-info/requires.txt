@@ -1,0 +1,13 @@
+numpy
+pandas
+scikit-learn
+joblib
+tifffile
+scikit-image
+matplotlib
+napari
+qtpy
+pyside6
+qptifffile
+tifffile
+PySide6

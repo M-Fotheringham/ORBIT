@@ -1,0 +1,19 @@
+Metadata-Version: 2.4
+Name: orbit
+Version: 0.1.0
+Summary: Supervised Machine-Learning Phenotyping for multiplex pathology images.
+Author: Michael Fotheringham
+Requires-Python: >=3.10
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: scikit-learn
+Requires-Dist: joblib
+Requires-Dist: tifffile
+Requires-Dist: scikit-image
+Requires-Dist: matplotlib
+Requires-Dist: napari
+Requires-Dist: qtpy
+Requires-Dist: pyside6
+Requires-Dist: qptifffile
+Requires-Dist: tifffile
+Requires-Dist: PySide6
