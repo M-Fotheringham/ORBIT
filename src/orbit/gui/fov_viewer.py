@@ -135,6 +135,9 @@ class OrbitFOVViewer(QWidget):
         self.image_path = None
         self.project_path = None
         self.annotations = {}
+        self.training_navigation_indices = {"positive": -1, "negative": -1}
+        self.loaded_images = []
+        self.current_image_index = -1
 
         # Segmentation data remain in whole-slide pixel coordinates. Only the
         # current FOV is cropped and converted to a boundary overlay.
@@ -161,7 +164,7 @@ class OrbitFOVViewer(QWidget):
         self.spinner.setMaximumHeight(8)
         self.spinner.hide()
 
-        self.open_button = QPushButton("Open")
+        self.open_button = QPushButton("Add Image")
         self.open_button.clicked.connect(self.open_qptiff)
         self.load_segmentation_button = QPushButton("Load Segmentation")
         self.load_segmentation_button.clicked.connect(self.load_segmentation)
@@ -202,6 +205,43 @@ class OrbitFOVViewer(QWidget):
         self.negative_annotations_checkbox.stateChanged.connect(self.update_display)
         self.positive_count_label = QLabel("Positive: 0")
         self.negative_count_label = QLabel("Negative: 0")
+        self.previous_positive_button = QPushButton("←")
+        self.previous_positive_button.setToolTip("Previous positive training cell")
+        self.previous_positive_button.setFixedWidth(36)
+        self.previous_positive_button.clicked.connect(
+            lambda: self.navigate_training("positive", -1)
+        )
+        self.next_positive_button = QPushButton("→")
+        self.next_positive_button.setToolTip("Next positive training cell")
+        self.next_positive_button.setFixedWidth(36)
+        self.next_positive_button.clicked.connect(
+            lambda: self.navigate_training("positive", 1)
+        )
+        self.positive_position_label = QLabel("0 / 0")
+        self.positive_position_label.setAlignment(Qt.AlignCenter)
+        self.previous_negative_button = QPushButton("←")
+        self.previous_negative_button.setToolTip("Previous negative training cell")
+        self.previous_negative_button.setFixedWidth(36)
+        self.previous_negative_button.clicked.connect(
+            lambda: self.navigate_training("negative", -1)
+        )
+        self.next_negative_button = QPushButton("→")
+        self.next_negative_button.setToolTip("Next negative training cell")
+        self.next_negative_button.setFixedWidth(36)
+        self.next_negative_button.clicked.connect(
+            lambda: self.navigate_training("negative", 1)
+        )
+        self.negative_position_label = QLabel("0 / 0")
+        self.negative_position_label.setAlignment(Qt.AlignCenter)
+
+        positive_navigation_layout = QHBoxLayout()
+        positive_navigation_layout.addWidget(self.previous_positive_button)
+        positive_navigation_layout.addWidget(self.positive_position_label, stretch=1)
+        positive_navigation_layout.addWidget(self.next_positive_button)
+        negative_navigation_layout = QHBoxLayout()
+        negative_navigation_layout.addWidget(self.previous_negative_button)
+        negative_navigation_layout.addWidget(self.negative_position_label, stretch=1)
+        negative_navigation_layout.addWidget(self.next_negative_button)
 
         training_panel = QGroupBox("Phenotype Training")
         training_panel.setMinimumWidth(220)
@@ -214,7 +254,9 @@ class OrbitFOVViewer(QWidget):
         training_layout.addWidget(self.negative_annotations_checkbox)
         training_layout.addSpacing(10)
         training_layout.addWidget(self.positive_count_label)
+        training_layout.addLayout(positive_navigation_layout)
         training_layout.addWidget(self.negative_count_label)
+        training_layout.addLayout(negative_navigation_layout)
         training_layout.addStretch()
         training_panel.setLayout(training_layout)
 
@@ -259,8 +301,30 @@ class OrbitFOVViewer(QWidget):
         layout.addWidget(self.spinner)
         layout.addWidget(self.status_label)
         layout.addLayout(toolbar)
+
+        carousel = QGroupBox("Loaded Images")
+        carousel_layout = QHBoxLayout()
+        self.previous_image_button = QPushButton("←")
+        self.previous_image_button.setToolTip("Previous loaded image")
+        self.previous_image_button.setFixedWidth(44)
+        self.previous_image_button.clicked.connect(lambda: self.cycle_image(-1))
+        self.image_carousel = QComboBox()
+        self.image_carousel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.image_carousel.currentIndexChanged.connect(self.switch_image)
+        self.next_image_button = QPushButton("→")
+        self.next_image_button.setToolTip("Next loaded image")
+        self.next_image_button.setFixedWidth(44)
+        self.next_image_button.clicked.connect(lambda: self.cycle_image(1))
+        carousel_layout.addWidget(self.previous_image_button)
+        carousel_layout.addWidget(self.image_carousel, stretch=1)
+        carousel_layout.addWidget(self.next_image_button)
+        carousel.setLayout(carousel_layout)
+        layout.addWidget(carousel)
+
         self.setLayout(layout)
         self.resize(1200, 1000)
+        self.update_training_navigation_controls()
+        self.update_image_carousel_controls()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -288,24 +352,43 @@ class OrbitFOVViewer(QWidget):
         self.segmentation_checkbox.setEnabled(
             not loading and self.segmentation_masks is not None
         )
+        self.update_training_navigation_controls()
+        self.update_image_carousel_controls()
 
     def open_qptiff(self):
-        path, _ = QFileDialog.getOpenFileName(
+        image_path, _ = QFileDialog.getOpenFileName(
             self, "Select QPTIFF image", "", "QPTIFF files (*.qptiff *.tif *.tiff)"
         )
-        if not path:
+        if not image_path:
             return
-        self.set_loading(True, "Loading QPTIFF metadata...")
+        cell_path, _ = QFileDialog.getOpenFileName(
+            self, "Select corresponding cell data", "",
+            "Cell data (*.tsv *.txt *.csv);;All files (*)",
+        )
+        if not cell_path:
+            return
+        mask_path, _ = QFileDialog.getOpenFileName(
+            self, "Select corresponding annotation mask", "",
+            "TIFF masks (*.tif *.tiff);;All files (*)",
+        )
+        if not mask_path:
+            return
+
+        self.set_loading(True, "Loading image and segmentation...")
         try:
-            self._load_image_path(path)
-            self.project_path = None
-            self.status_label.setText("")
+            state = self._create_image_state(image_path, cell_path, mask_path)
+            self._capture_current_image_state()
+            self.loaded_images.append(state)
+            self._refresh_image_carousel()
+            self._activate_image(len(self.loaded_images) - 1)
+            self.status_label.setText(
+                f"Loaded {Path(state['image_path']).name} "
+                f"({len(self.loaded_images)} image(s) in the carousel)."
+            )
         except Exception:
-            self.img = self.fov_generator = None
-            self.image_label.setText("Failed to load QPTIFF.")
             self.status_label.setText(traceback.format_exc())
         finally:
-            self.set_loading(False)
+            self.set_loading(False, self.status_label.text())
 
     def load_segmentation(self):
         if self.img is None:
@@ -325,8 +408,16 @@ class OrbitFOVViewer(QWidget):
 
         self.set_loading(True, "Loading segmentation...")
         try:
-            self._load_segmentation_paths(cell_path, mask_path)
+            cell_data, masks, cell_path, mask_path = self._read_segmentation(
+                cell_path, mask_path, self.img
+            )
+            self.cell_data = cell_data
+            self.segmentation_masks = masks
+            self.cell_data_path = cell_path
+            self.segmentation_mask_path = mask_path
             self.annotations.clear()
+            self.training_navigation_indices = {"positive": -1, "negative": -1}
+            self._capture_current_image_state()
             self.update_annotation_counts()
             self.segmentation_checkbox.setChecked(True)
             self.status_label.setText(
@@ -340,30 +431,36 @@ class OrbitFOVViewer(QWidget):
         finally:
             self.set_loading(False, self.status_label.text())
 
-    def _load_image_path(self, path):
-        path = str(Path(path).expanduser().resolve())
-        if not Path(path).is_file():
-            raise FileNotFoundError(f"Image file not found: {path}")
+    def _create_image_state(self, image_path, cell_path=None, mask_path=None):
+        image_path = str(Path(image_path).expanduser().resolve())
+        if not Path(image_path).is_file():
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+        image = QPTiffImage(image_path)
+        if cell_path or mask_path:
+            if not cell_path or not mask_path:
+                raise ValueError("Both cell data and annotation mask paths are required.")
+            cell_data, masks, cell_path, mask_path = self._read_segmentation(
+                cell_path, mask_path, image
+            )
+        else:
+            cell_data = masks = cell_path = mask_path = None
+        return {
+            "image_path": image_path,
+            "cell_data_path": cell_path,
+            "segmentation_mask_path": mask_path,
+            "img": image,
+            "fov_generator": RandomFOVGenerator(image),
+            "cell_data": cell_data,
+            "segmentation_masks": masks,
+            "annotations": {},
+            "current_y0": None,
+            "current_x0": None,
+            "current_fov": None,
+            "current_dapi_fov": None,
+            "channel_index": 0,
+        }
 
-        self.img = QPTiffImage(path)
-        self.fov_generator = RandomFOVGenerator(self.img)
-        self.image_path = path
-        self.channel_dropdown.blockSignals(True)
-        self.channel_dropdown.clear()
-        self.channel_dropdown.addItems(self.img.get_channel_names())
-        self.channel_dropdown.blockSignals(False)
-        self.current_y0 = self.current_x0 = None
-        self.current_fov = self.current_dapi_fov = None
-        self.current_pixmap = None
-        self.cell_data = self.segmentation_masks = None
-        self.cell_data_path = self.segmentation_mask_path = None
-        self.annotations.clear()
-        self.update_annotation_counts()
-        self.segmentation_checkbox.setEnabled(False)
-        self.image_label.clear()
-        self.image_label.setText("Image loaded.\n\nClick 'Generate FOV'.")
-
-    def _load_segmentation_paths(self, cell_path, mask_path):
+    def _read_segmentation(self, cell_path, mask_path, image=None):
         cell_path = str(Path(cell_path).expanduser().resolve())
         mask_path = str(Path(mask_path).expanduser().resolve())
         if not Path(cell_path).is_file():
@@ -376,16 +473,123 @@ class OrbitFOVViewer(QWidget):
         if cell_data.empty:
             raise ValueError("The selected cell-data file contains no rows.")
 
-        masks = np.squeeze(tifffile.imread(mask_path))
+        try:
+            # Keep large, uncompressed masks on disk when possible so adding
+            # several images does not require loading every mask into RAM.
+            masks = np.squeeze(tifffile.memmap(mask_path))
+        except (ValueError, TypeError):
+            masks = np.squeeze(tifffile.imread(mask_path))
         if masks.ndim != 2:
             raise ValueError(
                 f"Expected a two-dimensional annotation mask; got {masks.shape}."
             )
+        if image is not None:
+            _, image_height, image_width = image.get_shape()
+            if masks.shape != (image_height, image_width):
+                raise ValueError(
+                    "The annotation mask dimensions do not match the image "
+                    f"({masks.shape[1]} x {masks.shape[0]} mask; "
+                    f"{image_width} x {image_height} image)."
+                )
+        return cell_data, masks, cell_path, mask_path
 
-        self.cell_data = cell_data
-        self.segmentation_masks = masks
-        self.cell_data_path = cell_path
-        self.segmentation_mask_path = mask_path
+    def _capture_current_image_state(self):
+        if not (0 <= self.current_image_index < len(self.loaded_images)):
+            return
+        state = self.loaded_images[self.current_image_index]
+        state.update({
+            "image_path": self.image_path,
+            "cell_data_path": self.cell_data_path,
+            "segmentation_mask_path": self.segmentation_mask_path,
+            "img": self.img,
+            "fov_generator": self.fov_generator,
+            "cell_data": self.cell_data,
+            "segmentation_masks": self.segmentation_masks,
+            "annotations": self.annotations,
+            "current_y0": self.current_y0,
+            "current_x0": self.current_x0,
+            "current_fov": self.current_fov,
+            "current_dapi_fov": self.current_dapi_fov,
+            "channel_index": self.channel_dropdown.currentIndex(),
+        })
+
+    def _activate_image(self, index):
+        if not (0 <= index < len(self.loaded_images)):
+            return
+        state = self.loaded_images[index]
+        self.current_image_index = index
+        self.image_path = state["image_path"]
+        self.cell_data_path = state["cell_data_path"]
+        self.segmentation_mask_path = state["segmentation_mask_path"]
+        self.img = state["img"]
+        self.fov_generator = state["fov_generator"]
+        self.cell_data = state["cell_data"]
+        self.segmentation_masks = state["segmentation_masks"]
+        self.annotations = state["annotations"]
+        self.current_y0 = state["current_y0"]
+        self.current_x0 = state["current_x0"]
+        self.current_fov = state["current_fov"]
+        self.current_dapi_fov = state["current_dapi_fov"]
+        self.current_pixmap = None
+        self.training_navigation_indices = {"positive": -1, "negative": -1}
+
+        self.channel_dropdown.blockSignals(True)
+        self.channel_dropdown.clear()
+        self.channel_dropdown.addItems(self.img.get_channel_names())
+        channel_index = min(
+            max(int(state.get("channel_index", 0)), 0),
+            max(self.channel_dropdown.count() - 1, 0),
+        )
+        self.channel_dropdown.setCurrentIndex(channel_index)
+        self.channel_dropdown.blockSignals(False)
+        self.image_carousel.blockSignals(True)
+        self.image_carousel.setCurrentIndex(index)
+        self.image_carousel.blockSignals(False)
+        self.update_annotation_counts()
+
+        if self.current_fov is None:
+            self.image_label.clear()
+            self.image_label.setText(
+                f"{Path(self.image_path).name} loaded.\n\nClick 'Generate FOV'."
+            )
+        else:
+            self.update_display()
+        self.update_image_carousel_controls()
+
+    def switch_image(self, index):
+        if self.is_loading or index == self.current_image_index:
+            return
+        self._capture_current_image_state()
+        self._activate_image(index)
+        self.set_loading(False, f"Showing {Path(self.image_path).name}")
+
+    def cycle_image(self, step):
+        if self.is_loading or not self.loaded_images:
+            return
+        index = (self.current_image_index + step) % len(self.loaded_images)
+        self.switch_image(index)
+
+    def _refresh_image_carousel(self):
+        self.image_carousel.blockSignals(True)
+        self.image_carousel.clear()
+        for index, state in enumerate(self.loaded_images, start=1):
+            self.image_carousel.addItem(
+                f"{index} / {len(self.loaded_images)} — "
+                f"{Path(state['image_path']).name}"
+            )
+        if self.current_image_index >= 0:
+            self.image_carousel.setCurrentIndex(self.current_image_index)
+        self.image_carousel.blockSignals(False)
+        self.update_image_carousel_controls()
+
+    def update_image_carousel_controls(self):
+        if not hasattr(self, "previous_image_button"):
+            return
+        has_images = bool(self.loaded_images)
+        can_cycle = len(self.loaded_images) > 1 and not self.is_loading
+        self.previous_image_button.setEnabled(can_cycle)
+        self.next_image_button.setEnabled(can_cycle)
+        self.image_carousel.setEnabled(has_images and not self.is_loading)
 
     def label_clicked_cell(self, x_fraction, y_fraction):
         if self.current_fov is None or self.segmentation_masks is None:
@@ -462,6 +666,71 @@ class OrbitFOVViewer(QWidget):
         negative = sum(a["label"] == "negative" for a in self.annotations.values())
         self.positive_count_label.setText(f"Positive: {positive}")
         self.negative_count_label.setText(f"Negative: {negative}")
+        for label, count in (("positive", positive), ("negative", negative)):
+            if self.training_navigation_indices[label] >= count:
+                self.training_navigation_indices[label] = -1
+        self.update_training_navigation_controls()
+
+    def training_annotations(self, label):
+        return [
+            annotation
+            for annotation in self.annotations.values()
+            if annotation["label"] == label
+        ]
+
+    def update_training_navigation_controls(self):
+        if not hasattr(self, "previous_positive_button"):
+            return
+        for label, previous_button, next_button, position_label in (
+            (
+                "positive", self.previous_positive_button,
+                self.next_positive_button, self.positive_position_label,
+            ),
+            (
+                "negative", self.previous_negative_button,
+                self.next_negative_button, self.negative_position_label,
+            ),
+        ):
+            count = len(self.training_annotations(label))
+            index = self.training_navigation_indices[label]
+            enabled = count > 0 and self.img is not None and not self.is_loading
+            previous_button.setEnabled(enabled)
+            next_button.setEnabled(enabled)
+            position_label.setText(
+                f"{index + 1} / {count}" if index >= 0 else f"— / {count}"
+            )
+
+    def navigate_training(self, label, step):
+        annotations = self.training_annotations(label)
+        if not annotations or self.img is None or self.is_loading:
+            return
+
+        index = self.training_navigation_indices[label]
+        if index < 0:
+            index = 0 if step > 0 else len(annotations) - 1
+        else:
+            index = (index + step) % len(annotations)
+        self.training_navigation_indices[label] = index
+
+        annotation = annotations[index]
+        centroid_x = float(annotation["centroid_x"])
+        centroid_y = float(annotation["centroid_y"])
+        _, image_height, image_width = self.img.get_shape()
+        maximum_x0 = max(int(image_width) - self.fov_size, 0)
+        maximum_y0 = max(int(image_height) - self.fov_size, 0)
+        self.current_x0 = min(
+            max(round(centroid_x - self.fov_size / 2), 0), maximum_x0
+        )
+        self.current_y0 = min(
+            max(round(centroid_y - self.fov_size / 2), 0), maximum_y0
+        )
+
+        if label == "positive":
+            self.positive_annotations_checkbox.setChecked(True)
+        else:
+            self.negative_annotations_checkbox.setChecked(True)
+        self.update_training_navigation_controls()
+        self.reload_current_fov()
 
     def current_annotation_markers(self):
         if self.current_fov is None:
@@ -482,31 +751,42 @@ class OrbitFOVViewer(QWidget):
         return markers
 
     def project_data(self):
-        if not self.image_path:
+        if not self.loaded_images:
             raise ValueError("Load an image before saving a project.")
+        self._capture_current_image_state()
+        images = []
+        for state in self.loaded_images:
+            images.append({
+                "paths": {
+                    "image": state["image_path"],
+                    "cell_data": state["cell_data_path"],
+                    "segmentation_mask": state["segmentation_mask_path"],
+                },
+                "annotations": list(state["annotations"].values()),
+                "viewer": {
+                    "current_x0": (
+                        None if state["current_x0"] is None
+                        else int(state["current_x0"])
+                    ),
+                    "current_y0": (
+                        None if state["current_y0"] is None
+                        else int(state["current_y0"])
+                    ),
+                    "channel_index": int(state.get("channel_index", 0)),
+                },
+            })
         return {
             "format": "ORBIT phenotype training session",
-            "version": 1,
-            "paths": {
-                "image": self.image_path,
-                "cell_data": self.cell_data_path,
-                "segmentation_mask": self.segmentation_mask_path,
-            },
+            "version": 2,
+            "images": images,
+            "current_image_index": self.current_image_index,
             "phenotype": {
                 "name": self.phenotype_name.text(),
-                "annotations": list(self.annotations.values()),
                 "show_positive": self.positive_annotations_checkbox.isChecked(),
                 "show_negative": self.negative_annotations_checkbox.isChecked(),
             },
             "viewer": {
                 "fov_size": self.fov_size,
-                "current_x0": (
-                    None if self.current_x0 is None else int(self.current_x0)
-                ),
-                "current_y0": (
-                    None if self.current_y0 is None else int(self.current_y0)
-                ),
-                "channel_index": self.channel_dropdown.currentIndex(),
                 "color": self.color_dropdown.currentText(),
                 "show_dapi": self.dapi_checkbox.isChecked(),
                 "show_segmentation": self.segmentation_checkbox.isChecked(),
@@ -554,43 +834,60 @@ class OrbitFOVViewer(QWidget):
                 data = json.load(project_file)
             if data.get("format") != "ORBIT phenotype training session":
                 raise ValueError("The selected file is not an ORBIT training session.")
-            if data.get("version") != 1:
+            version = data.get("version")
+            if version not in {1, 2}:
                 raise ValueError(f"Unsupported ORBIT project version: {data.get('version')}")
-
-            paths = data["paths"]
-            if not paths.get("image"):
-                raise ValueError("The project does not contain an image path.")
-            self._load_image_path(paths["image"])
-            if paths.get("cell_data") or paths.get("segmentation_mask"):
-                if not paths.get("cell_data") or not paths.get("segmentation_mask"):
-                    raise ValueError("The project contains incomplete segmentation paths.")
-                self._load_segmentation_paths(
-                    paths["cell_data"], paths["segmentation_mask"]
-                )
-
             phenotype = data.get("phenotype", {})
+            viewer = data.get("viewer", {})
+            if version == 1:
+                image_entries = [{
+                    "paths": data["paths"],
+                    "annotations": phenotype.get("annotations", []),
+                    "viewer": {
+                        "current_x0": viewer.get("current_x0"),
+                        "current_y0": viewer.get("current_y0"),
+                        "channel_index": viewer.get("channel_index", 0),
+                    },
+                }]
+                target_index = 0
+            else:
+                image_entries = data.get("images", [])
+                target_index = int(data.get("current_image_index", 0))
+            if not image_entries:
+                raise ValueError("The project does not contain any images.")
+
+            loaded_states = []
+            for entry in image_entries:
+                paths = entry.get("paths", {})
+                if not paths.get("image"):
+                    raise ValueError("A project image is missing its image path.")
+                state = self._create_image_state(
+                    paths["image"],
+                    paths.get("cell_data"),
+                    paths.get("segmentation_mask"),
+                )
+                state["annotations"] = {
+                    str(annotation["cell_id"]): annotation
+                    for annotation in entry.get("annotations", [])
+                    if annotation.get("label") in {"positive", "negative"}
+                }
+                image_viewer = entry.get("viewer", {})
+                state["current_x0"] = image_viewer.get("current_x0")
+                state["current_y0"] = image_viewer.get("current_y0")
+                state["channel_index"] = int(
+                    image_viewer.get("channel_index", 0)
+                )
+                loaded_states.append(state)
+
+            self.loaded_images = loaded_states
+            self.current_image_index = -1
+            self.fov_size = int(viewer.get("fov_size", 512))
             self.phenotype_name.setText(phenotype.get("name", ""))
-            annotations = phenotype.get("annotations", [])
-            self.annotations = {
-                str(annotation["cell_id"]): annotation
-                for annotation in annotations
-                if annotation.get("label") in {"positive", "negative"}
-            }
             self.positive_annotations_checkbox.setChecked(
                 phenotype.get("show_positive", True)
             )
             self.negative_annotations_checkbox.setChecked(
                 phenotype.get("show_negative", True)
-            )
-            self.update_annotation_counts()
-
-            viewer = data.get("viewer", {})
-            self.fov_size = int(viewer.get("fov_size", 512))
-            self.current_x0 = viewer.get("current_x0")
-            self.current_y0 = viewer.get("current_y0")
-            channel_index = int(viewer.get("channel_index", 0))
-            self.channel_dropdown.setCurrentIndex(
-                min(max(channel_index, 0), self.channel_dropdown.count() - 1)
             )
             color = viewer.get("color", "Green")
             if color in COLOR_MAPS:
@@ -599,6 +896,9 @@ class OrbitFOVViewer(QWidget):
             self.segmentation_checkbox.setChecked(
                 viewer.get("show_segmentation", True)
             )
+            target_index = min(max(target_index, 0), len(self.loaded_images) - 1)
+            self._refresh_image_carousel()
+            self._activate_image(target_index)
             self.project_path = str(Path(path).resolve())
             has_fov = self.current_x0 is not None and self.current_y0 is not None
             message = f"Opened project: {self.project_path}"
