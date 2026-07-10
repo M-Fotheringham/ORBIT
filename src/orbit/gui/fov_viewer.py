@@ -5,7 +5,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import tifffile
+import joblib
 from skimage.segmentation import find_boundaries
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
 
 from PySide6.QtWidgets import (
     QWidget, QPushButton, QLabel, QFileDialog, QVBoxLayout, QHBoxLayout,
@@ -24,6 +28,10 @@ COLOR_MAPS = {
     "Blue": (0, 0, 1), "Cyan": (0, 1, 1),
     "Magenta": (1, 0, 1), "Yellow": (1, 1, 0),
 }
+
+DEFAULT_PIXEL_SIZE_UM = 0.5055
+MODEL_FORMAT = "ORBIT phenotype model"
+MODEL_VERSION = 1
 
 
 def normalize_channel(arr: np.ndarray) -> np.ndarray:
@@ -63,8 +71,8 @@ def array_to_qpixmap(
     if annotation_markers:
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing)
-        radius = 5
         for marker in annotation_markers:
+            radius = 3 if marker.get("source") == "model" else 5
             color = QColor("#00e640" if marker["label"] == "positive" else "#ff3030")
             painter.setPen(QPen(QColor("black"), 1))
             painter.setBrush(color)
@@ -138,6 +146,7 @@ class OrbitFOVViewer(QWidget):
         self.training_navigation_indices = {"positive": -1, "negative": -1}
         self.loaded_images = []
         self.current_image_index = -1
+        self.model_bundle = None
 
         # Segmentation data remain in whole-slide pixel coordinates. Only the
         # current FOV is cropped and converted to a boundary overlay.
@@ -260,6 +269,33 @@ class OrbitFOVViewer(QWidget):
         training_layout.addStretch()
         training_panel.setLayout(training_layout)
 
+        self.model_status_label = QLabel("No model trained or loaded.")
+        self.model_status_label.setWordWrap(True)
+        self.train_model_button = QPushButton("Train Model")
+        self.train_model_button.clicked.connect(self.train_model)
+        self.apply_model_button = QPushButton("Apply to Loaded Images")
+        self.apply_model_button.clicked.connect(self.apply_model)
+        self.modelled_phenotypes_checkbox = QCheckBox(
+            "Show Modelled Phenotypes"
+        )
+        self.modelled_phenotypes_checkbox.setChecked(True)
+        self.modelled_phenotypes_checkbox.stateChanged.connect(self.update_display)
+        self.model_positive_count_label = QLabel("Model positive: 0")
+        self.model_negative_count_label = QLabel("Model negative: 0")
+
+        model_panel = QGroupBox("Machine-Learning Model")
+        model_panel.setMinimumWidth(220)
+        model_panel.setMaximumWidth(300)
+        model_layout = QVBoxLayout()
+        model_layout.addWidget(self.model_status_label)
+        model_layout.addWidget(self.train_model_button)
+        model_layout.addWidget(self.apply_model_button)
+        model_layout.addWidget(self.modelled_phenotypes_checkbox)
+        model_layout.addWidget(self.model_positive_count_label)
+        model_layout.addWidget(self.model_negative_count_label)
+        model_layout.addStretch()
+        model_panel.setLayout(model_layout)
+
         toolbar = QHBoxLayout()
         for widget in (
             self.open_button, self.load_segmentation_button,
@@ -279,6 +315,9 @@ class OrbitFOVViewer(QWidget):
 
         self.menu_bar = QMenuBar()
         file_menu = self.menu_bar.addMenu("&File")
+        self.new_project_action = QAction("&New Project", self)
+        self.new_project_action.setShortcut("Ctrl+N")
+        self.new_project_action.triggered.connect(self.new_project)
         self.open_project_action = QAction("&Open...", self)
         self.open_project_action.setShortcut("Ctrl+O")
         self.open_project_action.triggered.connect(self.open_project)
@@ -288,15 +327,26 @@ class OrbitFOVViewer(QWidget):
         self.save_project_as_action = QAction("Save &As...", self)
         self.save_project_as_action.setShortcut("Ctrl+Shift+S")
         self.save_project_as_action.triggered.connect(self.save_project_as)
+        self.import_model_action = QAction("&Import Model...", self)
+        self.import_model_action.triggered.connect(self.import_model)
+        self.export_model_action = QAction("&Export Model...", self)
+        self.export_model_action.triggered.connect(self.export_model)
+        file_menu.addAction(self.new_project_action)
         file_menu.addAction(self.open_project_action)
         file_menu.addSeparator()
         file_menu.addAction(self.save_project_action)
         file_menu.addAction(self.save_project_as_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.import_model_action)
+        file_menu.addAction(self.export_model_action)
         layout.setMenuBar(self.menu_bar)
 
         viewer_layout = QHBoxLayout()
         viewer_layout.addWidget(self.image_label, stretch=1)
-        viewer_layout.addWidget(training_panel)
+        right_panel = QVBoxLayout()
+        right_panel.addWidget(training_panel)
+        right_panel.addWidget(model_panel)
+        viewer_layout.addLayout(right_panel)
         layout.addLayout(viewer_layout, stretch=1)
         layout.addWidget(self.spinner)
         layout.addWidget(self.status_label)
@@ -325,6 +375,7 @@ class OrbitFOVViewer(QWidget):
         self.resize(1200, 1000)
         self.update_training_navigation_controls()
         self.update_image_carousel_controls()
+        self.update_model_controls()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -354,6 +405,7 @@ class OrbitFOVViewer(QWidget):
         )
         self.update_training_navigation_controls()
         self.update_image_carousel_controls()
+        self.update_model_controls()
 
     def open_qptiff(self):
         image_path, _ = QFileDialog.getOpenFileName(
@@ -417,6 +469,8 @@ class OrbitFOVViewer(QWidget):
             self.segmentation_mask_path = mask_path
             self.annotations.clear()
             self.training_navigation_indices = {"positive": -1, "negative": -1}
+            self.loaded_images[self.current_image_index]["model_predictions"] = None
+            self.loaded_images[self.current_image_index]["centroid_cache"] = None
             self._capture_current_image_state()
             self.update_annotation_counts()
             self.segmentation_checkbox.setChecked(True)
@@ -458,6 +512,8 @@ class OrbitFOVViewer(QWidget):
             "current_fov": None,
             "current_dapi_fov": None,
             "channel_index": 0,
+            "centroid_cache": None,
+            "model_predictions": None,
         }
 
     def _read_segmentation(self, cell_path, mask_path, image=None):
@@ -531,8 +587,6 @@ class OrbitFOVViewer(QWidget):
         self.current_fov = state["current_fov"]
         self.current_dapi_fov = state["current_dapi_fov"]
         self.current_pixmap = None
-        self.training_navigation_indices = {"positive": -1, "negative": -1}
-
         self.channel_dropdown.blockSignals(True)
         self.channel_dropdown.clear()
         self.channel_dropdown.addItems(self.img.get_channel_names())
@@ -546,6 +600,7 @@ class OrbitFOVViewer(QWidget):
         self.image_carousel.setCurrentIndex(index)
         self.image_carousel.blockSignals(False)
         self.update_annotation_counts()
+        self.update_model_prediction_counts()
 
         if self.current_fov is None:
             self.image_label.clear()
@@ -555,6 +610,7 @@ class OrbitFOVViewer(QWidget):
         else:
             self.update_display()
         self.update_image_carousel_controls()
+        self.update_model_controls()
 
     def switch_image(self, index):
         if self.is_loading or index == self.current_image_index:
@@ -614,6 +670,18 @@ class OrbitFOVViewer(QWidget):
         centroid_x, centroid_y = self._cell_centroid_near_click(
             raw_cell_id, global_x, global_y
         )
+        state = self.loaded_images[self.current_image_index]
+        try:
+            row_index = self._find_cell_row_index(
+                state,
+                {
+                    "cell_id": cell_id,
+                    "centroid_x": centroid_x,
+                    "centroid_y": centroid_y,
+                },
+            )
+        except ValueError:
+            row_index = None
         phenotype = self.phenotype_name.text().strip() or "unnamed phenotype"
 
         message = QMessageBox(self)
@@ -643,6 +711,7 @@ class OrbitFOVViewer(QWidget):
             "label": label,
             "centroid_x": centroid_x,
             "centroid_y": centroid_y,
+            "row_index": row_index,
         }
         self.update_annotation_counts()
         self.update_display()
@@ -662,19 +731,21 @@ class OrbitFOVViewer(QWidget):
         return float(x0 + columns.mean()), float(y0 + rows.mean())
 
     def update_annotation_counts(self):
-        positive = sum(a["label"] == "positive" for a in self.annotations.values())
-        negative = sum(a["label"] == "negative" for a in self.annotations.values())
+        positive = len(self.training_annotations("positive"))
+        negative = len(self.training_annotations("negative"))
         self.positive_count_label.setText(f"Positive: {positive}")
         self.negative_count_label.setText(f"Negative: {negative}")
         for label, count in (("positive", positive), ("negative", negative)):
             if self.training_navigation_indices[label] >= count:
                 self.training_navigation_indices[label] = -1
         self.update_training_navigation_controls()
+        self.update_model_controls()
 
     def training_annotations(self, label):
         return [
-            annotation
-            for annotation in self.annotations.values()
+            (image_index, annotation)
+            for image_index, state in enumerate(self.loaded_images)
+            for annotation in state["annotations"].values()
             if annotation["label"] == label
         ]
 
@@ -712,7 +783,9 @@ class OrbitFOVViewer(QWidget):
             index = (index + step) % len(annotations)
         self.training_navigation_indices[label] = index
 
-        annotation = annotations[index]
+        image_index, annotation = annotations[index]
+        if image_index != self.current_image_index:
+            self.switch_image(image_index)
         centroid_x = float(annotation["centroid_x"])
         centroid_y = float(annotation["centroid_y"])
         _, image_height, image_width = self.img.get_shape()
@@ -747,8 +820,406 @@ class OrbitFOVViewer(QWidget):
             x = float(annotation["centroid_x"]) - x0
             y = float(annotation["centroid_y"]) - y0
             if 0 <= x < width and 0 <= y < height:
-                markers.append({"x": x, "y": y, "label": label})
+                markers.append({
+                    "x": x, "y": y, "label": label, "source": "manual"
+                })
         return markers
+
+    @staticmethod
+    def _centroid_columns(cell_data):
+        def find_axis(axis):
+            exact = [
+                f"Centroid {axis.upper()} µm",
+                f"Centroid {axis.upper()} μm",
+                f"Centroid {axis.upper()} um",
+                f"Centroid {axis.upper()} px",
+                f"Centroid {axis.upper()}",
+            ]
+            for candidate in exact:
+                if candidate in cell_data.columns:
+                    return candidate
+            for column in cell_data.columns:
+                normalized = str(column).lower().replace("_", " ").replace("-", " ")
+                has_centroid = "centroid" in normalized or "center" in normalized
+                has_axis = f" {axis} " in f" {normalized} " or normalized.endswith(axis)
+                if has_centroid and has_axis:
+                    return column
+            return None
+
+        x_column, y_column = find_axis("x"), find_axis("y")
+        if x_column is None or y_column is None:
+            raise ValueError(
+                "Cell data must contain X and Y centroid columns to display "
+                "model predictions."
+            )
+        return x_column, y_column
+
+    @staticmethod
+    def _coordinates_are_microns(column):
+        name = str(column).lower()
+        return any(unit in name for unit in ("µm", "μm", " um", "micron"))
+
+    def _cell_centroid_cache(self, state):
+        if state.get("centroid_cache") is not None:
+            return state["centroid_cache"]
+        x_column, y_column = self._centroid_columns(state["cell_data"])
+        x = pd.to_numeric(state["cell_data"][x_column], errors="coerce").to_numpy(
+            dtype=float
+        )
+        y = pd.to_numeric(state["cell_data"][y_column], errors="coerce").to_numpy(
+            dtype=float
+        )
+        if self._coordinates_are_microns(x_column):
+            x = x / DEFAULT_PIXEL_SIZE_UM
+        if self._coordinates_are_microns(y_column):
+            y = y / DEFAULT_PIXEL_SIZE_UM
+        state["centroid_cache"] = {
+            "x": x,
+            "y": y,
+            "x_column": x_column,
+            "y_column": y_column,
+        }
+        return state["centroid_cache"]
+
+    def _find_cell_row_index(self, state, annotation):
+        row_index = annotation.get("row_index")
+        if row_index is not None:
+            try:
+                row_index = int(row_index)
+            except (TypeError, ValueError):
+                row_index = None
+            if row_index is not None and 0 <= row_index < len(state["cell_data"]):
+                return row_index
+
+        cache = self._cell_centroid_cache(state)
+        x = cache["x"]
+        y = cache["y"]
+        valid = np.isfinite(x) & np.isfinite(y)
+        if valid.any():
+            distance_squared = (
+                (x - float(annotation["centroid_x"])) ** 2
+                + (y - float(annotation["centroid_y"])) ** 2
+            )
+            distance_squared[~valid] = np.inf
+            nearest = int(np.argmin(distance_squared))
+            if distance_squared[nearest] <= 75 ** 2:
+                return nearest
+
+        try:
+            sequential_index = int(float(annotation["cell_id"])) - 1
+        except (TypeError, ValueError):
+            return None
+        if 0 <= sequential_index < len(state["cell_data"]):
+            return sequential_index
+        return None
+
+    @staticmethod
+    def _excluded_feature(column):
+        name = str(column).lower().replace("_", " ").replace("-", " ")
+        excluded = (
+            "centroid", "object id", "cell id", "label", "classification",
+            "geometry", "polygon", "bounding", "bbox", "roi", "x min",
+            "x max", "y min", "y max",
+        )
+        return any(fragment in name for fragment in excluded)
+
+    def _shared_numeric_features(self):
+        if not self.loaded_images:
+            return []
+        per_image = []
+        for state in self.loaded_images:
+            numeric = set()
+            for column in state["cell_data"].columns:
+                if self._excluded_feature(column):
+                    continue
+                values = pd.to_numeric(state["cell_data"][column], errors="coerce")
+                if values.notna().any():
+                    numeric.add(column)
+            per_image.append(numeric)
+        shared = set.intersection(*per_image) if per_image else set()
+        return [
+            column for column in self.loaded_images[0]["cell_data"].columns
+            if column in shared
+        ]
+
+    def train_model(self):
+        try:
+            features = self._shared_numeric_features()
+            if not features:
+                raise ValueError(
+                    "No shared numeric measurement columns were found across "
+                    "the loaded cell-data files."
+                )
+
+            rows, targets = [], []
+            skipped = 0
+            for state in self.loaded_images:
+                for annotation in state["annotations"].values():
+                    row_index = self._find_cell_row_index(state, annotation)
+                    if row_index is None:
+                        skipped += 1
+                        continue
+                    annotation["row_index"] = row_index
+                    rows.append(state["cell_data"].iloc[row_index][features])
+                    targets.append(1 if annotation["label"] == "positive" else 0)
+
+            if set(targets) != {0, 1}:
+                raise ValueError(
+                    "Label at least one Positive and one Negative cell before training."
+                )
+            training_data = pd.DataFrame(rows, columns=features).apply(
+                pd.to_numeric, errors="coerce"
+            )
+            features = [
+                column for column in features
+                if training_data[column].notna().any()
+                and training_data[column].nunique(dropna=True) > 1
+            ]
+            if not features:
+                raise ValueError(
+                    "The labelled cells do not vary in any shared measurement column."
+                )
+
+            pipeline = Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("classifier", RandomForestClassifier(
+                    n_estimators=300,
+                    class_weight="balanced",
+                    random_state=42,
+                    n_jobs=-1,
+                )),
+            ])
+            pipeline.fit(training_data[features], np.asarray(targets, dtype=np.uint8))
+            self.model_bundle = {
+                "format": MODEL_FORMAT,
+                "version": MODEL_VERSION,
+                "phenotype_name": self.phenotype_name.text().strip(),
+                "feature_columns": features,
+                "algorithm": "RandomForestClassifier",
+                "training_samples": len(targets),
+                "pipeline": pipeline,
+            }
+            for state in self.loaded_images:
+                state["model_predictions"] = None
+            self.model_status_label.setText(
+                f"Random forest trained on {len(targets)} cells and "
+                f"{len(features)} features"
+                + (f"; {skipped} labels skipped." if skipped else ".")
+            )
+            self.update_model_prediction_counts()
+            self.update_model_controls()
+            self.update_display()
+        except Exception as error:
+            QMessageBox.warning(self, "Could not train model", str(error))
+
+    def apply_model(self):
+        if self.model_bundle is None:
+            return
+        try:
+            features = list(self.model_bundle["feature_columns"])
+            prepared = []
+            for state in self.loaded_images:
+                if state["cell_data"] is None:
+                    raise ValueError(
+                        f"{Path(state['image_path']).name} has no cell-data file."
+                    )
+                missing = [
+                    column for column in features
+                    if column not in state["cell_data"].columns
+                ]
+                if missing:
+                    raise ValueError(
+                        f"{Path(state['image_path']).name} is missing model "
+                        f"features: {', '.join(missing[:8])}"
+                    )
+                measurements = state["cell_data"][features].apply(
+                    pd.to_numeric, errors="coerce"
+                )
+                centroids = self._cell_centroid_cache(state)
+                prepared.append((state, measurements, centroids))
+
+            for state, measurements, centroids in prepared:
+                prediction = np.asarray(
+                    self.model_bundle["pipeline"].predict(measurements),
+                    dtype=np.uint8,
+                )
+                state["model_predictions"] = {
+                    "x": centroids["x"],
+                    "y": centroids["y"],
+                    "positive": prediction.astype(bool),
+                }
+            self.modelled_phenotypes_checkbox.setChecked(True)
+            self.update_model_prediction_counts()
+            self.update_model_controls()
+            self.update_display()
+            self.status_label.setText(
+                f"Applied model to {len(self.loaded_images)} loaded image(s)."
+            )
+        except Exception as error:
+            QMessageBox.warning(self, "Could not apply model", str(error))
+
+    def current_model_markers(self):
+        if (
+            not self.modelled_phenotypes_checkbox.isChecked()
+            or not (0 <= self.current_image_index < len(self.loaded_images))
+            or self.current_fov is None
+        ):
+            return []
+        predictions = self.loaded_images[self.current_image_index].get(
+            "model_predictions"
+        )
+        if predictions is None:
+            return []
+        x0, y0 = float(self.current_x0), float(self.current_y0)
+        height, width = self.current_fov.shape[:2]
+        x, y = predictions["x"], predictions["y"]
+        visible = (
+            np.isfinite(x) & np.isfinite(y)
+            & (x >= x0) & (x < x0 + width)
+            & (y >= y0) & (y < y0 + height)
+        )
+        indices = np.flatnonzero(visible)
+        return [
+            {
+                "x": float(x[index] - x0),
+                "y": float(y[index] - y0),
+                "label": (
+                    "positive" if predictions["positive"][index] else "negative"
+                ),
+                "source": "model",
+            }
+            for index in indices
+        ]
+
+    def update_model_prediction_counts(self):
+        positive = negative = 0
+        for state in self.loaded_images:
+            predictions = state.get("model_predictions")
+            if predictions is None:
+                continue
+            positive += int(np.count_nonzero(predictions["positive"]))
+            negative += int(len(predictions["positive"]) - np.count_nonzero(
+                predictions["positive"]
+            ))
+        self.model_positive_count_label.setText(f"Model positive: {positive:,}")
+        self.model_negative_count_label.setText(f"Model negative: {negative:,}")
+
+    def update_model_controls(self):
+        if not hasattr(self, "train_model_button"):
+            return
+        has_both_labels = bool(
+            self.training_annotations("positive")
+            and self.training_annotations("negative")
+        )
+        all_have_cell_data = bool(self.loaded_images) and all(
+            state["cell_data"] is not None for state in self.loaded_images
+        )
+        self.train_model_button.setEnabled(
+            has_both_labels and all_have_cell_data and not self.is_loading
+        )
+        self.apply_model_button.setEnabled(
+            self.model_bundle is not None
+            and all_have_cell_data
+            and not self.is_loading
+        )
+        has_predictions = any(
+            state.get("model_predictions") is not None
+            for state in self.loaded_images
+        )
+        self.modelled_phenotypes_checkbox.setEnabled(has_predictions)
+        self.export_model_action.setEnabled(self.model_bundle is not None)
+        self.import_model_action.setEnabled(not self.is_loading)
+
+    def export_model(self):
+        if self.model_bundle is None:
+            QMessageBox.warning(self, "Export model", "Train or import a model first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export ORBIT model", "", "ORBIT model (*.orbitmodel)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".orbitmodel"):
+            path += ".orbitmodel"
+        try:
+            joblib.dump(self.model_bundle, path)
+            self.status_label.setText(f"Exported model: {Path(path).resolve()}")
+        except Exception:
+            QMessageBox.critical(self, "Could not export model", traceback.format_exc())
+
+    def import_model(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import ORBIT model", "", "ORBIT model (*.orbitmodel);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            bundle = joblib.load(path)
+            if not isinstance(bundle, dict) or bundle.get("format") != MODEL_FORMAT:
+                raise ValueError("The selected file is not an ORBIT phenotype model.")
+            if bundle.get("version") != MODEL_VERSION:
+                raise ValueError(
+                    f"Unsupported ORBIT model version: {bundle.get('version')}"
+                )
+            if not bundle.get("feature_columns") or not hasattr(
+                bundle.get("pipeline"), "predict"
+            ):
+                raise ValueError("The ORBIT model file is incomplete.")
+            self.model_bundle = bundle
+            for state in self.loaded_images:
+                state["model_predictions"] = None
+            if not self.phenotype_name.text().strip():
+                self.phenotype_name.setText(bundle.get("phenotype_name", ""))
+            self.model_status_label.setText(
+                f"Loaded {bundle.get('algorithm', 'model')} with "
+                f"{len(bundle['feature_columns'])} features."
+            )
+            self.update_model_prediction_counts()
+            self.update_model_controls()
+            self.update_display()
+        except Exception as error:
+            QMessageBox.warning(self, "Could not import model", str(error))
+
+    def new_project(self):
+        if self.loaded_images:
+            choice = QMessageBox.question(
+                self,
+                "New project",
+                "Close the current project? Save it first if you want to keep "
+                "its training labels.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if choice != QMessageBox.Yes:
+                return
+        for state in self.loaded_images:
+            try:
+                state["img"].tif.close()
+            except Exception:
+                pass
+        self.loaded_images = []
+        self.current_image_index = -1
+        self.img = self.fov_generator = None
+        self.image_path = self.cell_data_path = None
+        self.segmentation_mask_path = None
+        self.cell_data = self.segmentation_masks = None
+        self.current_y0 = self.current_x0 = None
+        self.current_fov = self.current_dapi_fov = None
+        self.current_pixmap = None
+        self.annotations = {}
+        self.model_bundle = None
+        self.project_path = None
+        self.training_navigation_indices = {"positive": -1, "negative": -1}
+        self.phenotype_name.clear()
+        self.channel_dropdown.clear()
+        self.image_label.clear()
+        self.image_label.setText("Select a QPTIFF image")
+        self.model_status_label.setText("No model trained or loaded.")
+        self._refresh_image_carousel()
+        self.update_annotation_counts()
+        self.update_model_prediction_counts()
+        self.update_model_controls()
+        self.set_loading(False, "New project")
 
     def project_data(self):
         if not self.loaded_images:
@@ -879,8 +1350,15 @@ class OrbitFOVViewer(QWidget):
                 )
                 loaded_states.append(state)
 
+            for old_state in self.loaded_images:
+                try:
+                    old_state["img"].tif.close()
+                except Exception:
+                    pass
             self.loaded_images = loaded_states
             self.current_image_index = -1
+            self.model_bundle = None
+            self.model_status_label.setText("No model trained or loaded.")
             self.fov_size = int(viewer.get("fov_size", 512))
             self.phenotype_name.setText(phenotype.get("name", ""))
             self.positive_annotations_checkbox.setChecked(
@@ -971,7 +1449,10 @@ class OrbitFOVViewer(QWidget):
                 dapi_arr=self.current_dapi_fov,
                 show_dapi=self.dapi_checkbox.isChecked(),
                 segmentation_boundary=boundary,
-                annotation_markers=self.current_annotation_markers(),
+                annotation_markers=(
+                    self.current_model_markers()
+                    + self.current_annotation_markers()
+                ),
             )
             self.display_pixmap()
         except Exception:
