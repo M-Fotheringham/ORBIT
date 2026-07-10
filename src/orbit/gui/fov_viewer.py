@@ -135,6 +135,7 @@ class OrbitFOVViewer(QWidget):
         self.image_path = None
         self.project_path = None
         self.annotations = {}
+        self.training_navigation_indices = {"positive": -1, "negative": -1}
 
         # Segmentation data remain in whole-slide pixel coordinates. Only the
         # current FOV is cropped and converted to a boundary overlay.
@@ -202,6 +203,43 @@ class OrbitFOVViewer(QWidget):
         self.negative_annotations_checkbox.stateChanged.connect(self.update_display)
         self.positive_count_label = QLabel("Positive: 0")
         self.negative_count_label = QLabel("Negative: 0")
+        self.previous_positive_button = QPushButton("←")
+        self.previous_positive_button.setToolTip("Previous positive training cell")
+        self.previous_positive_button.setFixedWidth(36)
+        self.previous_positive_button.clicked.connect(
+            lambda: self.navigate_training("positive", -1)
+        )
+        self.next_positive_button = QPushButton("→")
+        self.next_positive_button.setToolTip("Next positive training cell")
+        self.next_positive_button.setFixedWidth(36)
+        self.next_positive_button.clicked.connect(
+            lambda: self.navigate_training("positive", 1)
+        )
+        self.positive_position_label = QLabel("0 / 0")
+        self.positive_position_label.setAlignment(Qt.AlignCenter)
+        self.previous_negative_button = QPushButton("←")
+        self.previous_negative_button.setToolTip("Previous negative training cell")
+        self.previous_negative_button.setFixedWidth(36)
+        self.previous_negative_button.clicked.connect(
+            lambda: self.navigate_training("negative", -1)
+        )
+        self.next_negative_button = QPushButton("→")
+        self.next_negative_button.setToolTip("Next negative training cell")
+        self.next_negative_button.setFixedWidth(36)
+        self.next_negative_button.clicked.connect(
+            lambda: self.navigate_training("negative", 1)
+        )
+        self.negative_position_label = QLabel("0 / 0")
+        self.negative_position_label.setAlignment(Qt.AlignCenter)
+
+        positive_navigation_layout = QHBoxLayout()
+        positive_navigation_layout.addWidget(self.previous_positive_button)
+        positive_navigation_layout.addWidget(self.positive_position_label, stretch=1)
+        positive_navigation_layout.addWidget(self.next_positive_button)
+        negative_navigation_layout = QHBoxLayout()
+        negative_navigation_layout.addWidget(self.previous_negative_button)
+        negative_navigation_layout.addWidget(self.negative_position_label, stretch=1)
+        negative_navigation_layout.addWidget(self.next_negative_button)
 
         training_panel = QGroupBox("Phenotype Training")
         training_panel.setMinimumWidth(220)
@@ -214,7 +252,9 @@ class OrbitFOVViewer(QWidget):
         training_layout.addWidget(self.negative_annotations_checkbox)
         training_layout.addSpacing(10)
         training_layout.addWidget(self.positive_count_label)
+        training_layout.addLayout(positive_navigation_layout)
         training_layout.addWidget(self.negative_count_label)
+        training_layout.addLayout(negative_navigation_layout)
         training_layout.addStretch()
         training_panel.setLayout(training_layout)
 
@@ -261,6 +301,7 @@ class OrbitFOVViewer(QWidget):
         layout.addLayout(toolbar)
         self.setLayout(layout)
         self.resize(1200, 1000)
+        self.update_training_navigation_controls()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -288,6 +329,7 @@ class OrbitFOVViewer(QWidget):
         self.segmentation_checkbox.setEnabled(
             not loading and self.segmentation_masks is not None
         )
+        self.update_training_navigation_controls()
 
     def open_qptiff(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -462,6 +504,71 @@ class OrbitFOVViewer(QWidget):
         negative = sum(a["label"] == "negative" for a in self.annotations.values())
         self.positive_count_label.setText(f"Positive: {positive}")
         self.negative_count_label.setText(f"Negative: {negative}")
+        for label, count in (("positive", positive), ("negative", negative)):
+            if self.training_navigation_indices[label] >= count:
+                self.training_navigation_indices[label] = -1
+        self.update_training_navigation_controls()
+
+    def training_annotations(self, label):
+        return [
+            annotation
+            for annotation in self.annotations.values()
+            if annotation["label"] == label
+        ]
+
+    def update_training_navigation_controls(self):
+        if not hasattr(self, "previous_positive_button"):
+            return
+        for label, previous_button, next_button, position_label in (
+            (
+                "positive", self.previous_positive_button,
+                self.next_positive_button, self.positive_position_label,
+            ),
+            (
+                "negative", self.previous_negative_button,
+                self.next_negative_button, self.negative_position_label,
+            ),
+        ):
+            count = len(self.training_annotations(label))
+            index = self.training_navigation_indices[label]
+            enabled = count > 0 and self.img is not None and not self.is_loading
+            previous_button.setEnabled(enabled)
+            next_button.setEnabled(enabled)
+            position_label.setText(
+                f"{index + 1} / {count}" if index >= 0 else f"— / {count}"
+            )
+
+    def navigate_training(self, label, step):
+        annotations = self.training_annotations(label)
+        if not annotations or self.img is None or self.is_loading:
+            return
+
+        index = self.training_navigation_indices[label]
+        if index < 0:
+            index = 0 if step > 0 else len(annotations) - 1
+        else:
+            index = (index + step) % len(annotations)
+        self.training_navigation_indices[label] = index
+
+        annotation = annotations[index]
+        centroid_x = float(annotation["centroid_x"])
+        centroid_y = float(annotation["centroid_y"])
+        _, image_height, image_width = self.img.get_shape()
+        maximum_x0 = max(int(image_width) - self.fov_size, 0)
+        maximum_y0 = max(int(image_height) - self.fov_size, 0)
+        self.current_x0 = min(
+            max(round(centroid_x - self.fov_size / 2), 0), maximum_x0
+        )
+        self.current_y0 = min(
+            max(round(centroid_y - self.fov_size / 2), 0), maximum_y0
+        )
+
+        if label == "positive":
+            self.positive_annotations_checkbox.setChecked(True)
+        else:
+            self.negative_annotations_checkbox.setChecked(True)
+        self.update_training_navigation_controls()
+        self.reload_current_fov()
 
     def current_annotation_markers(self):
         if self.current_fov is None:
