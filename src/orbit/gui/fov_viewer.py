@@ -282,6 +282,16 @@ class OrbitFOVViewer(QWidget):
         self.modelled_phenotypes_checkbox.stateChanged.connect(self.update_display)
         self.model_positive_count_label = QLabel("Model positive: 0")
         self.model_negative_count_label = QLabel("Model negative: 0")
+        self.export_cell_phenotypes_button = QPushButton(
+            "Export Cell Phenotypes"
+        )
+        self.export_cell_phenotypes_button.setToolTip(
+            "Export model features and Positive/Negative cell labels "
+            "for every loaded image"
+        )
+        self.export_cell_phenotypes_button.clicked.connect(
+            self.export_cell_phenotypes
+        )
 
         model_panel = QGroupBox("Machine-Learning Model")
         model_panel.setMinimumWidth(220)
@@ -294,6 +304,7 @@ class OrbitFOVViewer(QWidget):
         model_layout.addWidget(self.model_positive_count_label)
         model_layout.addWidget(self.model_negative_count_label)
         model_layout.addStretch()
+        model_layout.addWidget(self.export_cell_phenotypes_button)
         model_panel.setLayout(model_layout)
 
         toolbar = QHBoxLayout()
@@ -1126,9 +1137,150 @@ class OrbitFOVViewer(QWidget):
             state.get("model_predictions") is not None
             for state in self.loaded_images
         )
+        all_have_predictions = bool(self.loaded_images) and all(
+            state.get("model_predictions") is not None
+            for state in self.loaded_images
+        )
         self.modelled_phenotypes_checkbox.setEnabled(has_predictions)
+        self.export_cell_phenotypes_button.setEnabled(
+            self.model_bundle is not None
+            and all_have_predictions
+            and not self.is_loading
+        )
         self.export_model_action.setEnabled(self.model_bundle is not None)
         self.import_model_action.setEnabled(not self.is_loading)
+
+    @staticmethod
+    def _cell_identifier_column(cell_data):
+        preferred = (
+            "object id", "objectid", "cell id", "cellid", "label id",
+            "labelid",
+        )
+        normalized_columns = {
+            str(column).lower().replace("_", " ").replace("-", " ").strip(): column
+            for column in cell_data.columns
+        }
+        for candidate in preferred:
+            if candidate in normalized_columns:
+                return normalized_columns[candidate]
+        return None
+
+    def export_cell_phenotypes(self):
+        if self.model_bundle is None:
+            QMessageBox.warning(
+                self,
+                "Export cell phenotypes",
+                "Train or import and apply a model before exporting.",
+            )
+            return
+        if not self.loaded_images or any(
+            state.get("model_predictions") is None
+            for state in self.loaded_images
+        ):
+            QMessageBox.warning(
+                self,
+                "Export cell phenotypes",
+                "Apply the model to all loaded images before exporting.",
+            )
+            return
+
+        phenotype_name = (
+            self.phenotype_name.text().strip()
+            or self.model_bundle.get("phenotype_name", "").strip()
+            or "Phenotype"
+        )
+        safe_name = "".join(
+            character if character.isalnum() or character in "-_" else "_"
+            for character in phenotype_name
+        ).strip("_") or "phenotype"
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export cell phenotypes",
+            f"{safe_name}_cell_phenotypes.tsv",
+            "Tab-separated values (*.tsv);;Comma-separated values (*.csv)",
+        )
+        if not path:
+            return
+
+        export_csv = (
+            path.lower().endswith(".csv")
+            or selected_filter.startswith("Comma-separated")
+        )
+        if not Path(path).suffix:
+            path += ".csv" if export_csv else ".tsv"
+        separator = "," if export_csv else "\t"
+        label_column = f"{phenotype_name} Label"
+        features = list(self.model_bundle["feature_columns"])
+        temporary_path = Path(f"{path}.tmp")
+        exported_rows = 0
+
+        try:
+            for image_index, state in enumerate(self.loaded_images):
+                predictions = state["model_predictions"]
+                cell_data = state["cell_data"]
+                if len(predictions["positive"]) != len(cell_data):
+                    raise ValueError(
+                        f"Prediction count does not match the cell data for "
+                        f"{Path(state['image_path']).name}. Reapply the model."
+                    )
+                missing = [column for column in features if column not in cell_data]
+                if missing:
+                    raise ValueError(
+                        f"{Path(state['image_path']).name} is missing exported "
+                        f"features: {', '.join(missing[:8])}"
+                    )
+
+                export_data = cell_data[features].apply(
+                    pd.to_numeric, errors="coerce"
+                ).copy()
+                export_data.insert(0, "Cell Row", np.arange(1, len(cell_data) + 1))
+                identifier_column = self._cell_identifier_column(cell_data)
+                if identifier_column is not None:
+                    export_data.insert(
+                        1, "Cell ID", cell_data[identifier_column].astype(str).to_numpy()
+                    )
+                export_data.insert(
+                    0, "Image Name", Path(state["image_path"]).name
+                )
+
+                labels = np.where(
+                    predictions["positive"], "Positive", "Negative"
+                ).astype(object)
+                label_sources = np.full(len(cell_data), "Model", dtype=object)
+                for annotation in state["annotations"].values():
+                    row_index = self._find_cell_row_index(state, annotation)
+                    if row_index is None:
+                        continue
+                    labels[row_index] = (
+                        "Positive"
+                        if annotation["label"] == "positive"
+                        else "Negative"
+                    )
+                    label_sources[row_index] = "Manual Training"
+                export_data[label_column] = labels
+                export_data["Label Source"] = label_sources
+
+                export_data.to_csv(
+                    temporary_path,
+                    sep=separator,
+                    index=False,
+                    mode="w" if image_index == 0 else "a",
+                    header=image_index == 0,
+                )
+                exported_rows += len(export_data)
+
+            temporary_path.replace(Path(path))
+            self.status_label.setText(
+                f"Exported {exported_rows:,} cells to {Path(path).resolve()}"
+            )
+        except Exception as error:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            QMessageBox.warning(
+                self, "Could not export cell phenotypes", str(error)
+            )
 
     def export_model(self):
         if self.model_bundle is None:
