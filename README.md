@@ -15,12 +15,8 @@ The platform is designed for rapid, pathologist-guided biomarker training using 
 - Interactive QPTIFF viewer
 - Random field-of-view (FOV) generation
 - Biomarker/channel selection
-- Real biomarker names from QPTIFF metadata
 - Custom fluorescence color overlays
-- Persistent DAPI overlay
-- Fast channel switching
-- Asynchronous image loading with GUI spinner
-- Foundation for supervised phenotyping workflows
+- Interactive, supervised machine-learning-based phenotyping
 - Designed for multiplex pathology and spatial biology
 
 ---
