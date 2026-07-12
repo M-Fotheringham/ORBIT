@@ -4,7 +4,7 @@
 
 ![ORBIT Logo](docs/figs/main_page_logo.png)
 
-ORBIT is an interactive Python package for supervised multiplex immunofluorescence (mIF) phenotyping.
+ORBIT is an interactive Python program for supervised multiplex immunofluorescence (mIF) phenotyping.
 
 The platform is designed for rapid, pathologist-guided biomarker training using random fields of view from whole-slide QPTIFF images. ORBIT enables users to visually inspect fluorescence channels, generate randomized image regions, label cellular phenotypes, and iteratively train machine-learning classifiers for immunophenotyping workflows.
 
