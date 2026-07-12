@@ -30,8 +30,11 @@ The platform is designed for rapid, pathologist-guided biomarker training using 
 **T**raining
 
 ---
+# Standalone Installation
 
-# Installation
+Download the latest release from the Releases tab. Installation requires ~1.7 GB disk space.
+
+# Editable Installation
 
 ## Create Environment
 
