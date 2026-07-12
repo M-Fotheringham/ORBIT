@@ -286,8 +286,8 @@ class OrbitFOVViewer(QWidget):
             "Export Cell Phenotypes"
         )
         self.export_cell_phenotypes_button.setToolTip(
-            "Export model features and Positive/Negative cell labels "
-            "for every loaded image"
+            "Export every original Cellpose TSV column and the "
+            "Positive/Negative phenotype labels for every loaded image"
         )
         self.export_cell_phenotypes_button.clicked.connect(
             self.export_cell_phenotypes
@@ -1151,19 +1151,16 @@ class OrbitFOVViewer(QWidget):
         self.import_model_action.setEnabled(not self.is_loading)
 
     @staticmethod
-    def _cell_identifier_column(cell_data):
-        preferred = (
-            "object id", "objectid", "cell id", "cellid", "label id",
-            "labelid",
-        )
-        normalized_columns = {
-            str(column).lower().replace("_", " ").replace("-", " ").strip(): column
-            for column in cell_data.columns
-        }
-        for candidate in preferred:
-            if candidate in normalized_columns:
-                return normalized_columns[candidate]
-        return None
+    def _unique_export_column(preferred_name, existing_columns):
+        if preferred_name not in existing_columns:
+            return preferred_name
+        orbit_name = f"ORBIT {preferred_name}"
+        if orbit_name not in existing_columns:
+            return orbit_name
+        suffix = 2
+        while f"{orbit_name} {suffix}" in existing_columns:
+            suffix += 1
+        return f"{orbit_name} {suffix}"
 
     def export_cell_phenotypes(self):
         if self.model_bundle is None:
@@ -1209,8 +1206,28 @@ class OrbitFOVViewer(QWidget):
         if not Path(path).suffix:
             path += ".csv" if export_csv else ".tsv"
         separator = "," if export_csv else "\t"
-        label_column = f"{phenotype_name} Label"
         features = list(self.model_bundle["feature_columns"])
+        original_columns = []
+        seen_columns = set()
+        for state in self.loaded_images:
+            for column in state["cell_data"].columns:
+                if column not in seen_columns:
+                    original_columns.append(column)
+                    seen_columns.add(column)
+
+        image_column = self._unique_export_column(
+            "Image Name", seen_columns
+        )
+        seen_columns.add(image_column)
+        row_column = self._unique_export_column("Cell Row", seen_columns)
+        seen_columns.add(row_column)
+        label_column = self._unique_export_column(
+            f"{phenotype_name} Label", seen_columns
+        )
+        seen_columns.add(label_column)
+        source_column = self._unique_export_column(
+            "Label Source", seen_columns
+        )
         temporary_path = Path(f"{path}.tmp")
         exported_rows = 0
 
@@ -1230,17 +1247,14 @@ class OrbitFOVViewer(QWidget):
                         f"features: {', '.join(missing[:8])}"
                     )
 
-                export_data = cell_data[features].apply(
-                    pd.to_numeric, errors="coerce"
-                ).copy()
-                export_data.insert(0, "Cell Row", np.arange(1, len(cell_data) + 1))
-                identifier_column = self._cell_identifier_column(cell_data)
-                if identifier_column is not None:
-                    export_data.insert(
-                        1, "Cell ID", cell_data[identifier_column].astype(str).to_numpy()
-                    )
+                # Reindex to the union of all source schemas so every original
+                # Cellpose column is retained and image blocks append cleanly.
+                export_data = cell_data.reindex(columns=original_columns).copy()
                 export_data.insert(
-                    0, "Image Name", Path(state["image_path"]).name
+                    0, row_column, np.arange(1, len(cell_data) + 1)
+                )
+                export_data.insert(
+                    0, image_column, Path(state["image_path"]).name
                 )
 
                 labels = np.where(
@@ -1258,7 +1272,7 @@ class OrbitFOVViewer(QWidget):
                     )
                     label_sources[row_index] = "Manual Training"
                 export_data[label_column] = labels
-                export_data["Label Source"] = label_sources
+                export_data[source_column] = label_sources
 
                 export_data.to_csv(
                     temporary_path,
