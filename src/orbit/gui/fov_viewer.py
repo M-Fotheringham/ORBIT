@@ -29,7 +29,7 @@ COLOR_MAPS = {
     "Magenta": (1, 0, 1), "Yellow": (1, 1, 0),
 }
 
-DEFAULT_PIXEL_SIZE_UM = 0.5055
+DEFAULT_PIXEL_SIZE_UM = 0.5064
 MODEL_FORMAT = "ORBIT phenotype model"
 MODEL_VERSION = 1
 
