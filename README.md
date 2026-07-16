@@ -121,12 +121,12 @@ git push
 2. Use the colour dropdown list to select a pseudo colour for the marker
 
 ### 2.c Toggling DAPI and segmentation overlays
-![2b](docs/figs/tutorial_2b.png)
+![2c](docs/figs/tutorial_2c.png)
 
 The DAPI stain and the segmentation can be toggled on/off.
 
 ### 2.d Cycling through images
-![2b](docs/figs/tutorial_2b.png)
+![2d](docs/figs/tutorial_2d.png)
 
 Change the image displayed using the carousel arrows or by selecting an image from the dropdown list.
 
