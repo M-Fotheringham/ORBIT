@@ -4,6 +4,7 @@ src/orbit/__init__.py
 src/orbit/app.py
 src/orbit/fov.py
 src/orbit/image.py
+src/orbit/threshold.py
 src/orbit.egg-info/PKG-INFO
 src/orbit.egg-info/SOURCES.txt
 src/orbit.egg-info/dependency_links.txt

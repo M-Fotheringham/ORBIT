@@ -156,12 +156,16 @@ class ThresholdApplyWorker(QRunnable):
         channel_name,
         intensity_threshold,
         positive_pixel_fraction,
+        compartment,
+        inward_buffer_pixels,
     ):
         super().__init__()
         self.image_states = image_states
         self.channel_name = channel_name
         self.intensity_threshold = intensity_threshold
         self.positive_pixel_fraction = positive_pixel_fraction
+        self.compartment = compartment
+        self.inward_buffer_pixels = inward_buffer_pixels
         self.signals = ThresholdWorkerSignals()
 
     def run(self):
@@ -185,6 +189,8 @@ class ThresholdApplyWorker(QRunnable):
                     centroid_y=centroid_cache["y"],
                     intensity_threshold=self.intensity_threshold,
                     positive_pixel_fraction=self.positive_pixel_fraction,
+                    compartment=self.compartment,
+                    inward_buffer_pixels=self.inward_buffer_pixels,
                 )
                 result.update({
                     "x": centroid_cache["x"],
@@ -192,6 +198,8 @@ class ThresholdApplyWorker(QRunnable):
                     "channel_name": self.channel_name,
                     "intensity_threshold": self.intensity_threshold,
                     "positive_pixel_fraction": self.positive_pixel_fraction,
+                    "compartment": self.compartment,
+                    "inward_buffer_pixels": self.inward_buffer_pixels,
                 })
                 results.append(result)
             self.signals.finished.emit(results)
@@ -419,6 +427,36 @@ class OrbitFOVViewer(QWidget):
         self.threshold_percent_slider.valueChanged.connect(
             self.threshold_percent_changed
         )
+        self.threshold_compartment_label = QLabel(
+            "Positive-pixel denominator:"
+        )
+        self.threshold_nucleus_checkbox = QCheckBox("Nucleus")
+        self.threshold_nucleus_checkbox.setChecked(True)
+        self.threshold_nucleus_checkbox.setToolTip(
+            "Use pixels deeper than the inward boundary distance."
+        )
+        self.threshold_nucleus_checkbox.stateChanged.connect(
+            self.threshold_compartment_changed
+        )
+        self.threshold_cytoplasm_checkbox = QCheckBox(
+            "Cytoplasm/Membrane"
+        )
+        self.threshold_cytoplasm_checkbox.setChecked(True)
+        self.threshold_cytoplasm_checkbox.setToolTip(
+            "Use the inward band measured from each cell boundary."
+        )
+        self.threshold_cytoplasm_checkbox.stateChanged.connect(
+            self.threshold_compartment_changed
+        )
+        self.threshold_buffer_label = QLabel(
+            "Inward boundary distance: 10 px (5.1 µm)"
+        )
+        self.threshold_buffer_slider = QSlider(Qt.Horizontal)
+        self.threshold_buffer_slider.setRange(0, 50)
+        self.threshold_buffer_slider.setValue(10)
+        self.threshold_buffer_slider.valueChanged.connect(
+            self.threshold_buffer_changed
+        )
         self.apply_threshold_button = QPushButton(
             "Apply Threshold to All Cells"
         )
@@ -461,6 +499,12 @@ class OrbitFOVViewer(QWidget):
         threshold_layout.addSpacing(8)
         threshold_layout.addWidget(self.threshold_percent_label)
         threshold_layout.addWidget(self.threshold_percent_slider)
+        threshold_layout.addSpacing(8)
+        threshold_layout.addWidget(self.threshold_compartment_label)
+        threshold_layout.addWidget(self.threshold_nucleus_checkbox)
+        threshold_layout.addWidget(self.threshold_cytoplasm_checkbox)
+        threshold_layout.addWidget(self.threshold_buffer_label)
+        threshold_layout.addWidget(self.threshold_buffer_slider)
         threshold_layout.addWidget(self.apply_threshold_button)
         threshold_layout.addWidget(self.threshold_phenotypes_checkbox)
         threshold_layout.addWidget(self.threshold_positive_count_label)
@@ -667,6 +711,30 @@ class OrbitFOVViewer(QWidget):
         self._invalidate_threshold_predictions()
         self.update_display()
 
+    def threshold_compartment(self):
+        use_nucleus = self.threshold_nucleus_checkbox.isChecked()
+        use_cytoplasm = self.threshold_cytoplasm_checkbox.isChecked()
+        if use_nucleus and use_cytoplasm:
+            return "all"
+        if use_nucleus:
+            return "nucleus"
+        if use_cytoplasm:
+            return "cytoplasm_membrane"
+        return None
+
+    def threshold_compartment_changed(self):
+        self._invalidate_threshold_predictions()
+        self.update_threshold_controls()
+        self.update_display()
+
+    def threshold_buffer_changed(self, value):
+        distance_um = value * DEFAULT_PIXEL_SIZE_UM
+        self.threshold_buffer_label.setText(
+            f"Inward boundary distance: {value} px ({distance_um:.1f} µm)"
+        )
+        self._invalidate_threshold_predictions()
+        self.update_display()
+
     def on_channel_changed(self):
         if self.active_tool == "threshold":
             self.threshold_intensity_value = None
@@ -818,18 +886,10 @@ class OrbitFOVViewer(QWidget):
             "threshold_predictions": None,
         }
 
-    def _read_segmentation(self, cell_path, mask_path, image=None):
-        cell_path = str(Path(cell_path).expanduser().resolve())
+    def _read_mask(self, mask_path, image=None, description="Segmentation mask"):
         mask_path = str(Path(mask_path).expanduser().resolve())
-        if not Path(cell_path).is_file():
-            raise FileNotFoundError(f"Cell-data file not found: {cell_path}")
         if not Path(mask_path).is_file():
-            raise FileNotFoundError(f"Segmentation mask not found: {mask_path}")
-
-        separator = "," if cell_path.lower().endswith(".csv") else "\t"
-        cell_data = pd.read_csv(cell_path, sep=separator)
-        if cell_data.empty:
-            raise ValueError("The selected cell-data file contains no rows.")
+            raise FileNotFoundError(f"{description} not found: {mask_path}")
 
         try:
             # Keep large, uncompressed masks on disk when possible so adding
@@ -839,16 +899,34 @@ class OrbitFOVViewer(QWidget):
             masks = np.squeeze(tifffile.imread(mask_path))
         if masks.ndim != 2:
             raise ValueError(
-                f"Expected a two-dimensional annotation mask; got {masks.shape}."
+                f"Expected a two-dimensional {description.lower()}; "
+                f"got {masks.shape}."
             )
         if image is not None:
             _, image_height, image_width = image.get_shape()
             if masks.shape != (image_height, image_width):
                 raise ValueError(
-                    "The annotation mask dimensions do not match the image "
-                    f"({masks.shape[1]} x {masks.shape[0]} mask; "
+                    f"The {description.lower()} dimensions do not match the "
+                    f"image ({masks.shape[1]} x {masks.shape[0]} mask; "
                     f"{image_width} x {image_height} image)."
                 )
+        return masks, mask_path
+
+    def _read_segmentation(self, cell_path, mask_path, image=None):
+        cell_path = str(Path(cell_path).expanduser().resolve())
+        if not Path(cell_path).is_file():
+            raise FileNotFoundError(f"Cell-data file not found: {cell_path}")
+
+        separator = "," if cell_path.lower().endswith(".csv") else "\t"
+        cell_data = pd.read_csv(cell_path, sep=separator)
+        if cell_data.empty:
+            raise ValueError("The selected cell-data file contains no rows.")
+
+        masks, mask_path = self._read_mask(
+            mask_path,
+            image,
+            "Segmentation mask",
+        )
         return cell_data, masks, cell_path, mask_path
 
     def _capture_current_image_state(self):
@@ -1466,6 +1544,15 @@ class OrbitFOVViewer(QWidget):
             )
             return
 
+        compartment = self.threshold_compartment()
+        if compartment is None:
+            QMessageBox.warning(
+                self,
+                "Apply threshold",
+                "Select Nucleus, Cytoplasm/Membrane, or both compartments.",
+            )
+            return
+
         channel_name = self.channel_dropdown.currentText()
         if (
             self.threshold_intensity_value is None
@@ -1486,6 +1573,7 @@ class OrbitFOVViewer(QWidget):
             return
 
         positive_pixel_fraction = self.threshold_percent_slider.value() / 100
+        inward_buffer_pixels = self.threshold_buffer_slider.value()
         self._invalidate_threshold_predictions()
         self.set_loading(
             True,
@@ -1496,6 +1584,8 @@ class OrbitFOVViewer(QWidget):
             channel_name=channel_name,
             intensity_threshold=self.threshold_intensity_value,
             positive_pixel_fraction=positive_pixel_fraction,
+            compartment=compartment,
+            inward_buffer_pixels=inward_buffer_pixels,
         )
         worker.signals.finished.connect(self.on_threshold_applied)
         worker.signals.error.connect(self.on_threshold_apply_error)
@@ -1612,11 +1702,22 @@ class OrbitFOVViewer(QWidget):
             for state in self.loaded_images
         )
         editable = threshold_mode and not self.is_loading
+        compartment = self.threshold_compartment()
         self.threshold_phenotype_name.setEnabled(editable)
         self.threshold_intensity_slider.setEnabled(editable and has_fov)
         self.threshold_percent_slider.setEnabled(editable and has_fov)
+        self.threshold_nucleus_checkbox.setEnabled(editable)
+        self.threshold_cytoplasm_checkbox.setEnabled(editable)
+        self.threshold_buffer_slider.setEnabled(
+            editable and has_fov and compartment in {
+                "nucleus", "cytoplasm_membrane"
+            }
+        )
         self.apply_threshold_button.setEnabled(
-            editable and has_fov and all_have_segmentation
+            editable
+            and has_fov
+            and all_have_segmentation
+            and compartment is not None
         )
         self.threshold_phenotypes_checkbox.setEnabled(
             editable and has_predictions
@@ -1881,7 +1982,19 @@ class OrbitFOVViewer(QWidget):
         self.threshold_percent_slider.blockSignals(True)
         self.threshold_percent_slider.setValue(25)
         self.threshold_percent_slider.blockSignals(False)
+        self.threshold_nucleus_checkbox.blockSignals(True)
+        self.threshold_nucleus_checkbox.setChecked(True)
+        self.threshold_nucleus_checkbox.blockSignals(False)
+        self.threshold_cytoplasm_checkbox.blockSignals(True)
+        self.threshold_cytoplasm_checkbox.setChecked(True)
+        self.threshold_cytoplasm_checkbox.blockSignals(False)
+        self.threshold_buffer_slider.blockSignals(True)
+        self.threshold_buffer_slider.setValue(10)
+        self.threshold_buffer_slider.blockSignals(False)
         self.threshold_percent_label.setText("Positive pixels required: >25%")
+        self.threshold_buffer_label.setText(
+            "Inward boundary distance: 10 px (5.1 µm)"
+        )
         self.threshold_intensity_label.setText("Intensity threshold: —")
         self.channel_dropdown.clear()
         self.image_label.clear()
@@ -1941,6 +2054,15 @@ class OrbitFOVViewer(QWidget):
                     "intensity_slider": self.threshold_intensity_slider.value(),
                     "positive_pixel_percent": (
                         self.threshold_percent_slider.value()
+                    ),
+                    "use_nucleus": (
+                        self.threshold_nucleus_checkbox.isChecked()
+                    ),
+                    "use_cytoplasm_membrane": (
+                        self.threshold_cytoplasm_checkbox.isChecked()
+                    ),
+                    "inward_buffer_pixels": (
+                        self.threshold_buffer_slider.value()
                     ),
                 },
             },
@@ -2056,9 +2178,33 @@ class OrbitFOVViewer(QWidget):
                 int(threshold_settings.get("positive_pixel_percent", 25))
             )
             self.threshold_percent_slider.blockSignals(False)
+            self.threshold_nucleus_checkbox.blockSignals(True)
+            self.threshold_nucleus_checkbox.setChecked(
+                bool(threshold_settings.get("use_nucleus", True))
+            )
+            self.threshold_nucleus_checkbox.blockSignals(False)
+            self.threshold_cytoplasm_checkbox.blockSignals(True)
+            self.threshold_cytoplasm_checkbox.setChecked(
+                bool(
+                    threshold_settings.get(
+                        "use_cytoplasm_membrane", True
+                    )
+                )
+            )
+            self.threshold_cytoplasm_checkbox.blockSignals(False)
+            self.threshold_buffer_slider.blockSignals(True)
+            self.threshold_buffer_slider.setValue(
+                int(threshold_settings.get("inward_buffer_pixels", 10))
+            )
+            self.threshold_buffer_slider.blockSignals(False)
             self.threshold_percent_label.setText(
                 "Positive pixels required: "
                 f">{self.threshold_percent_slider.value()}%"
+            )
+            self.threshold_buffer_label.setText(
+                "Inward boundary distance: "
+                f"{self.threshold_buffer_slider.value()} px "
+                f"({self.threshold_buffer_slider.value() * DEFAULT_PIXEL_SIZE_UM:.1f} µm)"
             )
             self.positive_annotations_checkbox.setChecked(
                 phenotype.get("show_positive", True)
