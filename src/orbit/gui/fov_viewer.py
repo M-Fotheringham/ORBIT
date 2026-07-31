@@ -19,11 +19,12 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import (
     QPixmap, QImage, QPainter, QColor, QPen, QAction, QActionGroup,
 )
-from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool
+from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QTimer
 
 from orbit.image import QPTiffImage
 from orbit.fov import RandomFOVGenerator
 from orbit.threshold import (
+    cell_statistics_by_threshold,
     intensity_threshold_from_slider,
     phenotype_cells_by_threshold,
 )
@@ -36,6 +37,7 @@ COLOR_MAPS = {
 }
 
 DEFAULT_PIXEL_SIZE_UM = 0.5064
+THRESHOLD_HISTOGRAM_BINS = 30
 MODEL_FORMAT = "ORBIT phenotype model"
 MODEL_VERSION = 1
 
@@ -117,6 +119,137 @@ class ClickableImageLabel(QLabel):
         super().mousePressEvent(event)
 
 
+class CellHistogramWidget(QWidget):
+    """Compact dependency-free histogram with an optional threshold marker."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._counts = np.array([], dtype=float)
+        self._minimum = 0.0
+        self._maximum = 1.0
+        self._marker = None
+        self._message = "Load an image and segmentation"
+        self.setMinimumHeight(86)
+        self.setMaximumHeight(110)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def set_data(self, values, marker=None, value_range=None):
+        values = np.asarray(values, dtype=float)
+        values = values[np.isfinite(values)]
+        self._marker = marker
+        if values.size == 0:
+            self._counts = np.array([], dtype=float)
+            self._message = "No cells with pixels in this compartment"
+            self.update()
+            return
+
+        if value_range is None:
+            minimum = float(values.min())
+            maximum = float(values.max())
+            if np.isclose(minimum, maximum):
+                padding = max(abs(minimum) * 0.05, 0.5)
+                minimum -= padding
+                maximum += padding
+        else:
+            minimum, maximum = map(float, value_range)
+        self._minimum = minimum
+        self._maximum = maximum
+        self._counts, _ = np.histogram(
+            values,
+            bins=THRESHOLD_HISTOGRAM_BINS,
+            range=(self._minimum, self._maximum),
+        )
+        self._message = f"n = {values.size:,} cells"
+        self.update()
+
+    def set_marker(self, value):
+        self._marker = value
+        self.update()
+
+    def set_message(self, message):
+        self._counts = np.array([], dtype=float)
+        self._message = message
+        self.update()
+
+    def set_status(self, message):
+        self._message = message
+        self.update()
+
+    @staticmethod
+    def _format_axis_value(value):
+        absolute = abs(value)
+        if absolute >= 10000 or (0 < absolute < 0.01):
+            return f"{value:.1e}"
+        return f"{value:.3g}"
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.fillRect(self.rect(), QColor("#ffffff"))
+
+        left, top = 7, 6
+        right, bottom = self.width() - 7, self.height() - 20
+        plot_width = max(right - left, 1)
+        plot_height = max(bottom - top, 1)
+        painter.setPen(QPen(QColor("#b0b0b0"), 1))
+        painter.drawRect(left, top, plot_width, plot_height)
+
+        if self._counts.size:
+            maximum_count = max(float(self._counts.max()), 1.0)
+            bar_width = plot_width / self._counts.size
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#6f9fd1"))
+            for index, count in enumerate(self._counts):
+                if count <= 0:
+                    continue
+                height = max(int((count / maximum_count) * (plot_height - 2)), 1)
+                x0 = left + int(index * bar_width) + 1
+                x1 = left + int((index + 1) * bar_width)
+                painter.drawRect(
+                    x0,
+                    bottom - height,
+                    max(x1 - x0, 1),
+                    height,
+                )
+
+            if self._marker is not None and np.isfinite(self._marker):
+                position = np.clip(
+                    (float(self._marker) - self._minimum)
+                    / (self._maximum - self._minimum),
+                    0.0,
+                    1.0,
+                )
+                marker_x = left + round(position * plot_width)
+                painter.setPen(QPen(QColor("#e67e22"), 2))
+                painter.drawLine(marker_x, top, marker_x, bottom)
+
+            painter.setPen(QColor("#555555"))
+            painter.drawText(
+                left,
+                self.height() - 4,
+                self._format_axis_value(self._minimum),
+            )
+            maximum_text = self._format_axis_value(self._maximum)
+            maximum_width = painter.fontMetrics().horizontalAdvance(maximum_text)
+            painter.drawText(
+                max(right - maximum_width, left),
+                self.height() - 4,
+                maximum_text,
+            )
+
+        painter.setPen(QColor("#555555"))
+        painter.drawText(
+            left + 3,
+            top + 3,
+            plot_width - 6,
+            plot_height - 6,
+            Qt.AlignTop | Qt.AlignRight,
+            self._message,
+        )
+        painter.end()
+
+
 class WorkerSignals(QObject):
     finished = Signal(object, object)
     error = Signal(str)
@@ -147,6 +280,70 @@ class FOVLoadWorker(QRunnable):
 class ThresholdWorkerSignals(QObject):
     finished = Signal(object)
     error = Signal(str)
+
+
+class ThresholdHistogramSignals(QObject):
+    finished = Signal(object)
+    error = Signal(object)
+
+
+class ThresholdHistogramWorker(QRunnable):
+    def __init__(
+        self,
+        request_id,
+        image_index,
+        image_state,
+        channel_name,
+        intensity_threshold,
+        compartment,
+        inward_buffer_pixels,
+    ):
+        super().__init__()
+        self.request_id = request_id
+        self.image_index = image_index
+        self.image_state = image_state
+        self.channel_name = channel_name
+        self.intensity_threshold = intensity_threshold
+        self.compartment = compartment
+        self.inward_buffer_pixels = inward_buffer_pixels
+        self.signals = ThresholdHistogramSignals()
+
+    def run(self):
+        try:
+            channel_names = list(self.image_state["img"].get_channel_names())
+            if self.channel_name not in channel_names:
+                raise ValueError(
+                    f"The image does not contain channel '{self.channel_name}'."
+                )
+            channel = self.image_state["img"].get_channel(
+                channel_names.index(self.channel_name)
+            )
+            centroid_cache = self.image_state["centroid_cache"]
+            result = cell_statistics_by_threshold(
+                channel=channel,
+                masks=self.image_state["segmentation_masks"],
+                cell_data=self.image_state["cell_data"],
+                centroid_x=centroid_cache["x"],
+                centroid_y=centroid_cache["y"],
+                intensity_threshold=self.intensity_threshold,
+                compartment=self.compartment,
+                inward_buffer_pixels=self.inward_buffer_pixels,
+            )
+            result.update({
+                "request_id": self.request_id,
+                "image_index": self.image_index,
+                "channel_name": self.channel_name,
+                "intensity_threshold": self.intensity_threshold,
+                "compartment": self.compartment,
+                "inward_buffer_pixels": self.inward_buffer_pixels,
+                "total_cells": len(self.image_state["cell_data"]),
+            })
+            self.signals.finished.emit(result)
+        except Exception:
+            self.signals.error.emit({
+                "request_id": self.request_id,
+                "error": traceback.format_exc(),
+            })
 
 
 class ThresholdApplyWorker(QRunnable):
@@ -231,6 +428,13 @@ class OrbitFOVViewer(QWidget):
         self.threshold_intensity_value = None
         self.threshold_channel_name = None
         self.threshold_worker = None
+        self.threshold_histogram_worker = None
+        self.threshold_histogram_request_id = 0
+        self.threshold_histogram_timer = QTimer(self)
+        self.threshold_histogram_timer.setSingleShot(True)
+        self.threshold_histogram_timer.timeout.connect(
+            self._start_threshold_histogram_worker
+        )
 
         # Segmentation data remain in whole-slide pixel coordinates. Only the
         # current FOV is cropped and converted to a boundary overlay.
@@ -418,6 +622,16 @@ class OrbitFOVViewer(QWidget):
         self.threshold_intensity_slider.valueChanged.connect(
             self.threshold_slider_changed
         )
+        self.threshold_intensity_histogram_label = QLabel(
+            "All-image mean fluorescence per cell"
+        )
+        self.threshold_intensity_histogram_label.setWordWrap(True)
+        self.threshold_intensity_histogram = CellHistogramWidget()
+        self.threshold_intensity_histogram.setToolTip(
+            "Distribution of mean fluorescence intensity per segmented cell "
+            "for the selected channel and compartment across the entire "
+            "current image. The orange line is the intensity threshold."
+        )
         self.threshold_percent_label = QLabel(
             "Positive pixels required: >25%"
         )
@@ -426,6 +640,16 @@ class OrbitFOVViewer(QWidget):
         self.threshold_percent_slider.setValue(25)
         self.threshold_percent_slider.valueChanged.connect(
             self.threshold_percent_changed
+        )
+        self.threshold_fraction_histogram_label = QLabel(
+            "All-image positive-pixel percentages per cell"
+        )
+        self.threshold_fraction_histogram_label.setWordWrap(True)
+        self.threshold_fraction_histogram = CellHistogramWidget()
+        self.threshold_fraction_histogram.setToolTip(
+            "Distribution of the percentage of above-threshold pixels per "
+            "segmented cell across the entire current image. The orange line "
+            "is the percentage required to call a cell positive."
         )
         self.threshold_compartment_label = QLabel(
             "Positive-pixel denominator:"
@@ -494,9 +718,13 @@ class OrbitFOVViewer(QWidget):
         threshold_layout.addLayout(threshold_name_layout)
         threshold_layout.addWidget(threshold_description)
         threshold_layout.addSpacing(8)
+        threshold_layout.addWidget(self.threshold_intensity_histogram_label)
+        threshold_layout.addWidget(self.threshold_intensity_histogram)
         threshold_layout.addWidget(self.threshold_intensity_label)
         threshold_layout.addWidget(self.threshold_intensity_slider)
         threshold_layout.addSpacing(8)
+        threshold_layout.addWidget(self.threshold_fraction_histogram_label)
+        threshold_layout.addWidget(self.threshold_fraction_histogram)
         threshold_layout.addWidget(self.threshold_percent_label)
         threshold_layout.addWidget(self.threshold_percent_slider)
         threshold_layout.addSpacing(8)
@@ -665,6 +893,11 @@ class OrbitFOVViewer(QWidget):
                 or self.threshold_channel_name != displayed_channel
             ):
                 self._update_threshold_value(invalidate=False)
+        if threshold_mode:
+            self.request_threshold_histogram_refresh()
+        else:
+            self.threshold_histogram_request_id += 1
+            self.threshold_histogram_timer.stop()
         self.update_model_controls()
         self.update_threshold_controls()
         self.update_display()
@@ -674,6 +907,150 @@ class OrbitFOVViewer(QWidget):
             state["threshold_predictions"] = None
         self.update_threshold_prediction_counts()
         self.update_threshold_controls()
+
+    def _update_threshold_histogram_markers(self):
+        self.threshold_intensity_histogram.set_marker(
+            self.threshold_intensity_value
+        )
+        self.threshold_fraction_histogram.set_marker(
+            self.threshold_percent_slider.value()
+        )
+
+    def request_threshold_histogram_refresh(self, delay_ms=0):
+        """Queue whole-image histogram statistics without blocking the UI."""
+        if not hasattr(self, "threshold_intensity_histogram"):
+            return
+        self.threshold_histogram_request_id += 1
+        self.threshold_histogram_timer.stop()
+        self._update_threshold_histogram_markers()
+
+        if self.active_tool != "threshold":
+            return
+        if not (0 <= self.current_image_index < len(self.loaded_images)):
+            self.threshold_intensity_histogram.set_message("Load an image")
+            self.threshold_fraction_histogram.set_message("Load an image")
+            return
+        if self.current_fov is None:
+            self.threshold_intensity_histogram.set_message("Generate an FOV")
+            self.threshold_fraction_histogram.set_message("Generate an FOV")
+            return
+        if self.cell_data is None or self.segmentation_masks is None:
+            self.threshold_intensity_histogram.set_message(
+                "Load cell data and a segmentation mask"
+            )
+            self.threshold_fraction_histogram.set_message(
+                "Load cell data and a segmentation mask"
+            )
+            return
+        if self.threshold_compartment() is None:
+            self.threshold_intensity_histogram.set_message(
+                "Select at least one compartment"
+            )
+            self.threshold_fraction_histogram.set_message(
+                "Select at least one compartment"
+            )
+            return
+
+        self.threshold_intensity_histogram.set_status(
+            "Updating all image cells…"
+        )
+        self.threshold_fraction_histogram.set_status(
+            "Updating all image cells…"
+        )
+        if self.threshold_histogram_worker is not None:
+            return
+        if delay_ms > 0:
+            self.threshold_histogram_timer.start(delay_ms)
+        else:
+            self._start_threshold_histogram_worker()
+
+    def _start_threshold_histogram_worker(self):
+        if self.threshold_histogram_worker is not None:
+            return
+        if (
+            self.active_tool != "threshold"
+            or self.current_fov is None
+            or self.cell_data is None
+            or self.segmentation_masks is None
+            or not (0 <= self.current_image_index < len(self.loaded_images))
+        ):
+            return
+        compartment = self.threshold_compartment()
+        if compartment is None:
+            return
+        if self.threshold_intensity_value is None:
+            self._update_threshold_value(invalidate=False)
+
+        state = self.loaded_images[self.current_image_index]
+        try:
+            self._cell_centroid_cache(state)
+        except Exception as error:
+            self.threshold_intensity_histogram.set_message(
+                "Could not map cell centroids"
+            )
+            self.threshold_fraction_histogram.set_message(
+                "Could not map cell centroids"
+            )
+            self.status_label.setText(str(error))
+            return
+
+        worker = ThresholdHistogramWorker(
+            request_id=self.threshold_histogram_request_id,
+            image_index=self.current_image_index,
+            image_state=state,
+            channel_name=self.channel_dropdown.currentText(),
+            intensity_threshold=self.threshold_intensity_value,
+            compartment=compartment,
+            inward_buffer_pixels=self.threshold_buffer_slider.value(),
+        )
+        worker.signals.finished.connect(self.on_threshold_histograms_ready)
+        worker.signals.error.connect(self.on_threshold_histograms_error)
+        self.threshold_histogram_worker = worker
+        self.thread_pool.start(worker)
+
+    def on_threshold_histograms_ready(self, result):
+        self.threshold_histogram_worker = None
+        if result["request_id"] != self.threshold_histogram_request_id:
+            self._start_threshold_histogram_worker()
+            return
+        if result["image_index"] != self.current_image_index:
+            return
+
+        denominator_pixels = np.asarray(result["denominator_pixels"])
+        included = denominator_pixels > 0
+        mean_intensities = np.asarray(result["mean_intensity"])[included]
+        positive_percentages = (
+            np.asarray(result["positive_fraction"])[included] * 100.0
+        )
+        self.threshold_intensity_histogram.set_data(
+            mean_intensities,
+            marker=self.threshold_intensity_value,
+        )
+        self.threshold_fraction_histogram.set_data(
+            positive_percentages,
+            marker=self.threshold_percent_slider.value(),
+            value_range=(0.0, 100.0),
+        )
+        channel_name = result["channel_name"]
+        self.threshold_intensity_histogram_label.setText(
+            f"All-image mean {channel_name} fluorescence per cell"
+        )
+        self.threshold_fraction_histogram_label.setText(
+            "All-image positive-pixel percentages per cell"
+        )
+
+    def on_threshold_histograms_error(self, payload):
+        self.threshold_histogram_worker = None
+        if payload["request_id"] != self.threshold_histogram_request_id:
+            self._start_threshold_histogram_worker()
+            return
+        self.threshold_intensity_histogram.set_message(
+            "Could not calculate histogram"
+        )
+        self.threshold_fraction_histogram.set_message(
+            "Could not calculate histogram"
+        )
+        self.status_label.setText(payload["error"])
 
     def _update_threshold_value(self, invalidate=True):
         if self.current_fov is None:
@@ -702,6 +1079,8 @@ class OrbitFOVViewer(QWidget):
     def threshold_slider_changed(self):
         if self.current_fov is not None:
             self._update_threshold_value(invalidate=True)
+        self._update_threshold_histogram_markers()
+        self.request_threshold_histogram_refresh(delay_ms=300)
         self.update_display()
 
     def threshold_percent_changed(self, value):
@@ -709,6 +1088,7 @@ class OrbitFOVViewer(QWidget):
             f"Positive pixels required: >{value}%"
         )
         self._invalidate_threshold_predictions()
+        self._update_threshold_histogram_markers()
         self.update_display()
 
     def threshold_compartment(self):
@@ -725,6 +1105,7 @@ class OrbitFOVViewer(QWidget):
     def threshold_compartment_changed(self):
         self._invalidate_threshold_predictions()
         self.update_threshold_controls()
+        self.request_threshold_histogram_refresh()
         self.update_display()
 
     def threshold_buffer_changed(self, value):
@@ -733,6 +1114,7 @@ class OrbitFOVViewer(QWidget):
             f"Inward boundary distance: {value} px ({distance_um:.1f} µm)"
         )
         self._invalidate_threshold_predictions()
+        self.request_threshold_histogram_refresh(delay_ms=300)
         self.update_display()
 
     def on_channel_changed(self):
@@ -740,6 +1122,10 @@ class OrbitFOVViewer(QWidget):
             self.threshold_intensity_value = None
             self.threshold_channel_name = None
             self._invalidate_threshold_predictions()
+            self.threshold_histogram_request_id += 1
+            self.threshold_histogram_timer.stop()
+            self.threshold_intensity_histogram.set_message("Loading channel…")
+            self.threshold_fraction_histogram.set_message("Loading channel…")
         self.reload_current_fov()
 
     def current_threshold_highlight(self):
@@ -848,6 +1234,8 @@ class OrbitFOVViewer(QWidget):
                 f"{self.segmentation_masks.shape[1]} x "
                 f"{self.segmentation_masks.shape[0]} mask."
             )
+            if self.active_tool == "threshold":
+                self.request_threshold_histogram_refresh()
             self.update_display()
         except Exception:
             self.status_label.setText(traceback.format_exc())
@@ -967,6 +1355,9 @@ class OrbitFOVViewer(QWidget):
         self.current_fov = state["current_fov"]
         self.current_dapi_fov = state["current_dapi_fov"]
         self.current_pixmap = None
+        if self.active_tool == "threshold":
+            self.threshold_intensity_value = None
+            self.threshold_channel_name = None
         self.channel_dropdown.blockSignals(True)
         self.channel_dropdown.clear()
         self.channel_dropdown.addItems(self.img.get_channel_names())
@@ -993,6 +1384,10 @@ class OrbitFOVViewer(QWidget):
         self.update_image_carousel_controls()
         self.update_model_controls()
         self.update_threshold_controls()
+        if self.active_tool == "threshold":
+            if self.current_fov is not None:
+                self._update_threshold_value(invalidate=False)
+            self.request_threshold_histogram_refresh()
 
     def switch_image(self, index):
         if self.is_loading or index == self.current_image_index:
@@ -1973,6 +2368,8 @@ class OrbitFOVViewer(QWidget):
         self.model_bundle = None
         self.threshold_intensity_value = None
         self.threshold_channel_name = None
+        self.threshold_histogram_request_id += 1
+        self.threshold_histogram_timer.stop()
         self.project_path = None
         self.training_navigation_indices = {"positive": -1, "negative": -1}
         self.phenotype_name.clear()
@@ -1996,6 +2393,14 @@ class OrbitFOVViewer(QWidget):
             "Inward boundary distance: 10 px (5.1 µm)"
         )
         self.threshold_intensity_label.setText("Intensity threshold: —")
+        self.threshold_intensity_histogram_label.setText(
+            "All-image mean fluorescence per cell"
+        )
+        self.threshold_fraction_histogram_label.setText(
+            "All-image positive-pixel percentages per cell"
+        )
+        self.threshold_intensity_histogram.set_message("Load an image")
+        self.threshold_fraction_histogram.set_message("Load an image")
         self.channel_dropdown.clear()
         self.image_label.clear()
         self.image_label.setText("Select a QPTIFF image")
@@ -2267,6 +2672,7 @@ class OrbitFOVViewer(QWidget):
                 != self.channel_dropdown.currentText()
             ):
                 self._update_threshold_value(invalidate=True)
+            self.request_threshold_histogram_refresh()
         self.update_display()
 
     def on_fov_error(self, error_message: str):
