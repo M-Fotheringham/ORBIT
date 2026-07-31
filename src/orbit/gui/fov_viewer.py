@@ -14,13 +14,19 @@ from sklearn.pipeline import Pipeline
 from PySide6.QtWidgets import (
     QWidget, QPushButton, QLabel, QFileDialog, QVBoxLayout, QHBoxLayout,
     QComboBox, QCheckBox, QProgressBar, QSizePolicy, QLineEdit, QGroupBox,
-    QFormLayout, QMessageBox, QMenuBar,
+    QFormLayout, QMessageBox, QMenuBar, QSlider, QStackedWidget,
 )
-from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QAction
+from PySide6.QtGui import (
+    QPixmap, QImage, QPainter, QColor, QPen, QAction, QActionGroup,
+)
 from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool
 
 from orbit.image import QPTiffImage
 from orbit.fov import RandomFOVGenerator
+from orbit.threshold import (
+    intensity_threshold_from_slider,
+    phenotype_cells_by_threshold,
+)
 
 
 COLOR_MAPS = {
@@ -46,6 +52,7 @@ def array_to_qpixmap(
     dapi_arr: np.ndarray | None = None,
     show_dapi: bool = True,
     segmentation_boundary: np.ndarray | None = None,
+    threshold_highlight: np.ndarray | None = None,
     annotation_markers: list[dict] | None = None,
 ) -> QPixmap:
     marker = normalize_channel(marker_arr)
@@ -57,6 +64,12 @@ def array_to_qpixmap(
 
     if show_dapi and dapi_arr is not None:
         rgb[:, :, 2] = np.maximum(rgb[:, :, 2], normalize_channel(dapi_arr))
+
+    if threshold_highlight is not None:
+        highlighted = threshold_highlight.astype(bool)
+        rgb[highlighted, 0] = 255
+        rgb[highlighted, 1] = 255
+        rgb[highlighted, 2] = 0
 
     if segmentation_boundary is not None:
         boundary = segmentation_boundary.astype(bool)
@@ -72,7 +85,11 @@ def array_to_qpixmap(
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing)
         for marker in annotation_markers:
-            radius = 3 if marker.get("source") == "model" else 5
+            radius = (
+                3
+                if marker.get("source") in {"model", "threshold"}
+                else 5
+            )
             color = QColor("#00e640" if marker["label"] == "positive" else "#ff3030")
             painter.setPen(QPen(QColor("black"), 1))
             painter.setBrush(color)
@@ -127,6 +144,61 @@ class FOVLoadWorker(QRunnable):
             self.signals.error.emit(traceback.format_exc())
 
 
+class ThresholdWorkerSignals(QObject):
+    finished = Signal(object)
+    error = Signal(str)
+
+
+class ThresholdApplyWorker(QRunnable):
+    def __init__(
+        self,
+        image_states,
+        channel_name,
+        intensity_threshold,
+        positive_pixel_fraction,
+    ):
+        super().__init__()
+        self.image_states = image_states
+        self.channel_name = channel_name
+        self.intensity_threshold = intensity_threshold
+        self.positive_pixel_fraction = positive_pixel_fraction
+        self.signals = ThresholdWorkerSignals()
+
+    def run(self):
+        try:
+            results = []
+            for state in self.image_states:
+                channel_names = list(state["img"].get_channel_names())
+                if self.channel_name not in channel_names:
+                    raise ValueError(
+                        f"{Path(state['image_path']).name} does not contain the "
+                        f"channel '{self.channel_name}'."
+                    )
+                channel_index = channel_names.index(self.channel_name)
+                channel = state["img"].get_channel(channel_index)
+                centroid_cache = state["centroid_cache"]
+                result = phenotype_cells_by_threshold(
+                    channel=channel,
+                    masks=state["segmentation_masks"],
+                    cell_data=state["cell_data"],
+                    centroid_x=centroid_cache["x"],
+                    centroid_y=centroid_cache["y"],
+                    intensity_threshold=self.intensity_threshold,
+                    positive_pixel_fraction=self.positive_pixel_fraction,
+                )
+                result.update({
+                    "x": centroid_cache["x"],
+                    "y": centroid_cache["y"],
+                    "channel_name": self.channel_name,
+                    "intensity_threshold": self.intensity_threshold,
+                    "positive_pixel_fraction": self.positive_pixel_fraction,
+                })
+                results.append(result)
+            self.signals.finished.emit(results)
+        except Exception:
+            self.signals.error.emit(traceback.format_exc())
+
+
 class OrbitFOVViewer(QWidget):
     def __init__(self):
         super().__init__()
@@ -147,6 +219,10 @@ class OrbitFOVViewer(QWidget):
         self.loaded_images = []
         self.current_image_index = -1
         self.model_bundle = None
+        self.active_tool = "random_forest"
+        self.threshold_intensity_value = None
+        self.threshold_channel_name = None
+        self.threshold_worker = None
 
         # Segmentation data remain in whole-slide pixel coordinates. Only the
         # current FOV is cropped and converted to a boundary overlay.
@@ -186,7 +262,7 @@ class OrbitFOVViewer(QWidget):
         self.regenerate_button.setEnabled(False)
 
         self.channel_dropdown = QComboBox()
-        self.channel_dropdown.currentIndexChanged.connect(self.reload_current_fov)
+        self.channel_dropdown.currentIndexChanged.connect(self.on_channel_changed)
         self.channel_dropdown.setEnabled(False)
         self.color_dropdown = QComboBox()
         self.color_dropdown.addItems(COLOR_MAPS.keys())
@@ -307,6 +383,104 @@ class OrbitFOVViewer(QWidget):
         model_layout.addWidget(self.export_cell_phenotypes_button)
         model_panel.setLayout(model_layout)
 
+        random_forest_page = QWidget()
+        random_forest_layout = QVBoxLayout(random_forest_page)
+        random_forest_layout.setContentsMargins(0, 0, 0, 0)
+        random_forest_layout.addWidget(training_panel)
+        random_forest_layout.addWidget(model_panel)
+
+        self.threshold_phenotype_name = QLineEdit()
+        self.threshold_phenotype_name.setPlaceholderText("e.g. CD8-positive")
+        self.phenotype_name.textChanged.connect(
+            self.sync_phenotype_name_from_random_forest
+        )
+        self.threshold_phenotype_name.textChanged.connect(
+            self.sync_phenotype_name_from_threshold
+        )
+
+        threshold_description = QLabel(
+            "Pixels in the displayed channel above the intensity threshold "
+            "are highlighted yellow."
+        )
+        threshold_description.setWordWrap(True)
+        self.threshold_intensity_label = QLabel("Intensity threshold: —")
+        self.threshold_intensity_slider = QSlider(Qt.Horizontal)
+        self.threshold_intensity_slider.setRange(0, 1000)
+        self.threshold_intensity_slider.setValue(500)
+        self.threshold_intensity_slider.valueChanged.connect(
+            self.threshold_slider_changed
+        )
+        self.threshold_percent_label = QLabel(
+            "Positive pixels required: >25%"
+        )
+        self.threshold_percent_slider = QSlider(Qt.Horizontal)
+        self.threshold_percent_slider.setRange(1, 100)
+        self.threshold_percent_slider.setValue(25)
+        self.threshold_percent_slider.valueChanged.connect(
+            self.threshold_percent_changed
+        )
+        self.apply_threshold_button = QPushButton(
+            "Apply Threshold to All Cells"
+        )
+        self.apply_threshold_button.clicked.connect(
+            self.apply_threshold_to_all_cells
+        )
+        self.threshold_phenotypes_checkbox = QCheckBox(
+            "Show Threshold Phenotypes"
+        )
+        self.threshold_phenotypes_checkbox.setChecked(True)
+        self.threshold_phenotypes_checkbox.stateChanged.connect(
+            self.update_display
+        )
+        self.threshold_positive_count_label = QLabel("Threshold positive: 0")
+        self.threshold_negative_count_label = QLabel("Threshold negative: 0")
+        self.export_threshold_phenotypes_button = QPushButton(
+            "Export Cell Phenotypes"
+        )
+        self.export_threshold_phenotypes_button.setToolTip(
+            "Export every original Cellpose TSV column and the threshold-derived "
+            "Positive/Negative phenotype labels for every loaded image"
+        )
+        self.export_threshold_phenotypes_button.clicked.connect(
+            self.export_cell_phenotypes
+        )
+
+        threshold_panel = QGroupBox("Threshold Phenotyping")
+        threshold_panel.setMinimumWidth(220)
+        threshold_panel.setMaximumWidth(300)
+        threshold_layout = QVBoxLayout()
+        threshold_name_layout = QFormLayout()
+        threshold_name_layout.addRow(
+            "Phenotype:", self.threshold_phenotype_name
+        )
+        threshold_layout.addLayout(threshold_name_layout)
+        threshold_layout.addWidget(threshold_description)
+        threshold_layout.addSpacing(8)
+        threshold_layout.addWidget(self.threshold_intensity_label)
+        threshold_layout.addWidget(self.threshold_intensity_slider)
+        threshold_layout.addSpacing(8)
+        threshold_layout.addWidget(self.threshold_percent_label)
+        threshold_layout.addWidget(self.threshold_percent_slider)
+        threshold_layout.addWidget(self.apply_threshold_button)
+        threshold_layout.addWidget(self.threshold_phenotypes_checkbox)
+        threshold_layout.addWidget(self.threshold_positive_count_label)
+        threshold_layout.addWidget(self.threshold_negative_count_label)
+        threshold_layout.addStretch()
+        threshold_layout.addWidget(self.export_threshold_phenotypes_button)
+        threshold_panel.setLayout(threshold_layout)
+
+        threshold_page = QWidget()
+        threshold_page_layout = QVBoxLayout(threshold_page)
+        threshold_page_layout.setContentsMargins(0, 0, 0, 0)
+        threshold_page_layout.addWidget(threshold_panel)
+        threshold_page_layout.addStretch()
+
+        self.right_panel_stack = QStackedWidget()
+        self.right_panel_stack.setMinimumWidth(220)
+        self.right_panel_stack.setMaximumWidth(300)
+        self.right_panel_stack.addWidget(random_forest_page)
+        self.right_panel_stack.addWidget(threshold_page)
+
         toolbar = QHBoxLayout()
         for widget in (
             self.open_button, self.load_segmentation_button,
@@ -350,14 +524,30 @@ class OrbitFOVViewer(QWidget):
         file_menu.addSeparator()
         file_menu.addAction(self.import_model_action)
         file_menu.addAction(self.export_model_action)
+
+        tools_menu = self.menu_bar.addMenu("&Tools")
+        self.tool_action_group = QActionGroup(self)
+        self.tool_action_group.setExclusive(True)
+        self.random_forest_tool_action = QAction("Random Forest", self)
+        self.random_forest_tool_action.setCheckable(True)
+        self.random_forest_tool_action.setChecked(True)
+        self.random_forest_tool_action.triggered.connect(
+            lambda: self.set_tool_mode("random_forest")
+        )
+        self.threshold_tool_action = QAction("Threshold Slider", self)
+        self.threshold_tool_action.setCheckable(True)
+        self.threshold_tool_action.triggered.connect(
+            lambda: self.set_tool_mode("threshold")
+        )
+        self.tool_action_group.addAction(self.random_forest_tool_action)
+        self.tool_action_group.addAction(self.threshold_tool_action)
+        tools_menu.addAction(self.random_forest_tool_action)
+        tools_menu.addAction(self.threshold_tool_action)
         layout.setMenuBar(self.menu_bar)
 
         viewer_layout = QHBoxLayout()
         viewer_layout.addWidget(self.image_label, stretch=1)
-        right_panel = QVBoxLayout()
-        right_panel.addWidget(training_panel)
-        right_panel.addWidget(model_panel)
-        viewer_layout.addLayout(right_panel)
+        viewer_layout.addWidget(self.right_panel_stack)
         layout.addLayout(viewer_layout, stretch=1)
         layout.addWidget(self.spinner)
         layout.addWidget(self.status_label)
@@ -387,6 +577,7 @@ class OrbitFOVViewer(QWidget):
         self.update_training_navigation_controls()
         self.update_image_carousel_controls()
         self.update_model_controls()
+        self.update_threshold_controls()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -399,6 +590,101 @@ class OrbitFOVViewer(QWidget):
         self.image_label.setPixmap(self.current_pixmap.scaled(
             self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
         ))
+
+    def sync_phenotype_name_from_random_forest(self, text):
+        if self.threshold_phenotype_name.text() == text:
+            return
+        self.threshold_phenotype_name.blockSignals(True)
+        self.threshold_phenotype_name.setText(text)
+        self.threshold_phenotype_name.blockSignals(False)
+
+    def sync_phenotype_name_from_threshold(self, text):
+        if self.phenotype_name.text() == text:
+            return
+        self.phenotype_name.blockSignals(True)
+        self.phenotype_name.setText(text)
+        self.phenotype_name.blockSignals(False)
+
+    def set_tool_mode(self, tool):
+        if tool not in {"random_forest", "threshold"}:
+            tool = "random_forest"
+        self.active_tool = tool
+        threshold_mode = tool == "threshold"
+        self.right_panel_stack.setCurrentIndex(1 if threshold_mode else 0)
+        self.random_forest_tool_action.setChecked(not threshold_mode)
+        self.threshold_tool_action.setChecked(threshold_mode)
+
+        if threshold_mode and self.current_fov is not None:
+            displayed_channel = self.channel_dropdown.currentText()
+            if (
+                self.threshold_intensity_value is None
+                or self.threshold_channel_name != displayed_channel
+            ):
+                self._update_threshold_value(invalidate=False)
+        self.update_model_controls()
+        self.update_threshold_controls()
+        self.update_display()
+
+    def _invalidate_threshold_predictions(self):
+        for state in self.loaded_images:
+            state["threshold_predictions"] = None
+        self.update_threshold_prediction_counts()
+        self.update_threshold_controls()
+
+    def _update_threshold_value(self, invalidate=True):
+        if self.current_fov is None:
+            self.threshold_intensity_value = None
+            self.threshold_channel_name = None
+            self.threshold_intensity_label.setText("Intensity threshold: —")
+            return
+        self.threshold_intensity_value = intensity_threshold_from_slider(
+            self.current_fov,
+            self.threshold_intensity_slider.value(),
+            self.threshold_intensity_slider.maximum(),
+        )
+        self.threshold_channel_name = self.channel_dropdown.currentText()
+        normalized_percent = (
+            100
+            * self.threshold_intensity_slider.value()
+            / self.threshold_intensity_slider.maximum()
+        )
+        self.threshold_intensity_label.setText(
+            f"Intensity threshold: {self.threshold_intensity_value:.6g} "
+            f"({normalized_percent:.1f}% of display range)"
+        )
+        if invalidate:
+            self._invalidate_threshold_predictions()
+
+    def threshold_slider_changed(self):
+        if self.current_fov is not None:
+            self._update_threshold_value(invalidate=True)
+        self.update_display()
+
+    def threshold_percent_changed(self, value):
+        self.threshold_percent_label.setText(
+            f"Positive pixels required: >{value}%"
+        )
+        self._invalidate_threshold_predictions()
+        self.update_display()
+
+    def on_channel_changed(self):
+        if self.active_tool == "threshold":
+            self.threshold_intensity_value = None
+            self.threshold_channel_name = None
+            self._invalidate_threshold_predictions()
+        self.reload_current_fov()
+
+    def current_threshold_highlight(self):
+        if self.active_tool != "threshold" or self.current_fov is None:
+            return None
+        if (
+            self.threshold_intensity_value is None
+            or self.threshold_channel_name != self.channel_dropdown.currentText()
+        ):
+            self._update_threshold_value(
+                invalidate=self.threshold_channel_name is not None
+            )
+        return np.asarray(self.current_fov) > self.threshold_intensity_value
 
     def set_loading(self, loading: bool, message: str = ""):
         self.is_loading = loading
@@ -417,6 +703,7 @@ class OrbitFOVViewer(QWidget):
         self.update_training_navigation_controls()
         self.update_image_carousel_controls()
         self.update_model_controls()
+        self.update_threshold_controls()
 
     def open_qptiff(self):
         image_path, _ = QFileDialog.getOpenFileName(
@@ -481,6 +768,9 @@ class OrbitFOVViewer(QWidget):
             self.annotations.clear()
             self.training_navigation_indices = {"positive": -1, "negative": -1}
             self.loaded_images[self.current_image_index]["model_predictions"] = None
+            self.loaded_images[self.current_image_index][
+                "threshold_predictions"
+            ] = None
             self.loaded_images[self.current_image_index]["centroid_cache"] = None
             self._capture_current_image_state()
             self.update_annotation_counts()
@@ -525,6 +815,7 @@ class OrbitFOVViewer(QWidget):
             "channel_index": 0,
             "centroid_cache": None,
             "model_predictions": None,
+            "threshold_predictions": None,
         }
 
     def _read_segmentation(self, cell_path, mask_path, image=None):
@@ -612,6 +903,7 @@ class OrbitFOVViewer(QWidget):
         self.image_carousel.blockSignals(False)
         self.update_annotation_counts()
         self.update_model_prediction_counts()
+        self.update_threshold_prediction_counts()
 
         if self.current_fov is None:
             self.image_label.clear()
@@ -622,6 +914,7 @@ class OrbitFOVViewer(QWidget):
             self.update_display()
         self.update_image_carousel_controls()
         self.update_model_controls()
+        self.update_threshold_controls()
 
     def switch_image(self, index):
         if self.is_loading or index == self.current_image_index:
@@ -659,7 +952,11 @@ class OrbitFOVViewer(QWidget):
         self.image_carousel.setEnabled(has_images and not self.is_loading)
 
     def label_clicked_cell(self, x_fraction, y_fraction):
-        if self.current_fov is None or self.segmentation_masks is None:
+        if (
+            self.active_tool != "random_forest"
+            or self.current_fov is None
+            or self.segmentation_masks is None
+        ):
             return
 
         height, width = self.current_fov.shape[:2]
@@ -1150,6 +1447,184 @@ class OrbitFOVViewer(QWidget):
         self.export_model_action.setEnabled(self.model_bundle is not None)
         self.import_model_action.setEnabled(not self.is_loading)
 
+    def apply_threshold_to_all_cells(self):
+        if self.current_fov is None:
+            QMessageBox.warning(
+                self,
+                "Apply threshold",
+                "Generate a field of view before choosing an intensity threshold.",
+            )
+            return
+        if not self.loaded_images or any(
+            state["cell_data"] is None or state["segmentation_masks"] is None
+            for state in self.loaded_images
+        ):
+            QMessageBox.warning(
+                self,
+                "Apply threshold",
+                "Every loaded image must have cell data and a segmentation mask.",
+            )
+            return
+
+        channel_name = self.channel_dropdown.currentText()
+        if (
+            self.threshold_intensity_value is None
+            or self.threshold_channel_name != channel_name
+        ):
+            self._update_threshold_value(invalidate=True)
+
+        try:
+            for state in self.loaded_images:
+                if channel_name not in state["img"].get_channel_names():
+                    raise ValueError(
+                        f"{Path(state['image_path']).name} does not contain the "
+                        f"channel '{channel_name}'."
+                    )
+                self._cell_centroid_cache(state)
+        except Exception as error:
+            QMessageBox.warning(self, "Could not apply threshold", str(error))
+            return
+
+        positive_pixel_fraction = self.threshold_percent_slider.value() / 100
+        self._invalidate_threshold_predictions()
+        self.set_loading(
+            True,
+            f"Applying {channel_name} threshold to all loaded cells...",
+        )
+        worker = ThresholdApplyWorker(
+            image_states=list(self.loaded_images),
+            channel_name=channel_name,
+            intensity_threshold=self.threshold_intensity_value,
+            positive_pixel_fraction=positive_pixel_fraction,
+        )
+        worker.signals.finished.connect(self.on_threshold_applied)
+        worker.signals.error.connect(self.on_threshold_apply_error)
+        self.threshold_worker = worker
+        self.thread_pool.start(worker)
+
+    def on_threshold_applied(self, results):
+        try:
+            if len(results) != len(self.loaded_images):
+                raise ValueError(
+                    "Threshold results did not match the loaded image count."
+                )
+            for state, predictions in zip(self.loaded_images, results):
+                if len(predictions["positive"]) != len(state["cell_data"]):
+                    raise ValueError(
+                        f"Threshold result count does not match "
+                        f"{Path(state['image_path']).name}."
+                    )
+                state["threshold_predictions"] = predictions
+            self.threshold_phenotypes_checkbox.setChecked(True)
+            self.update_threshold_prediction_counts()
+            self.update_threshold_controls()
+            self.update_display()
+            total_cells = sum(
+                len(state["cell_data"]) for state in self.loaded_images
+            )
+            self.set_loading(
+                False,
+                f"Applied threshold to {total_cells:,} cells across "
+                f"{len(self.loaded_images)} image(s).",
+            )
+        except Exception as error:
+            self.on_threshold_apply_error(str(error))
+        finally:
+            self.threshold_worker = None
+
+    def on_threshold_apply_error(self, error_message):
+        self.threshold_worker = None
+        self.set_loading(False)
+        QMessageBox.warning(
+            self,
+            "Could not apply threshold",
+            error_message,
+        )
+
+    def current_threshold_markers(self):
+        if (
+            self.active_tool != "threshold"
+            or not self.threshold_phenotypes_checkbox.isChecked()
+            or not (0 <= self.current_image_index < len(self.loaded_images))
+            or self.current_fov is None
+        ):
+            return []
+        predictions = self.loaded_images[self.current_image_index].get(
+            "threshold_predictions"
+        )
+        if predictions is None:
+            return []
+        x0, y0 = float(self.current_x0), float(self.current_y0)
+        height, width = self.current_fov.shape[:2]
+        x, y = predictions["x"], predictions["y"]
+        visible = (
+            np.isfinite(x) & np.isfinite(y)
+            & (x >= x0) & (x < x0 + width)
+            & (y >= y0) & (y < y0 + height)
+        )
+        indices = np.flatnonzero(visible)
+        return [
+            {
+                "x": float(x[index] - x0),
+                "y": float(y[index] - y0),
+                "label": (
+                    "positive" if predictions["positive"][index] else "negative"
+                ),
+                "source": "threshold",
+            }
+            for index in indices
+        ]
+
+    def update_threshold_prediction_counts(self):
+        if not hasattr(self, "threshold_positive_count_label"):
+            return
+        positive = negative = 0
+        for state in self.loaded_images:
+            predictions = state.get("threshold_predictions")
+            if predictions is None:
+                continue
+            positive_count = int(np.count_nonzero(predictions["positive"]))
+            positive += positive_count
+            negative += int(len(predictions["positive"]) - positive_count)
+        self.threshold_positive_count_label.setText(
+            f"Threshold positive: {positive:,}"
+        )
+        self.threshold_negative_count_label.setText(
+            f"Threshold negative: {negative:,}"
+        )
+
+    def update_threshold_controls(self):
+        if not hasattr(self, "threshold_intensity_slider"):
+            return
+        threshold_mode = self.active_tool == "threshold"
+        has_fov = self.current_fov is not None
+        all_have_segmentation = bool(self.loaded_images) and all(
+            state["cell_data"] is not None
+            and state["segmentation_masks"] is not None
+            for state in self.loaded_images
+        )
+        has_predictions = any(
+            state.get("threshold_predictions") is not None
+            for state in self.loaded_images
+        )
+        all_have_predictions = bool(self.loaded_images) and all(
+            state.get("threshold_predictions") is not None
+            for state in self.loaded_images
+        )
+        editable = threshold_mode and not self.is_loading
+        self.threshold_phenotype_name.setEnabled(editable)
+        self.threshold_intensity_slider.setEnabled(editable and has_fov)
+        self.threshold_percent_slider.setEnabled(editable and has_fov)
+        self.apply_threshold_button.setEnabled(
+            editable and has_fov and all_have_segmentation
+        )
+        self.threshold_phenotypes_checkbox.setEnabled(
+            editable and has_predictions
+        )
+        self.export_threshold_phenotypes_button.setEnabled(
+            editable and all_have_predictions
+        )
+
     @staticmethod
     def _unique_export_column(preferred_name, existing_columns):
         if preferred_name not in existing_columns:
@@ -1163,29 +1638,48 @@ class OrbitFOVViewer(QWidget):
         return f"{orbit_name} {suffix}"
 
     def export_cell_phenotypes(self):
-        if self.model_bundle is None:
-            QMessageBox.warning(
-                self,
-                "Export cell phenotypes",
-                "Train or import and apply a model before exporting.",
+        threshold_export = self.active_tool == "threshold"
+        if threshold_export:
+            prediction_key = "threshold_predictions"
+            prediction_source = "Threshold"
+            features = []
+            phenotype_name = (
+                self.threshold_phenotype_name.text().strip() or "Phenotype"
             )
-            return
+            missing_message = (
+                "Apply the threshold to all loaded images before exporting."
+            )
+        else:
+            if self.model_bundle is None:
+                QMessageBox.warning(
+                    self,
+                    "Export cell phenotypes",
+                    "Train or import and apply a model before exporting.",
+                )
+                return
+            prediction_key = "model_predictions"
+            prediction_source = "Model"
+            features = list(self.model_bundle["feature_columns"])
+            phenotype_name = (
+                self.phenotype_name.text().strip()
+                or self.model_bundle.get("phenotype_name", "").strip()
+                or "Phenotype"
+            )
+            missing_message = (
+                "Apply the model to all loaded images before exporting."
+            )
+
         if not self.loaded_images or any(
-            state.get("model_predictions") is None
+            state.get(prediction_key) is None
             for state in self.loaded_images
         ):
             QMessageBox.warning(
                 self,
                 "Export cell phenotypes",
-                "Apply the model to all loaded images before exporting.",
+                missing_message,
             )
             return
 
-        phenotype_name = (
-            self.phenotype_name.text().strip()
-            or self.model_bundle.get("phenotype_name", "").strip()
-            or "Phenotype"
-        )
         safe_name = "".join(
             character if character.isalnum() or character in "-_" else "_"
             for character in phenotype_name
@@ -1206,7 +1700,6 @@ class OrbitFOVViewer(QWidget):
         if not Path(path).suffix:
             path += ".csv" if export_csv else ".tsv"
         separator = "," if export_csv else "\t"
-        features = list(self.model_bundle["feature_columns"])
         original_columns = []
         seen_columns = set()
         for state in self.loaded_images:
@@ -1233,7 +1726,7 @@ class OrbitFOVViewer(QWidget):
 
         try:
             for image_index, state in enumerate(self.loaded_images):
-                predictions = state["model_predictions"]
+                predictions = state[prediction_key]
                 cell_data = state["cell_data"]
                 if len(predictions["positive"]) != len(cell_data):
                     raise ValueError(
@@ -1260,17 +1753,20 @@ class OrbitFOVViewer(QWidget):
                 labels = np.where(
                     predictions["positive"], "Positive", "Negative"
                 ).astype(object)
-                label_sources = np.full(len(cell_data), "Model", dtype=object)
-                for annotation in state["annotations"].values():
-                    row_index = self._find_cell_row_index(state, annotation)
-                    if row_index is None:
-                        continue
-                    labels[row_index] = (
-                        "Positive"
-                        if annotation["label"] == "positive"
-                        else "Negative"
-                    )
-                    label_sources[row_index] = "Manual Training"
+                label_sources = np.full(
+                    len(cell_data), prediction_source, dtype=object
+                )
+                if not threshold_export:
+                    for annotation in state["annotations"].values():
+                        row_index = self._find_cell_row_index(state, annotation)
+                        if row_index is None:
+                            continue
+                        labels[row_index] = (
+                            "Positive"
+                            if annotation["label"] == "positive"
+                            else "Negative"
+                        )
+                        label_sources[row_index] = "Manual Training"
                 export_data[label_column] = labels
                 export_data[source_column] = label_sources
 
@@ -1374,9 +1870,19 @@ class OrbitFOVViewer(QWidget):
         self.current_pixmap = None
         self.annotations = {}
         self.model_bundle = None
+        self.threshold_intensity_value = None
+        self.threshold_channel_name = None
         self.project_path = None
         self.training_navigation_indices = {"positive": -1, "negative": -1}
         self.phenotype_name.clear()
+        self.threshold_intensity_slider.blockSignals(True)
+        self.threshold_intensity_slider.setValue(500)
+        self.threshold_intensity_slider.blockSignals(False)
+        self.threshold_percent_slider.blockSignals(True)
+        self.threshold_percent_slider.setValue(25)
+        self.threshold_percent_slider.blockSignals(False)
+        self.threshold_percent_label.setText("Positive pixels required: >25%")
+        self.threshold_intensity_label.setText("Intensity threshold: —")
         self.channel_dropdown.clear()
         self.image_label.clear()
         self.image_label.setText("Select a QPTIFF image")
@@ -1384,7 +1890,10 @@ class OrbitFOVViewer(QWidget):
         self._refresh_image_carousel()
         self.update_annotation_counts()
         self.update_model_prediction_counts()
+        self.update_threshold_prediction_counts()
+        self.set_tool_mode("random_forest")
         self.update_model_controls()
+        self.update_threshold_controls()
         self.set_loading(False, "New project")
 
     def project_data(self):
@@ -1427,6 +1936,13 @@ class OrbitFOVViewer(QWidget):
                 "color": self.color_dropdown.currentText(),
                 "show_dapi": self.dapi_checkbox.isChecked(),
                 "show_segmentation": self.segmentation_checkbox.isChecked(),
+                "tool": self.active_tool,
+                "threshold": {
+                    "intensity_slider": self.threshold_intensity_slider.value(),
+                    "positive_pixel_percent": (
+                        self.threshold_percent_slider.value()
+                    ),
+                },
             },
         }
 
@@ -1524,9 +2040,26 @@ class OrbitFOVViewer(QWidget):
             self.loaded_images = loaded_states
             self.current_image_index = -1
             self.model_bundle = None
+            self.threshold_intensity_value = None
+            self.threshold_channel_name = None
             self.model_status_label.setText("No model trained or loaded.")
             self.fov_size = int(viewer.get("fov_size", 512))
             self.phenotype_name.setText(phenotype.get("name", ""))
+            threshold_settings = viewer.get("threshold", {})
+            self.threshold_intensity_slider.blockSignals(True)
+            self.threshold_intensity_slider.setValue(
+                int(threshold_settings.get("intensity_slider", 500))
+            )
+            self.threshold_intensity_slider.blockSignals(False)
+            self.threshold_percent_slider.blockSignals(True)
+            self.threshold_percent_slider.setValue(
+                int(threshold_settings.get("positive_pixel_percent", 25))
+            )
+            self.threshold_percent_slider.blockSignals(False)
+            self.threshold_percent_label.setText(
+                "Positive pixels required: "
+                f">{self.threshold_percent_slider.value()}%"
+            )
             self.positive_annotations_checkbox.setChecked(
                 phenotype.get("show_positive", True)
             )
@@ -1543,6 +2076,7 @@ class OrbitFOVViewer(QWidget):
             target_index = min(max(target_index, 0), len(self.loaded_images) - 1)
             self._refresh_image_carousel()
             self._activate_image(target_index)
+            self.set_tool_mode(viewer.get("tool", "random_forest"))
             self.project_path = str(Path(path).resolve())
             has_fov = self.current_x0 is not None and self.current_y0 is not None
             message = f"Opened project: {self.project_path}"
@@ -1579,6 +2113,14 @@ class OrbitFOVViewer(QWidget):
         self.current_fov, self.current_dapi_fov = marker_fov, dapi_fov
         self.set_loading(False)
         self.regenerate_button.setEnabled(True)
+        if self.active_tool == "threshold":
+            if self.threshold_intensity_value is None:
+                self._update_threshold_value(invalidate=False)
+            elif (
+                self.threshold_channel_name
+                != self.channel_dropdown.currentText()
+            ):
+                self._update_threshold_value(invalidate=True)
         self.update_display()
 
     def on_fov_error(self, error_message: str):
@@ -1609,16 +2151,23 @@ class OrbitFOVViewer(QWidget):
             boundary = None
             if self.segmentation_checkbox.isChecked():
                 boundary = self.current_segmentation_boundary()
+            if self.active_tool == "threshold":
+                threshold_highlight = self.current_threshold_highlight()
+                annotation_markers = self.current_threshold_markers()
+            else:
+                threshold_highlight = None
+                annotation_markers = (
+                    self.current_model_markers()
+                    + self.current_annotation_markers()
+                )
             self.current_pixmap = array_to_qpixmap(
                 marker_arr=self.current_fov,
                 marker_color=self.color_dropdown.currentText(),
                 dapi_arr=self.current_dapi_fov,
                 show_dapi=self.dapi_checkbox.isChecked(),
                 segmentation_boundary=boundary,
-                annotation_markers=(
-                    self.current_model_markers()
-                    + self.current_annotation_markers()
-                ),
+                threshold_highlight=threshold_highlight,
+                annotation_markers=annotation_markers,
             )
             self.display_pixmap()
         except Exception:
