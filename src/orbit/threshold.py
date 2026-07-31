@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from scipy.ndimage import distance_transform_edt
 
 
 def intensity_threshold_from_slider(
@@ -31,13 +32,80 @@ def _grow_counts(counts: np.ndarray, required_size: int) -> np.ndarray:
     return expanded
 
 
+def _inner_boundaries(labels: np.ndarray) -> np.ndarray:
+    """Find boundary pixels inside each positive labelled region."""
+    labels = np.asarray(labels)
+    cell_pixels = labels > 0
+    boundary = np.zeros(labels.shape, dtype=bool)
+
+    vertical_change = labels[1:, :] != labels[:-1, :]
+    boundary[1:, :] |= cell_pixels[1:, :] & vertical_change
+    boundary[:-1, :] |= cell_pixels[:-1, :] & vertical_change
+
+    horizontal_change = labels[:, 1:] != labels[:, :-1]
+    boundary[:, 1:] |= cell_pixels[:, 1:] & horizontal_change
+    boundary[:, :-1] |= cell_pixels[:, :-1] & horizontal_change
+
+    boundary[0, :] |= cell_pixels[0, :]
+    boundary[-1, :] |= cell_pixels[-1, :]
+    boundary[:, 0] |= cell_pixels[:, 0]
+    boundary[:, -1] |= cell_pixels[:, -1]
+    return boundary
+
+
+def compartment_mask_for_rows(
+    masks: np.ndarray,
+    y0: int,
+    y1: int,
+    compartment: str,
+    inward_buffer_pixels: int,
+) -> np.ndarray:
+    """Return the selected compartment for a row block of a labelled mask."""
+    masks = np.asarray(masks)
+    if compartment == "all":
+        return masks[y0:y1] > 0
+    if compartment not in {"nucleus", "cytoplasm_membrane"}:
+        raise ValueError(f"Unsupported threshold compartment: {compartment}")
+    if inward_buffer_pixels < 0:
+        raise ValueError("The inward-buffer distance cannot be negative.")
+
+    # Include a halo larger than the requested distance so the artificial
+    # horizontal chunk edges cannot influence the rows returned to the caller.
+    halo = int(inward_buffer_pixels) + 2
+    halo_y0 = max(y0 - halo, 0)
+    halo_y1 = min(y1 + halo, masks.shape[0])
+    mask_chunk = np.asarray(masks[halo_y0:halo_y1])
+    cell_pixels = mask_chunk > 0
+    boundary = _inner_boundaries(mask_chunk)
+
+    if np.any(boundary):
+        distance_from_boundary = distance_transform_edt(~boundary)
+    else:
+        distance_from_boundary = np.full(mask_chunk.shape, np.inf)
+
+    if compartment == "nucleus":
+        selected = cell_pixels & (
+            distance_from_boundary > inward_buffer_pixels
+        )
+    else:
+        selected = cell_pixels & (
+            distance_from_boundary <= inward_buffer_pixels
+        )
+
+    row_start = y0 - halo_y0
+    row_stop = row_start + (y1 - y0)
+    return selected[row_start:row_stop]
+
+
 def pixel_counts_by_mask_label(
     channel: np.ndarray,
     masks: np.ndarray,
     intensity_threshold: float,
-    chunk_rows: int = 2048,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Count total and above-threshold pixels for each positive mask label."""
+    compartment: str = "all",
+    inward_buffer_pixels: int = 10,
+    chunk_rows: int = 512,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Count whole-cell, denominator, and positive pixels by mask label."""
     channel = np.asarray(channel)
     masks = np.asarray(masks)
     if channel.ndim != 2 or masks.ndim != 2:
@@ -47,10 +115,15 @@ def pixel_counts_by_mask_label(
             "The fluorescence channel and segmentation mask dimensions differ "
             f"({channel.shape} versus {masks.shape})."
         )
+    if compartment not in {"all", "nucleus", "cytoplasm_membrane"}:
+        raise ValueError(f"Unsupported threshold compartment: {compartment}")
+    if inward_buffer_pixels < 0:
+        raise ValueError("The inward-buffer distance cannot be negative.")
     if chunk_rows <= 0:
         raise ValueError("chunk_rows must be positive.")
 
-    total_counts = np.zeros(1, dtype=np.uint64)
+    whole_cell_counts = np.zeros(1, dtype=np.uint64)
+    denominator_counts = np.zeros(1, dtype=np.uint64)
     positive_counts = np.zeros(1, dtype=np.uint64)
 
     for y0 in range(0, masks.shape[0], chunk_rows):
@@ -58,34 +131,59 @@ def pixel_counts_by_mask_label(
         mask_chunk = np.asarray(masks[y0:y1])
         channel_chunk = np.asarray(channel[y0:y1])
 
-        valid = np.isfinite(mask_chunk) & (mask_chunk > 0)
-        if not np.any(valid):
+        whole_cell_valid = np.isfinite(mask_chunk) & (mask_chunk > 0)
+        if not np.any(whole_cell_valid):
             continue
 
-        labels = mask_chunk[valid].astype(np.int64, copy=False)
-        if np.any(labels < 0):
+        whole_cell_labels = mask_chunk[whole_cell_valid].astype(
+            np.int64, copy=False
+        )
+        if np.any(whole_cell_labels < 0):
             raise ValueError("Segmentation mask labels must be non-negative.")
 
-        maximum_label = int(labels.max())
+        maximum_label = int(whole_cell_labels.max())
         required_size = maximum_label + 1
-        total_counts = _grow_counts(total_counts, required_size)
+        whole_cell_counts = _grow_counts(whole_cell_counts, required_size)
+        denominator_counts = _grow_counts(denominator_counts, required_size)
         positive_counts = _grow_counts(positive_counts, required_size)
 
-        chunk_totals = np.bincount(labels)
-        total_counts[: chunk_totals.size] += chunk_totals.astype(
+        chunk_whole_cell = np.bincount(whole_cell_labels)
+        whole_cell_counts[: chunk_whole_cell.size] += chunk_whole_cell.astype(
             np.uint64, copy=False
         )
 
-        above_threshold = np.isfinite(channel_chunk[valid]) & (
-            channel_chunk[valid] > intensity_threshold
+        denominator_valid = whole_cell_valid
+        if compartment != "all":
+            denominator_valid = denominator_valid & compartment_mask_for_rows(
+                masks,
+                y0,
+                y1,
+                compartment,
+                inward_buffer_pixels,
+            )
+        if not np.any(denominator_valid):
+            continue
+
+        denominator_labels = mask_chunk[denominator_valid].astype(
+            np.int64, copy=False
+        )
+        chunk_denominator = np.bincount(denominator_labels)
+        denominator_counts[: chunk_denominator.size] += chunk_denominator.astype(
+            np.uint64, copy=False
+        )
+
+        above_threshold = np.isfinite(channel_chunk[denominator_valid]) & (
+            channel_chunk[denominator_valid] > intensity_threshold
         )
         if np.any(above_threshold):
-            chunk_positive = np.bincount(labels[above_threshold])
+            chunk_positive = np.bincount(
+                denominator_labels[above_threshold]
+            )
             positive_counts[: chunk_positive.size] += chunk_positive.astype(
                 np.uint64, copy=False
             )
 
-    return total_counts, positive_counts
+    return whole_cell_counts, denominator_counts, positive_counts
 
 
 def _numeric_identifier_candidates(cell_data: pd.DataFrame) -> list[np.ndarray]:
@@ -131,6 +229,7 @@ def map_cell_rows_to_mask_labels(
     centroid_x: np.ndarray,
     centroid_y: np.ndarray,
     total_counts: np.ndarray,
+    nearest_search_radius: int = 75,
 ) -> np.ndarray:
     """Resolve each table row to a non-empty segmentation-mask label."""
     row_count = len(cell_data)
@@ -180,12 +279,47 @@ def map_cell_rows_to_mask_labels(
     resolved[use] = sequential_labels[use]
 
     unresolved = ~labels_exist(resolved)
+    if np.any(unresolved) and nearest_search_radius > 0:
+        for row_index in np.flatnonzero(unresolved):
+            if not np.isfinite(x[row_index]) or not np.isfinite(y[row_index]):
+                continue
+            center_x = int(round(x[row_index]))
+            center_y = int(round(y[row_index]))
+            x0 = max(center_x - nearest_search_radius, 0)
+            x1 = min(center_x + nearest_search_radius + 1, masks.shape[1])
+            y0 = max(center_y - nearest_search_radius, 0)
+            y1 = min(center_y + nearest_search_radius + 1, masks.shape[0])
+            if x0 >= x1 or y0 >= y1:
+                continue
+
+            window = np.asarray(masks[y0:y1, x0:x1])
+            rows, columns = np.nonzero(window > 0)
+            if not len(rows):
+                continue
+            candidate_labels = window[rows, columns].astype(
+                np.int64, copy=False
+            )
+            candidate_valid = labels_exist(candidate_labels)
+            if not np.any(candidate_valid):
+                continue
+            rows = rows[candidate_valid]
+            columns = columns[candidate_valid]
+            candidate_labels = candidate_labels[candidate_valid]
+            distance_squared = (
+                (x0 + columns - x[row_index]) ** 2
+                + (y0 + rows - y[row_index]) ** 2
+            )
+            resolved[row_index] = candidate_labels[
+                int(np.argmin(distance_squared))
+            ]
+
+    unresolved = ~labels_exist(resolved)
     if np.any(unresolved):
         raise ValueError(
             "Could not match "
             f"{int(np.count_nonzero(unresolved)):,} cell-data rows to mask labels. "
-            "Provide numeric Cell ID/Object ID values or centroids that fall "
-            "inside their segmented cells."
+            "Provide numeric Cell ID/Object ID values or centroids within "
+            f"{nearest_search_radius} pixels of their segmented cells."
         )
     return resolved
 
@@ -198,34 +332,45 @@ def phenotype_cells_by_threshold(
     centroid_y: np.ndarray,
     intensity_threshold: float,
     positive_pixel_fraction: float,
-    chunk_rows: int = 2048,
+    compartment: str = "all",
+    inward_buffer_pixels: int = 10,
+    chunk_rows: int = 512,
 ) -> dict[str, np.ndarray]:
     """Assign cells using the fraction of their pixels above an intensity cutoff."""
     if not 0.0 <= positive_pixel_fraction <= 1.0:
         raise ValueError("The positive-pixel fraction must be between 0 and 1.")
 
-    total_counts, positive_counts = pixel_counts_by_mask_label(
-        channel,
-        masks,
-        intensity_threshold,
-        chunk_rows=chunk_rows,
+    whole_cell_counts, denominator_counts, positive_counts = (
+        pixel_counts_by_mask_label(
+            channel,
+            masks,
+            intensity_threshold,
+            compartment=compartment,
+            inward_buffer_pixels=inward_buffer_pixels,
+            chunk_rows=chunk_rows,
+        )
     )
     mask_labels = map_cell_rows_to_mask_labels(
         cell_data,
         masks,
         centroid_x,
         centroid_y,
-        total_counts,
+        whole_cell_counts,
     )
     fractions_by_label = np.divide(
         positive_counts,
-        total_counts,
+        denominator_counts,
         out=np.zeros_like(positive_counts, dtype=float),
-        where=total_counts > 0,
+        where=denominator_counts > 0,
     )
     fractions = fractions_by_label[mask_labels]
+    denominator_pixels = denominator_counts[mask_labels]
     return {
         "mask_label": mask_labels,
+        "denominator_pixels": denominator_pixels,
         "positive_fraction": fractions,
-        "positive": fractions > positive_pixel_fraction,
+        "positive": (
+            (denominator_pixels > 0)
+            & (fractions > positive_pixel_fraction)
+        ),
     }
