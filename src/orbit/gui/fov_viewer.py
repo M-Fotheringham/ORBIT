@@ -14,12 +14,15 @@ from sklearn.pipeline import Pipeline
 from PySide6.QtWidgets import (
     QWidget, QPushButton, QLabel, QFileDialog, QVBoxLayout, QHBoxLayout,
     QComboBox, QCheckBox, QProgressBar, QSizePolicy, QLineEdit, QGroupBox,
-    QFormLayout, QMessageBox, QMenuBar, QSlider, QStackedWidget,
+    QFormLayout, QMessageBox, QMenuBar, QSlider, QStackedWidget, QScrollArea,
+    QToolTip,
 )
 from PySide6.QtGui import (
     QPixmap, QImage, QPainter, QColor, QPen, QAction, QActionGroup,
 )
-from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QTimer
+from PySide6.QtCore import (
+    Qt, QObject, Signal, QRunnable, QThreadPool, QTimer, QPoint,
+)
 
 from orbit.image import QPTiffImage
 from orbit.fov import RandomFOVGenerator
@@ -27,6 +30,7 @@ from orbit.threshold import (
     cell_statistics_by_threshold,
     intensity_threshold_from_slider,
     phenotype_cells_by_threshold,
+    select_automated_training_indices,
 )
 
 
@@ -38,8 +42,32 @@ COLOR_MAPS = {
 
 DEFAULT_PIXEL_SIZE_UM = 0.5064
 THRESHOLD_HISTOGRAM_BINS = 30
+AUTOMATED_INTENSITY_SLIDER_VALUE = 660
+AUTOMATED_POSITIVE_PIXEL_PERCENT = 15
+AUTOMATED_NEGATIVE_TRAINING_COUNT = 25
+AUTOMATED_LOW_NEGATIVE_TRAINING_COUNT = 15
+AUTOMATED_MID_NEGATIVE_TRAINING_COUNT = 10
+AUTOMATED_POSITIVE_TRAINING_COUNT = 25
+AUTOMATED_TOP_POSITIVE_FRACTION = 0.30
+CELL_PROBABILITY_HOVER_DELAY_MS = 2000
 MODEL_FORMAT = "ORBIT phenotype model"
 MODEL_VERSION = 1
+
+
+def model_calls_and_positive_probabilities(pipeline, measurements):
+    """Return Boolean calls and probabilities for the positive phenotype."""
+    predictions = np.asarray(pipeline.predict(measurements), dtype=np.uint8)
+    probabilities = np.asarray(pipeline.predict_proba(measurements), dtype=float)
+    classes = np.asarray(pipeline.classes_)
+    positive_columns = np.flatnonzero(classes == 1)
+    if positive_columns.size != 1:
+        raise ValueError(
+            "The phenotype model does not expose a single positive class."
+        )
+    positive_probability = np.clip(
+        probabilities[:, int(positive_columns[0])], 0.0, 1.0
+    )
+    return predictions.astype(bool), positive_probability
 
 
 def normalize_channel(arr: np.ndarray) -> np.ndarray:
@@ -103,20 +131,49 @@ def array_to_qpixmap(
 
 
 class ClickableImageLabel(QLabel):
-    """QLabel that reports clicks as fractions of the displayed pixmap."""
+    """QLabel that reports pointer positions within the displayed pixmap."""
 
     image_clicked = Signal(float, float)
+    image_hovered = Signal(float, float, object)
+    image_hover_left = Signal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setMouseTracking(True)
+
+    def _pixmap_position(self, position):
+        pixmap = self.pixmap()
+        if pixmap is None or pixmap.width() <= 0 or pixmap.height() <= 0:
+            return None
+        left = (self.width() - pixmap.width()) / 2
+        top = (self.height() - pixmap.height()) / 2
+        x = position.x() - left
+        y = position.y() - top
+        if not (0 <= x < pixmap.width() and 0 <= y < pixmap.height()):
+            return None
+        return x / pixmap.width(), y / pixmap.height()
 
     def mousePressEvent(self, event):
-        pixmap = self.pixmap()
-        if event.button() == Qt.LeftButton and pixmap is not None:
-            left = (self.width() - pixmap.width()) / 2
-            top = (self.height() - pixmap.height()) / 2
-            x = event.position().x() - left
-            y = event.position().y() - top
-            if 0 <= x < pixmap.width() and 0 <= y < pixmap.height():
-                self.image_clicked.emit(x / pixmap.width(), y / pixmap.height())
+        relative_position = self._pixmap_position(event.position())
+        if event.button() == Qt.LeftButton and relative_position is not None:
+            self.image_clicked.emit(*relative_position)
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        relative_position = self._pixmap_position(event.position())
+        if relative_position is None:
+            self.image_hover_left.emit()
+        else:
+            self.image_hovered.emit(
+                relative_position[0],
+                relative_position[1],
+                event.globalPosition().toPoint(),
+            )
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self.image_hover_left.emit()
+        super().leaveEvent(event)
 
 
 class CellHistogramWidget(QWidget):
@@ -404,6 +461,253 @@ class ThresholdApplyWorker(QRunnable):
             self.signals.error.emit(traceback.format_exc())
 
 
+class AutomatedPhenotypeWorker(QRunnable):
+    """Threshold, select training cells, fit, and apply a random forest."""
+
+    def __init__(
+        self,
+        image_states,
+        channel_name,
+        intensity_threshold,
+        positive_pixel_fraction,
+        compartment,
+        inward_buffer_pixels,
+        feature_columns,
+        phenotype_name,
+        manual_training,
+        excluded_rows,
+        random_seed,
+    ):
+        super().__init__()
+        self.image_states = image_states
+        self.channel_name = channel_name
+        self.intensity_threshold = intensity_threshold
+        self.positive_pixel_fraction = positive_pixel_fraction
+        self.compartment = compartment
+        self.inward_buffer_pixels = inward_buffer_pixels
+        self.feature_columns = feature_columns
+        self.phenotype_name = phenotype_name
+        self.manual_training = manual_training
+        self.excluded_rows = excluded_rows
+        self.random_seed = random_seed
+        self.signals = ThresholdWorkerSignals()
+
+    def run(self):
+        try:
+            threshold_results = []
+            offsets = [0]
+            for state in self.image_states:
+                channel_names = list(state["img"].get_channel_names())
+                if self.channel_name not in channel_names:
+                    raise ValueError(
+                        f"{Path(state['image_path']).name} does not contain the "
+                        f"channel '{self.channel_name}'."
+                    )
+                channel = state["img"].get_channel(
+                    channel_names.index(self.channel_name)
+                )
+                centroids = state["centroid_cache"]
+                result = phenotype_cells_by_threshold(
+                    channel=channel,
+                    masks=state["segmentation_masks"],
+                    cell_data=state["cell_data"],
+                    centroid_x=centroids["x"],
+                    centroid_y=centroids["y"],
+                    intensity_threshold=self.intensity_threshold,
+                    positive_pixel_fraction=self.positive_pixel_fraction,
+                    compartment=self.compartment,
+                    inward_buffer_pixels=self.inward_buffer_pixels,
+                )
+                result.update({
+                    "x": centroids["x"],
+                    "y": centroids["y"],
+                    "channel_name": self.channel_name,
+                    "intensity_threshold": self.intensity_threshold,
+                    "positive_pixel_fraction": self.positive_pixel_fraction,
+                    "compartment": self.compartment,
+                    "inward_buffer_pixels": self.inward_buffer_pixels,
+                })
+                threshold_results.append(result)
+                offsets.append(offsets[-1] + len(state["cell_data"]))
+
+            all_fractions = np.concatenate([
+                result["positive_fraction"] for result in threshold_results
+            ])
+            all_fluorescence = np.concatenate([
+                result["mean_intensity"] for result in threshold_results
+            ])
+            excluded_global = {
+                offsets[image_index] + int(row_index)
+                for image_index, row_index in self.excluded_rows
+            }
+            manual_global = []
+            for item in self.manual_training:
+                global_index = offsets[item["image_index"]] + item["row_index"]
+                manual_global.append((global_index, item["label"]))
+                excluded_global.add(global_index)
+
+            manual_positive = sum(
+                label == "positive" for _, label in manual_global
+            )
+            manual_negative = sum(
+                label == "negative" for _, label in manual_global
+            )
+            requested_positive = max(
+                AUTOMATED_POSITIVE_TRAINING_COUNT - manual_positive, 0
+            )
+            requested_negative = max(
+                AUTOMATED_NEGATIVE_TRAINING_COUNT - manual_negative, 0
+            )
+            requested_low_negative = int(round(
+                requested_negative
+                * AUTOMATED_LOW_NEGATIVE_TRAINING_COUNT
+                / AUTOMATED_NEGATIVE_TRAINING_COUNT
+            ))
+            requested_low_negative = min(
+                requested_low_negative,
+                AUTOMATED_LOW_NEGATIVE_TRAINING_COUNT,
+            )
+            requested_mid_negative = (
+                requested_negative - requested_low_negative
+            )
+            selected = select_automated_training_indices(
+                all_fractions,
+                positive_pixel_fraction=self.positive_pixel_fraction,
+                low_negative_count=requested_low_negative,
+                mid_negative_count=requested_mid_negative,
+                positive_count=requested_positive,
+                top_positive_fraction=AUTOMATED_TOP_POSITIVE_FRACTION,
+                fluorescence_values=all_fluorescence,
+                excluded_indices=np.asarray(sorted(excluded_global), dtype=np.int64),
+                random_seed=self.random_seed,
+            )
+
+            image_for_global = np.concatenate([
+                np.full(len(state["cell_data"]), image_index, dtype=np.int64)
+                for image_index, state in enumerate(self.image_states)
+            ])
+            row_for_global = np.concatenate([
+                np.arange(len(state["cell_data"]), dtype=np.int64)
+                for state in self.image_states
+            ])
+            auto_annotations = [dict() for _ in self.image_states]
+            training_references = list(manual_global)
+            for label, global_indices in (
+                ("negative", selected["negative"]),
+                ("positive", selected["positive"]),
+            ):
+                for global_index in global_indices:
+                    image_index = int(image_for_global[global_index])
+                    row_index = int(row_for_global[global_index])
+                    threshold_result = threshold_results[image_index]
+                    cell_id = str(int(threshold_result["mask_label"][row_index]))
+                    auto_annotations[image_index][cell_id] = {
+                        "cell_id": cell_id,
+                        "label": label,
+                        "centroid_x": float(threshold_result["x"][row_index]),
+                        "centroid_y": float(threshold_result["y"][row_index]),
+                        "row_index": row_index,
+                        "source": "automated",
+                    }
+                    training_references.append((int(global_index), label))
+
+            rows = []
+            targets = []
+            for global_index, label in training_references:
+                image_index = int(image_for_global[global_index])
+                row_index = int(row_for_global[global_index])
+                rows.append(
+                    self.image_states[image_index]["cell_data"].iloc[row_index][
+                        self.feature_columns
+                    ]
+                )
+                targets.append(1 if label == "positive" else 0)
+            if set(targets) != {0, 1}:
+                raise ValueError(
+                    "Automated phenotyping requires both positive and negative "
+                    "training cells."
+                )
+
+            training_data = pd.DataFrame(
+                rows, columns=self.feature_columns
+            ).apply(pd.to_numeric, errors="coerce")
+            usable_features = [
+                column for column in self.feature_columns
+                if training_data[column].notna().any()
+                and training_data[column].nunique(dropna=True) > 1
+            ]
+            if not usable_features:
+                raise ValueError(
+                    "The automated training cells do not vary in any shared "
+                    "measurement column."
+                )
+
+            pipeline = Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("classifier", RandomForestClassifier(
+                    n_estimators=300,
+                    class_weight="balanced",
+                    random_state=42,
+                    n_jobs=-1,
+                )),
+            ])
+            pipeline.fit(
+                training_data[usable_features],
+                np.asarray(targets, dtype=np.uint8),
+            )
+            model_bundle = {
+                "format": MODEL_FORMAT,
+                "version": MODEL_VERSION,
+                "phenotype_name": self.phenotype_name,
+                "feature_columns": usable_features,
+                "algorithm": "RandomForestClassifier",
+                "training_samples": len(targets),
+                "pipeline": pipeline,
+                "automated": {
+                    "channel_name": self.channel_name,
+                    "intensity_threshold": self.intensity_threshold,
+                    "positive_pixel_fraction": self.positive_pixel_fraction,
+                    "compartment": self.compartment,
+                    "inward_buffer_pixels": self.inward_buffer_pixels,
+                    "negative_low_fluorescence_fraction": 0.50,
+                    "negative_mid_fluorescence_range": [0.51, 0.80],
+                    "top_positive_fraction": AUTOMATED_TOP_POSITIVE_FRACTION,
+                    "random_seed": self.random_seed,
+                },
+            }
+
+            model_predictions = []
+            for state in self.image_states:
+                measurements = state["cell_data"][usable_features].apply(
+                    pd.to_numeric, errors="coerce"
+                )
+                prediction, positive_probability = (
+                    model_calls_and_positive_probabilities(
+                        pipeline, measurements
+                    )
+                )
+                centroids = state["centroid_cache"]
+                model_predictions.append({
+                    "x": centroids["x"],
+                    "y": centroids["y"],
+                    "positive": prediction,
+                    "positive_probability": positive_probability,
+                })
+
+            self.signals.finished.emit({
+                "threshold_results": threshold_results,
+                "auto_annotations": auto_annotations,
+                "model_bundle": model_bundle,
+                "model_predictions": model_predictions,
+                "automatic_positive_count": len(selected["positive"]),
+                "automatic_negative_count": len(selected["negative"]),
+                "manual_positive_count": manual_positive,
+                "manual_negative_count": manual_negative,
+            })
+        except Exception:
+            self.signals.error.emit(traceback.format_exc())
+
+
 class OrbitFOVViewer(QWidget):
     def __init__(self):
         super().__init__()
@@ -425,6 +729,8 @@ class OrbitFOVViewer(QWidget):
         self.current_image_index = -1
         self.model_bundle = None
         self.active_tool = "random_forest"
+        self.automated_worker = None
+        self.automated_edit_mode = False
         self.threshold_intensity_value = None
         self.threshold_channel_name = None
         self.threshold_worker = None
@@ -435,6 +741,18 @@ class OrbitFOVViewer(QWidget):
         self.threshold_histogram_timer.timeout.connect(
             self._start_threshold_histogram_worker
         )
+        self.cell_probability_hover_timer = QTimer(self)
+        self.cell_probability_hover_timer.setSingleShot(True)
+        self.cell_probability_hover_timer.setInterval(
+            CELL_PROBABILITY_HOVER_DELAY_MS
+        )
+        self.cell_probability_hover_timer.timeout.connect(
+            self.show_hovered_cell_probability
+        )
+        self.hovered_prediction_key = None
+        self.hovered_prediction = None
+        self.hover_global_position = None
+        self.hover_probability_visible = False
 
         # Segmentation data remain in whole-slide pixel coordinates. Only the
         # current FOV is cropped and converted to a boundary overlay.
@@ -445,6 +763,8 @@ class OrbitFOVViewer(QWidget):
 
         self.image_label = ClickableImageLabel("Select a QPTIFF image")
         self.image_label.image_clicked.connect(self.label_clicked_cell)
+        self.image_label.image_hovered.connect(self.track_cell_probability_hover)
+        self.image_label.image_hover_left.connect(self.cancel_cell_probability_hover)
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMinimumSize(700, 700)
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -496,10 +816,16 @@ class OrbitFOVViewer(QWidget):
         self.positive_annotations_checkbox.setChecked(True)
         self.positive_annotations_checkbox.setStyleSheet("color: #00b832;")
         self.positive_annotations_checkbox.stateChanged.connect(self.update_display)
+        self.positive_annotations_checkbox.stateChanged.connect(
+            self.sync_automated_annotation_visibility
+        )
         self.negative_annotations_checkbox = QCheckBox("Show Negative")
         self.negative_annotations_checkbox.setChecked(True)
         self.negative_annotations_checkbox.setStyleSheet("color: #e02020;")
         self.negative_annotations_checkbox.stateChanged.connect(self.update_display)
+        self.negative_annotations_checkbox.stateChanged.connect(
+            self.sync_automated_annotation_visibility
+        )
         self.positive_count_label = QLabel("Positive: 0")
         self.negative_count_label = QLabel("Negative: 0")
         self.previous_positive_button = QPushButton("←")
@@ -568,6 +894,9 @@ class OrbitFOVViewer(QWidget):
         )
         self.modelled_phenotypes_checkbox.setChecked(True)
         self.modelled_phenotypes_checkbox.stateChanged.connect(self.update_display)
+        self.modelled_phenotypes_checkbox.stateChanged.connect(
+            self.sync_automated_model_visibility
+        )
         self.model_positive_count_label = QLabel("Model positive: 0")
         self.model_negative_count_label = QLabel("Model negative: 0")
         self.export_cell_phenotypes_button = QPushButton(
@@ -603,11 +932,16 @@ class OrbitFOVViewer(QWidget):
 
         self.threshold_phenotype_name = QLineEdit()
         self.threshold_phenotype_name.setPlaceholderText("e.g. CD8-positive")
+        self.automated_phenotype_name = QLineEdit()
+        self.automated_phenotype_name.setPlaceholderText("e.g. CD8-positive")
         self.phenotype_name.textChanged.connect(
             self.sync_phenotype_name_from_random_forest
         )
         self.threshold_phenotype_name.textChanged.connect(
             self.sync_phenotype_name_from_threshold
+        )
+        self.automated_phenotype_name.textChanged.connect(
+            self.sync_phenotype_name_from_automated
         )
 
         threshold_description = QLabel(
@@ -747,11 +1081,242 @@ class OrbitFOVViewer(QWidget):
         threshold_page_layout.addWidget(threshold_panel)
         threshold_page_layout.addStretch()
 
+        automated_description = QLabel(
+            "Automatically thresholds the displayed channel, selects 25 "
+            "negative and 25 positive training cells, trains a random forest, "
+            "and applies it to every loaded image."
+        )
+        automated_description.setWordWrap(True)
+        self.auto_phenotype_button = QPushButton("Auto Phenotype")
+        self.auto_phenotype_button.clicked.connect(
+            lambda: self.start_automated_phenotyping(reset_annotations=True)
+        )
+        self.automated_status_label = QLabel("Ready for automated phenotyping.")
+        self.automated_status_label.setWordWrap(True)
+        self.automated_edit_button = QPushButton("Edit")
+        self.automated_edit_button.clicked.connect(self.open_automated_edit)
+        self.automated_modelled_checkbox = QCheckBox(
+            "Show Modelled Phenotypes"
+        )
+        self.automated_modelled_checkbox.setChecked(True)
+        self.automated_modelled_checkbox.stateChanged.connect(
+            self.automated_model_visibility_changed
+        )
+        self.automated_model_positive_count_label = QLabel("Model positive: 0")
+        self.automated_model_negative_count_label = QLabel("Model negative: 0")
+        self.automated_export_button = QPushButton("Export Cell Phenotypes")
+        self.automated_export_button.clicked.connect(self.export_cell_phenotypes)
+
+        automated_default_panel = QGroupBox("Automated Phenotyping")
+        automated_default_layout = QVBoxLayout()
+        automated_default_layout.addWidget(automated_description)
+        automated_default_layout.addSpacing(8)
+        automated_default_layout.addWidget(self.auto_phenotype_button)
+        automated_default_layout.addWidget(self.automated_status_label)
+        automated_default_layout.addWidget(self.automated_edit_button)
+        automated_default_layout.addWidget(self.automated_modelled_checkbox)
+        automated_default_layout.addWidget(
+            self.automated_model_positive_count_label
+        )
+        automated_default_layout.addWidget(
+            self.automated_model_negative_count_label
+        )
+        automated_default_layout.addStretch()
+        automated_default_layout.addWidget(self.automated_export_button)
+        automated_default_panel.setLayout(automated_default_layout)
+        automated_default_page = QWidget()
+        automated_default_page_layout = QVBoxLayout(automated_default_page)
+        automated_default_page_layout.setContentsMargins(0, 0, 0, 0)
+        automated_default_page_layout.addWidget(automated_default_panel)
+
+        self.automated_intensity_label = QLabel(
+            "Intensity threshold: 66% of display range"
+        )
+        self.automated_intensity_slider = QSlider(Qt.Horizontal)
+        self.automated_intensity_slider.setRange(0, 1000)
+        self.automated_intensity_slider.setValue(
+            AUTOMATED_INTENSITY_SLIDER_VALUE
+        )
+        self.automated_intensity_slider.valueChanged.connect(
+            self.automated_intensity_changed
+        )
+        self.automated_percent_label = QLabel(
+            "Positive pixels required: >15%"
+        )
+        self.automated_percent_slider = QSlider(Qt.Horizontal)
+        self.automated_percent_slider.setRange(1, 100)
+        self.automated_percent_slider.setValue(
+            AUTOMATED_POSITIVE_PIXEL_PERCENT
+        )
+        self.automated_percent_slider.valueChanged.connect(
+            self.automated_percent_changed
+        )
+        self.automated_nucleus_checkbox = QCheckBox("Nucleus")
+        self.automated_nucleus_checkbox.setChecked(True)
+        self.automated_nucleus_checkbox.stateChanged.connect(
+            self.automated_compartment_changed
+        )
+        self.automated_cytoplasm_checkbox = QCheckBox("Cytoplasm/Membrane")
+        self.automated_cytoplasm_checkbox.setChecked(True)
+        self.automated_cytoplasm_checkbox.stateChanged.connect(
+            self.automated_compartment_changed
+        )
+        self.automated_buffer_label = QLabel(
+            "Inward boundary distance: 10 px (5.1 µm)"
+        )
+        self.automated_buffer_slider = QSlider(Qt.Horizontal)
+        self.automated_buffer_slider.setRange(0, 50)
+        self.automated_buffer_slider.setValue(10)
+        self.automated_buffer_slider.valueChanged.connect(
+            self.automated_buffer_changed
+        )
+
+        automated_threshold_panel = QGroupBox("Threshold Settings")
+        automated_threshold_layout = QVBoxLayout()
+        automated_threshold_layout.addWidget(self.automated_intensity_label)
+        automated_threshold_layout.addWidget(self.automated_intensity_slider)
+        automated_threshold_layout.addWidget(self.automated_percent_label)
+        automated_threshold_layout.addWidget(self.automated_percent_slider)
+        automated_threshold_layout.addWidget(QLabel("Positive-pixel denominator:"))
+        automated_threshold_layout.addWidget(self.automated_nucleus_checkbox)
+        automated_threshold_layout.addWidget(self.automated_cytoplasm_checkbox)
+        automated_threshold_layout.addWidget(self.automated_buffer_label)
+        automated_threshold_layout.addWidget(self.automated_buffer_slider)
+        automated_threshold_panel.setLayout(automated_threshold_layout)
+
+        self.automated_positive_checkbox = QCheckBox("Show Positive")
+        self.automated_positive_checkbox.setChecked(True)
+        self.automated_positive_checkbox.setStyleSheet("color: #00b832;")
+        self.automated_positive_checkbox.stateChanged.connect(
+            self.automated_annotation_visibility_changed
+        )
+        self.automated_negative_checkbox = QCheckBox("Show Negative")
+        self.automated_negative_checkbox.setChecked(True)
+        self.automated_negative_checkbox.setStyleSheet("color: #e02020;")
+        self.automated_negative_checkbox.stateChanged.connect(
+            self.automated_annotation_visibility_changed
+        )
+        self.automated_positive_count_label = QLabel("Positive: 0")
+        self.automated_negative_count_label = QLabel("Negative: 0")
+        self.automated_previous_positive_button = QPushButton("←")
+        self.automated_previous_positive_button.setFixedWidth(36)
+        self.automated_previous_positive_button.clicked.connect(
+            lambda: self.navigate_training("positive", -1)
+        )
+        self.automated_next_positive_button = QPushButton("→")
+        self.automated_next_positive_button.setFixedWidth(36)
+        self.automated_next_positive_button.clicked.connect(
+            lambda: self.navigate_training("positive", 1)
+        )
+        self.automated_positive_position_label = QLabel("0 / 0")
+        self.automated_positive_position_label.setAlignment(Qt.AlignCenter)
+        self.automated_previous_negative_button = QPushButton("←")
+        self.automated_previous_negative_button.setFixedWidth(36)
+        self.automated_previous_negative_button.clicked.connect(
+            lambda: self.navigate_training("negative", -1)
+        )
+        self.automated_next_negative_button = QPushButton("→")
+        self.automated_next_negative_button.setFixedWidth(36)
+        self.automated_next_negative_button.clicked.connect(
+            lambda: self.navigate_training("negative", 1)
+        )
+        self.automated_negative_position_label = QLabel("0 / 0")
+        self.automated_negative_position_label.setAlignment(Qt.AlignCenter)
+        automated_positive_navigation = QHBoxLayout()
+        automated_positive_navigation.addWidget(
+            self.automated_previous_positive_button
+        )
+        automated_positive_navigation.addWidget(
+            self.automated_positive_position_label, stretch=1
+        )
+        automated_positive_navigation.addWidget(
+            self.automated_next_positive_button
+        )
+        automated_negative_navigation = QHBoxLayout()
+        automated_negative_navigation.addWidget(
+            self.automated_previous_negative_button
+        )
+        automated_negative_navigation.addWidget(
+            self.automated_negative_position_label, stretch=1
+        )
+        automated_negative_navigation.addWidget(
+            self.automated_next_negative_button
+        )
+
+        automated_training_panel = QGroupBox("Random-Forest Training")
+        automated_training_layout = QVBoxLayout()
+        automated_training_name_layout = QFormLayout()
+        automated_training_name_layout.addRow(
+            "Phenotype:", self.automated_phenotype_name
+        )
+        automated_training_layout.addLayout(automated_training_name_layout)
+        automated_training_layout.addWidget(self.automated_positive_checkbox)
+        automated_training_layout.addWidget(self.automated_negative_checkbox)
+        automated_training_layout.addWidget(self.automated_positive_count_label)
+        automated_training_layout.addLayout(automated_positive_navigation)
+        automated_training_layout.addWidget(self.automated_negative_count_label)
+        automated_training_layout.addLayout(automated_negative_navigation)
+        automated_training_panel.setLayout(automated_training_layout)
+
+        self.automated_edit_status_label = QLabel("Edit labels or thresholds.")
+        self.automated_edit_status_label.setWordWrap(True)
+        self.automated_edit_modelled_checkbox = QCheckBox(
+            "Show Modelled Phenotypes"
+        )
+        self.automated_edit_modelled_checkbox.setChecked(True)
+        self.automated_edit_modelled_checkbox.stateChanged.connect(
+            self.automated_model_visibility_changed
+        )
+        self.automated_edit_model_positive_count_label = QLabel(
+            "Model positive: 0"
+        )
+        self.automated_edit_model_negative_count_label = QLabel(
+            "Model negative: 0"
+        )
+        self.rephenotype_button = QPushButton("Re-Phenotype")
+        self.rephenotype_button.clicked.connect(
+            lambda: self.start_automated_phenotyping(reset_annotations=False)
+        )
+        automated_edit_model_panel = QGroupBox("Random-Forest Model")
+        automated_edit_model_layout = QVBoxLayout()
+        automated_edit_model_layout.addWidget(self.automated_edit_status_label)
+        automated_edit_model_layout.addWidget(
+            self.automated_edit_modelled_checkbox
+        )
+        automated_edit_model_layout.addWidget(
+            self.automated_edit_model_positive_count_label
+        )
+        automated_edit_model_layout.addWidget(
+            self.automated_edit_model_negative_count_label
+        )
+        automated_edit_model_layout.addWidget(self.rephenotype_button)
+        automated_edit_model_panel.setLayout(automated_edit_model_layout)
+
+        automated_edit_content = QWidget()
+        automated_edit_layout = QVBoxLayout(automated_edit_content)
+        automated_edit_layout.setContentsMargins(0, 0, 0, 0)
+        automated_edit_layout.addWidget(automated_threshold_panel)
+        automated_edit_layout.addWidget(automated_training_panel)
+        automated_edit_layout.addWidget(automated_edit_model_panel)
+        automated_edit_layout.addStretch()
+        automated_edit_scroll = QScrollArea()
+        automated_edit_scroll.setWidgetResizable(True)
+        automated_edit_scroll.setWidget(automated_edit_content)
+
+        self.automated_panel_stack = QStackedWidget()
+        self.automated_panel_stack.addWidget(automated_default_page)
+        self.automated_panel_stack.addWidget(automated_edit_scroll)
+        automated_page = QWidget()
+        automated_page_layout = QVBoxLayout(automated_page)
+        automated_page_layout.setContentsMargins(0, 0, 0, 0)
+        automated_page_layout.addWidget(self.automated_panel_stack)
+
         self.right_panel_stack = QStackedWidget()
         self.right_panel_stack.setMinimumWidth(220)
-        self.right_panel_stack.setMaximumWidth(300)
+        self.right_panel_stack.setMaximumWidth(330)
         self.right_panel_stack.addWidget(random_forest_page)
         self.right_panel_stack.addWidget(threshold_page)
+        self.right_panel_stack.addWidget(automated_page)
 
         toolbar = QHBoxLayout()
         for widget in (
@@ -797,7 +1362,7 @@ class OrbitFOVViewer(QWidget):
         file_menu.addAction(self.import_model_action)
         file_menu.addAction(self.export_model_action)
 
-        tools_menu = self.menu_bar.addMenu("&Tools")
+        phenotyping_menu = self.menu_bar.addMenu("&Phenotyping")
         self.tool_action_group = QActionGroup(self)
         self.tool_action_group.setExclusive(True)
         self.random_forest_tool_action = QAction("Random Forest", self)
@@ -811,10 +1376,17 @@ class OrbitFOVViewer(QWidget):
         self.threshold_tool_action.triggered.connect(
             lambda: self.set_tool_mode("threshold")
         )
+        self.automated_tool_action = QAction("Automated", self)
+        self.automated_tool_action.setCheckable(True)
+        self.automated_tool_action.triggered.connect(
+            lambda: self.set_tool_mode("automated")
+        )
         self.tool_action_group.addAction(self.random_forest_tool_action)
         self.tool_action_group.addAction(self.threshold_tool_action)
-        tools_menu.addAction(self.random_forest_tool_action)
-        tools_menu.addAction(self.threshold_tool_action)
+        self.tool_action_group.addAction(self.automated_tool_action)
+        phenotyping_menu.addAction(self.random_forest_tool_action)
+        phenotyping_menu.addAction(self.threshold_tool_action)
+        phenotyping_menu.addAction(self.automated_tool_action)
         layout.setMenuBar(self.menu_bar)
 
         viewer_layout = QHBoxLayout()
@@ -850,6 +1422,7 @@ class OrbitFOVViewer(QWidget):
         self.update_image_carousel_controls()
         self.update_model_controls()
         self.update_threshold_controls()
+        self.update_automated_controls()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -864,27 +1437,203 @@ class OrbitFOVViewer(QWidget):
         ))
 
     def sync_phenotype_name_from_random_forest(self, text):
-        if self.threshold_phenotype_name.text() == text:
-            return
-        self.threshold_phenotype_name.blockSignals(True)
-        self.threshold_phenotype_name.setText(text)
-        self.threshold_phenotype_name.blockSignals(False)
+        for widget in (
+            self.threshold_phenotype_name,
+            self.automated_phenotype_name,
+        ):
+            if widget.text() == text:
+                continue
+            widget.blockSignals(True)
+            widget.setText(text)
+            widget.blockSignals(False)
 
     def sync_phenotype_name_from_threshold(self, text):
-        if self.phenotype_name.text() == text:
+        for widget in (self.phenotype_name, self.automated_phenotype_name):
+            if widget.text() == text:
+                continue
+            widget.blockSignals(True)
+            widget.setText(text)
+            widget.blockSignals(False)
+
+    def sync_phenotype_name_from_automated(self, text):
+        for widget in (self.phenotype_name, self.threshold_phenotype_name):
+            if widget.text() == text:
+                continue
+            widget.blockSignals(True)
+            widget.setText(text)
+            widget.blockSignals(False)
+
+    def sync_automated_annotation_visibility(self):
+        if not hasattr(self, "automated_positive_checkbox"):
             return
-        self.phenotype_name.blockSignals(True)
-        self.phenotype_name.setText(text)
-        self.phenotype_name.blockSignals(False)
+        for source, target in (
+            (self.positive_annotations_checkbox, self.automated_positive_checkbox),
+            (self.negative_annotations_checkbox, self.automated_negative_checkbox),
+        ):
+            target.blockSignals(True)
+            target.setChecked(source.isChecked())
+            target.blockSignals(False)
+
+    def automated_annotation_visibility_changed(self):
+        for source, target in (
+            (self.automated_positive_checkbox, self.positive_annotations_checkbox),
+            (self.automated_negative_checkbox, self.negative_annotations_checkbox),
+        ):
+            target.blockSignals(True)
+            target.setChecked(source.isChecked())
+            target.blockSignals(False)
+        self.update_display()
+
+    def sync_automated_model_visibility(self):
+        if not hasattr(self, "automated_modelled_checkbox"):
+            return
+        checked = self.modelled_phenotypes_checkbox.isChecked()
+        for widget in (
+            self.automated_modelled_checkbox,
+            self.automated_edit_modelled_checkbox,
+        ):
+            widget.blockSignals(True)
+            widget.setChecked(checked)
+            widget.blockSignals(False)
+
+    def automated_model_visibility_changed(self):
+        source = self.sender()
+        checked = bool(source.isChecked())
+        self.modelled_phenotypes_checkbox.blockSignals(True)
+        self.modelled_phenotypes_checkbox.setChecked(checked)
+        self.modelled_phenotypes_checkbox.blockSignals(False)
+        for widget in (
+            self.automated_modelled_checkbox,
+            self.automated_edit_modelled_checkbox,
+        ):
+            if widget is source:
+                continue
+            widget.blockSignals(True)
+            widget.setChecked(checked)
+            widget.blockSignals(False)
+        self.update_display()
+
+    def sync_automated_threshold_controls_from_master(self):
+        pairs = (
+            (self.automated_intensity_slider, self.threshold_intensity_slider),
+            (self.automated_percent_slider, self.threshold_percent_slider),
+            (self.automated_buffer_slider, self.threshold_buffer_slider),
+        )
+        for automated_widget, master_widget in pairs:
+            automated_widget.blockSignals(True)
+            automated_widget.setValue(master_widget.value())
+            automated_widget.blockSignals(False)
+        for automated_widget, master_widget in (
+            (self.automated_nucleus_checkbox, self.threshold_nucleus_checkbox),
+            (self.automated_cytoplasm_checkbox, self.threshold_cytoplasm_checkbox),
+        ):
+            automated_widget.blockSignals(True)
+            automated_widget.setChecked(master_widget.isChecked())
+            automated_widget.blockSignals(False)
+        self.automated_percent_label.setText(
+            f"Positive pixels required: >{self.automated_percent_slider.value()}%"
+        )
+        distance = self.automated_buffer_slider.value()
+        self.automated_buffer_label.setText(
+            f"Inward boundary distance: {distance} px "
+            f"({distance * DEFAULT_PIXEL_SIZE_UM:.1f} µm)"
+        )
+        if self.current_fov is not None:
+            self._update_threshold_value(invalidate=False)
+            self.automated_intensity_label.setText(
+                self.threshold_intensity_label.text()
+            )
+
+    def automated_intensity_changed(self, value):
+        self.threshold_intensity_slider.blockSignals(True)
+        self.threshold_intensity_slider.setValue(value)
+        self.threshold_intensity_slider.blockSignals(False)
+        if self.current_fov is not None:
+            self._update_threshold_value(invalidate=True)
+            self.automated_intensity_label.setText(
+                self.threshold_intensity_label.text()
+            )
+        else:
+            self.automated_intensity_label.setText(
+                f"Intensity threshold: {value / 10:.1f}% of display range"
+            )
+        self.automated_edit_status_label.setText(
+            "Threshold settings changed. Click Re-Phenotype to apply."
+        )
+        self.update_display()
+
+    def automated_percent_changed(self, value):
+        self.threshold_percent_slider.blockSignals(True)
+        self.threshold_percent_slider.setValue(value)
+        self.threshold_percent_slider.blockSignals(False)
+        self.threshold_percent_label.setText(
+            f"Positive pixels required: >{value}%"
+        )
+        self.automated_percent_label.setText(
+            f"Positive pixels required: >{value}%"
+        )
+        self._invalidate_threshold_predictions()
+        self.automated_edit_status_label.setText(
+            "Threshold settings changed. Click Re-Phenotype to apply."
+        )
+        self.update_display()
+
+    def automated_compartment_changed(self):
+        for automated_widget, master_widget in (
+            (self.automated_nucleus_checkbox, self.threshold_nucleus_checkbox),
+            (self.automated_cytoplasm_checkbox, self.threshold_cytoplasm_checkbox),
+        ):
+            master_widget.blockSignals(True)
+            master_widget.setChecked(automated_widget.isChecked())
+            master_widget.blockSignals(False)
+        self._invalidate_threshold_predictions()
+        self.automated_edit_status_label.setText(
+            "Threshold settings changed. Click Re-Phenotype to apply."
+        )
+        self.update_automated_controls()
+        self.update_display()
+
+    def automated_buffer_changed(self, value):
+        self.threshold_buffer_slider.blockSignals(True)
+        self.threshold_buffer_slider.setValue(value)
+        self.threshold_buffer_slider.blockSignals(False)
+        self.threshold_buffer_label.setText(
+            f"Inward boundary distance: {value} px "
+            f"({value * DEFAULT_PIXEL_SIZE_UM:.1f} µm)"
+        )
+        self.automated_buffer_label.setText(
+            f"Inward boundary distance: {value} px "
+            f"({value * DEFAULT_PIXEL_SIZE_UM:.1f} µm)"
+        )
+        self._invalidate_threshold_predictions()
+        self.automated_edit_status_label.setText(
+            "Threshold settings changed. Click Re-Phenotype to apply."
+        )
+        self.update_display()
+
+    def open_automated_edit(self):
+        self.automated_edit_mode = True
+        self.automated_panel_stack.setCurrentIndex(1)
+        self.sync_automated_threshold_controls_from_master()
+        self.sync_automated_annotation_visibility()
+        self.sync_automated_model_visibility()
+        self.update_automated_controls()
+        self.update_display()
 
     def set_tool_mode(self, tool):
-        if tool not in {"random_forest", "threshold"}:
+        if tool not in {"random_forest", "threshold", "automated"}:
             tool = "random_forest"
         self.active_tool = tool
         threshold_mode = tool == "threshold"
-        self.right_panel_stack.setCurrentIndex(1 if threshold_mode else 0)
-        self.random_forest_tool_action.setChecked(not threshold_mode)
+        automated_mode = tool == "automated"
+        page_index = 2 if automated_mode else (1 if threshold_mode else 0)
+        self.right_panel_stack.setCurrentIndex(page_index)
+        self.random_forest_tool_action.setChecked(tool == "random_forest")
         self.threshold_tool_action.setChecked(threshold_mode)
+        self.automated_tool_action.setChecked(automated_mode)
+        if automated_mode:
+            self.automated_edit_mode = False
+            self.automated_panel_stack.setCurrentIndex(0)
 
         if threshold_mode and self.current_fov is not None:
             displayed_channel = self.channel_dropdown.currentText()
@@ -900,6 +1649,7 @@ class OrbitFOVViewer(QWidget):
             self.threshold_histogram_timer.stop()
         self.update_model_controls()
         self.update_threshold_controls()
+        self.update_automated_controls()
         self.update_display()
 
     def _invalidate_threshold_predictions(self):
@@ -1118,18 +1868,25 @@ class OrbitFOVViewer(QWidget):
         self.update_display()
 
     def on_channel_changed(self):
-        if self.active_tool == "threshold":
+        threshold_edit = (
+            self.active_tool == "automated" and self.automated_edit_mode
+        )
+        if self.active_tool == "threshold" or threshold_edit:
             self.threshold_intensity_value = None
             self.threshold_channel_name = None
             self._invalidate_threshold_predictions()
-            self.threshold_histogram_request_id += 1
-            self.threshold_histogram_timer.stop()
-            self.threshold_intensity_histogram.set_message("Loading channel…")
-            self.threshold_fraction_histogram.set_message("Loading channel…")
+            if self.active_tool == "threshold":
+                self.threshold_histogram_request_id += 1
+                self.threshold_histogram_timer.stop()
+                self.threshold_intensity_histogram.set_message("Loading channel…")
+                self.threshold_fraction_histogram.set_message("Loading channel…")
         self.reload_current_fov()
 
     def current_threshold_highlight(self):
-        if self.active_tool != "threshold" or self.current_fov is None:
+        threshold_visible = self.active_tool == "threshold" or (
+            self.active_tool == "automated" and self.automated_edit_mode
+        )
+        if not threshold_visible or self.current_fov is None:
             return None
         if (
             self.threshold_intensity_value is None
@@ -1141,6 +1898,8 @@ class OrbitFOVViewer(QWidget):
         return np.asarray(self.current_fov) > self.threshold_intensity_value
 
     def set_loading(self, loading: bool, message: str = ""):
+        if loading:
+            self.cancel_cell_probability_hover()
         self.is_loading = loading
         self.status_label.setText(message)
         self.spinner.setVisible(loading)
@@ -1158,6 +1917,7 @@ class OrbitFOVViewer(QWidget):
         self.update_image_carousel_controls()
         self.update_model_controls()
         self.update_threshold_controls()
+        self.update_automated_controls()
 
     def open_qptiff(self):
         image_path, _ = QFileDialog.getOpenFileName(
@@ -1226,6 +1986,12 @@ class OrbitFOVViewer(QWidget):
                 "threshold_predictions"
             ] = None
             self.loaded_images[self.current_image_index]["centroid_cache"] = None
+            self.loaded_images[self.current_image_index][
+                "mask_label_row_cache"
+            ] = None
+            self.loaded_images[self.current_image_index][
+                "automated_exclusions"
+            ] = set()
             self._capture_current_image_state()
             self.update_annotation_counts()
             self.segmentation_checkbox.setChecked(True)
@@ -1270,8 +2036,10 @@ class OrbitFOVViewer(QWidget):
             "current_dapi_fov": None,
             "channel_index": 0,
             "centroid_cache": None,
+            "mask_label_row_cache": None,
             "model_predictions": None,
             "threshold_predictions": None,
+            "automated_exclusions": set(),
         }
 
     def _read_mask(self, mask_path, image=None, description="Segmentation mask"):
@@ -1340,6 +2108,7 @@ class OrbitFOVViewer(QWidget):
     def _activate_image(self, index):
         if not (0 <= index < len(self.loaded_images)):
             return
+        self.cancel_cell_probability_hover()
         state = self.loaded_images[index]
         self.current_image_index = index
         self.image_path = state["image_path"]
@@ -1355,7 +2124,7 @@ class OrbitFOVViewer(QWidget):
         self.current_fov = state["current_fov"]
         self.current_dapi_fov = state["current_dapi_fov"]
         self.current_pixmap = None
-        if self.active_tool == "threshold":
+        if self.active_tool in {"threshold", "automated"}:
             self.threshold_intensity_value = None
             self.threshold_channel_name = None
         self.channel_dropdown.blockSignals(True)
@@ -1384,9 +2153,11 @@ class OrbitFOVViewer(QWidget):
         self.update_image_carousel_controls()
         self.update_model_controls()
         self.update_threshold_controls()
-        if self.active_tool == "threshold":
+        self.update_automated_controls()
+        if self.active_tool in {"threshold", "automated"}:
             if self.current_fov is not None:
                 self._update_threshold_value(invalidate=False)
+        if self.active_tool == "threshold":
             self.request_threshold_histogram_refresh()
 
     def switch_image(self, index):
@@ -1424,9 +2195,177 @@ class OrbitFOVViewer(QWidget):
         self.next_image_button.setEnabled(can_cycle)
         self.image_carousel.setEnabled(has_images and not self.is_loading)
 
-    def label_clicked_cell(self, x_fraction, y_fraction):
+    def _mask_label_row_cache(self, state):
+        cached = state.get("mask_label_row_cache")
+        if cached is not None:
+            return cached
+        cache = {}
+        masks = state.get("segmentation_masks")
+        if masks is not None and state.get("cell_data") is not None:
+            centroids = self._cell_centroid_cache(state)
+            finite = (
+                np.isfinite(centroids["x"])
+                & np.isfinite(centroids["y"])
+            )
+            x = np.zeros(len(centroids["x"]), dtype=np.int64)
+            y = np.zeros(len(centroids["y"]), dtype=np.int64)
+            x[finite] = np.rint(centroids["x"][finite]).astype(np.int64)
+            y[finite] = np.rint(centroids["y"][finite]).astype(np.int64)
+            valid = (
+                finite
+                & (x >= 0)
+                & (x < masks.shape[1])
+                & (y >= 0)
+                & (y < masks.shape[0])
+            )
+            valid_rows = np.flatnonzero(valid)
+            labels = masks[y[valid], x[valid]]
+            for row_index, raw_label in zip(valid_rows, labels):
+                label = int(raw_label)
+                if label > 0 and label not in cache:
+                    cache[label] = int(row_index)
+        state["mask_label_row_cache"] = cache
+        return cache
+
+    def _model_prediction_at_fraction(self, x_fraction, y_fraction):
         if (
-            self.active_tool != "random_forest"
+            self.current_fov is None
+            or self.segmentation_masks is None
+            or self.current_x0 is None
+            or self.current_y0 is None
+            or not (0 <= self.current_image_index < len(self.loaded_images))
+        ):
+            return None
+        state = self.loaded_images[self.current_image_index]
+        predictions = state.get("model_predictions")
+        if predictions is None or "positive_probability" not in predictions:
+            return None
+
+        height, width = self.current_fov.shape[:2]
+        local_x = min(max(int(x_fraction * width), 0), width - 1)
+        local_y = min(max(int(y_fraction * height), 0), height - 1)
+        global_x = int(self.current_x0) + local_x
+        global_y = int(self.current_y0) + local_y
+        if not (
+            0 <= global_y < self.segmentation_masks.shape[0]
+            and 0 <= global_x < self.segmentation_masks.shape[1]
+        ):
+            return None
+
+        raw_cell_id = self.segmentation_masks[global_y, global_x]
+        if raw_cell_id == 0:
+            return None
+        cell_id = str(
+            raw_cell_id.item()
+            if hasattr(raw_cell_id, "item")
+            else raw_cell_id
+        )
+        label_row_cache = self._mask_label_row_cache(state)
+        row_index = label_row_cache.get(int(raw_cell_id))
+        if row_index is None:
+            try:
+                row_index = self._find_cell_row_index(
+                    state,
+                    {
+                        "cell_id": cell_id,
+                        "centroid_x": float(global_x),
+                        "centroid_y": float(global_y),
+                    },
+                )
+            except (TypeError, ValueError):
+                return None
+            if row_index is not None:
+                label_row_cache[int(raw_cell_id)] = int(row_index)
+        if row_index is None:
+            return None
+
+        positive = np.asarray(predictions["positive"], dtype=bool)
+        positive_probability = np.asarray(
+            predictions["positive_probability"], dtype=float
+        )
+        if not (
+            0 <= row_index < positive.size
+            and row_index < positive_probability.size
+            and np.isfinite(positive_probability[row_index])
+        ):
+            return None
+        return {
+            "image_index": self.current_image_index,
+            "row_index": int(row_index),
+            "cell_id": cell_id,
+            "positive": bool(positive[row_index]),
+            "positive_probability": float(positive_probability[row_index]),
+        }
+
+    def track_cell_probability_hover(
+        self, x_fraction, y_fraction, global_position
+    ):
+        hovered_prediction = self._model_prediction_at_fraction(
+            x_fraction, y_fraction
+        )
+        if hovered_prediction is None:
+            self.cancel_cell_probability_hover()
+            return
+
+        prediction_key = (
+            hovered_prediction["image_index"],
+            hovered_prediction["row_index"],
+        )
+        if prediction_key != self.hovered_prediction_key:
+            self.cancel_cell_probability_hover()
+            self.hovered_prediction_key = prediction_key
+            self.hovered_prediction = hovered_prediction
+            self.hover_global_position = QPoint(global_position)
+            self.cell_probability_hover_timer.start()
+            return
+
+        self.hover_global_position = QPoint(global_position)
+        if self.hover_probability_visible:
+            self.show_hovered_cell_probability()
+
+    def show_hovered_cell_probability(self):
+        if self.hovered_prediction is None or self.hover_global_position is None:
+            return
+        positive_probability = np.clip(
+            self.hovered_prediction["positive_probability"], 0.0, 1.0
+        )
+        if self.hovered_prediction["positive"]:
+            call = "Positive"
+            call_probability = positive_probability
+        else:
+            call = "Negative"
+            call_probability = 1.0 - positive_probability
+        phenotype_name = (
+            self.phenotype_name.text().strip()
+            or (
+                self.model_bundle.get("phenotype_name", "").strip()
+                if self.model_bundle is not None
+                else ""
+            )
+            or "Phenotype"
+        )
+        QToolTip.showText(
+            self.hover_global_position + QPoint(0, -42),
+            f"{phenotype_name}: {call} ({call_probability:.1%})",
+            self.image_label,
+        )
+        self.hover_probability_visible = True
+
+    def cancel_cell_probability_hover(self):
+        if hasattr(self, "cell_probability_hover_timer"):
+            self.cell_probability_hover_timer.stop()
+        self.hovered_prediction_key = None
+        self.hovered_prediction = None
+        self.hover_global_position = None
+        self.hover_probability_visible = False
+        QToolTip.hideText()
+
+    def label_clicked_cell(self, x_fraction, y_fraction):
+        can_label = self.active_tool == "random_forest" or (
+            self.active_tool == "automated" and self.automated_edit_mode
+        )
+        if (
+            not can_label
             or self.current_fov is None
             or self.segmentation_masks is None
         ):
@@ -1481,6 +2420,13 @@ class OrbitFOVViewer(QWidget):
             label = "negative"
         elif selected is exclude_button:
             self.annotations.pop(cell_id, None)
+            if self.active_tool == "automated" and row_index is not None:
+                state.setdefault("automated_exclusions", set()).add(
+                    int(row_index)
+                )
+                self.automated_edit_status_label.setText(
+                    "Training labels changed. Click Re-Phenotype to apply."
+                )
             self.update_annotation_counts()
             self.update_display()
             return
@@ -1493,7 +2439,16 @@ class OrbitFOVViewer(QWidget):
             "centroid_x": centroid_x,
             "centroid_y": centroid_y,
             "row_index": row_index,
+            "source": "manual",
         }
+        if row_index is not None:
+            state.setdefault("automated_exclusions", set()).discard(
+                int(row_index)
+            )
+        if self.active_tool == "automated":
+            self.automated_edit_status_label.setText(
+                "Training labels changed. Click Re-Phenotype to apply."
+            )
         self.update_annotation_counts()
         self.update_display()
 
@@ -1516,11 +2471,19 @@ class OrbitFOVViewer(QWidget):
         negative = len(self.training_annotations("negative"))
         self.positive_count_label.setText(f"Positive: {positive}")
         self.negative_count_label.setText(f"Negative: {negative}")
+        if hasattr(self, "automated_positive_count_label"):
+            self.automated_positive_count_label.setText(
+                f"Positive: {positive}"
+            )
+            self.automated_negative_count_label.setText(
+                f"Negative: {negative}"
+            )
         for label, count in (("positive", positive), ("negative", negative)):
             if self.training_navigation_indices[label] >= count:
                 self.training_navigation_indices[label] = -1
         self.update_training_navigation_controls()
         self.update_model_controls()
+        self.update_automated_controls()
 
     def training_annotations(self, label):
         return [
@@ -1533,7 +2496,7 @@ class OrbitFOVViewer(QWidget):
     def update_training_navigation_controls(self):
         if not hasattr(self, "previous_positive_button"):
             return
-        for label, previous_button, next_button, position_label in (
+        controls = [
             (
                 "positive", self.previous_positive_button,
                 self.next_positive_button, self.positive_position_label,
@@ -1542,7 +2505,21 @@ class OrbitFOVViewer(QWidget):
                 "negative", self.previous_negative_button,
                 self.next_negative_button, self.negative_position_label,
             ),
-        ):
+        ]
+        if hasattr(self, "automated_previous_positive_button"):
+            controls.extend([
+                (
+                    "positive", self.automated_previous_positive_button,
+                    self.automated_next_positive_button,
+                    self.automated_positive_position_label,
+                ),
+                (
+                    "negative", self.automated_previous_negative_button,
+                    self.automated_next_negative_button,
+                    self.automated_negative_position_label,
+                ),
+            ])
+        for label, previous_button, next_button, position_label in controls:
             count = len(self.training_annotations(label))
             index = self.training_navigation_indices[label]
             enabled = count > 0 and self.img is not None and not self.is_loading
@@ -1724,6 +2701,7 @@ class OrbitFOVViewer(QWidget):
         ]
 
     def train_model(self):
+        self.cancel_cell_probability_hover()
         try:
             features = self._shared_numeric_features()
             if not features:
@@ -1796,6 +2774,7 @@ class OrbitFOVViewer(QWidget):
     def apply_model(self):
         if self.model_bundle is None:
             return
+        self.cancel_cell_probability_hover()
         try:
             features = list(self.model_bundle["feature_columns"])
             prepared = []
@@ -1820,14 +2799,16 @@ class OrbitFOVViewer(QWidget):
                 prepared.append((state, measurements, centroids))
 
             for state, measurements, centroids in prepared:
-                prediction = np.asarray(
-                    self.model_bundle["pipeline"].predict(measurements),
-                    dtype=np.uint8,
+                prediction, positive_probability = (
+                    model_calls_and_positive_probabilities(
+                        self.model_bundle["pipeline"], measurements
+                    )
                 )
                 state["model_predictions"] = {
                     "x": centroids["x"],
                     "y": centroids["y"],
-                    "positive": prediction.astype(bool),
+                    "positive": prediction,
+                    "positive_probability": positive_probability,
                 }
             self.modelled_phenotypes_checkbox.setChecked(True)
             self.update_model_prediction_counts()
@@ -1884,6 +2865,19 @@ class OrbitFOVViewer(QWidget):
             ))
         self.model_positive_count_label.setText(f"Model positive: {positive:,}")
         self.model_negative_count_label.setText(f"Model negative: {negative:,}")
+        if hasattr(self, "automated_model_positive_count_label"):
+            for positive_label, negative_label in (
+                (
+                    self.automated_model_positive_count_label,
+                    self.automated_model_negative_count_label,
+                ),
+                (
+                    self.automated_edit_model_positive_count_label,
+                    self.automated_edit_model_negative_count_label,
+                ),
+            ):
+                positive_label.setText(f"Model positive: {positive:,}")
+                negative_label.setText(f"Model negative: {negative:,}")
 
     def update_model_controls(self):
         if not hasattr(self, "train_model_button"):
@@ -1919,6 +2913,301 @@ class OrbitFOVViewer(QWidget):
         )
         self.export_model_action.setEnabled(self.model_bundle is not None)
         self.import_model_action.setEnabled(not self.is_loading)
+
+    def _set_automated_threshold_defaults(self):
+        for slider, value in (
+            (self.threshold_intensity_slider, AUTOMATED_INTENSITY_SLIDER_VALUE),
+            (self.threshold_percent_slider, AUTOMATED_POSITIVE_PIXEL_PERCENT),
+            (self.threshold_buffer_slider, 10),
+        ):
+            slider.blockSignals(True)
+            slider.setValue(value)
+            slider.blockSignals(False)
+        for checkbox in (
+            self.threshold_nucleus_checkbox,
+            self.threshold_cytoplasm_checkbox,
+        ):
+            checkbox.blockSignals(True)
+            checkbox.setChecked(True)
+            checkbox.blockSignals(False)
+        self.threshold_percent_label.setText(
+            f"Positive pixels required: >{AUTOMATED_POSITIVE_PIXEL_PERCENT}%"
+        )
+        self.threshold_buffer_label.setText(
+            "Inward boundary distance: 10 px "
+            f"({10 * DEFAULT_PIXEL_SIZE_UM:.1f} µm)"
+        )
+        self.threshold_intensity_value = None
+        self.threshold_channel_name = None
+        if self.current_fov is not None:
+            self._update_threshold_value(invalidate=True)
+        self.sync_automated_threshold_controls_from_master()
+
+    def _automated_manual_training(self):
+        manual_training = []
+        for image_index, state in enumerate(self.loaded_images):
+            for annotation in state["annotations"].values():
+                if annotation.get("source") == "automated":
+                    continue
+                row_index = self._find_cell_row_index(state, annotation)
+                if row_index is None:
+                    continue
+                annotation["row_index"] = int(row_index)
+                annotation["source"] = "manual"
+                manual_training.append({
+                    "image_index": image_index,
+                    "row_index": int(row_index),
+                    "label": annotation["label"],
+                })
+        return manual_training
+
+    def start_automated_phenotyping(self, reset_annotations):
+        if self.automated_worker is not None:
+            return
+        if self.current_fov is None:
+            QMessageBox.warning(
+                self,
+                "Automated phenotyping",
+                "Generate a field of view before running automated phenotyping.",
+            )
+            return
+        if not self.loaded_images or any(
+            state["cell_data"] is None or state["segmentation_masks"] is None
+            for state in self.loaded_images
+        ):
+            QMessageBox.warning(
+                self,
+                "Automated phenotyping",
+                "Every loaded image must have cell data and a segmentation mask.",
+            )
+            return
+        if reset_annotations and any(
+            state["annotations"] for state in self.loaded_images
+        ):
+            choice = QMessageBox.question(
+                self,
+                "Replace training labels?",
+                "Auto Phenotype will replace the existing training labels with "
+                "25 automatically selected positive and 25 negative cells. Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if choice != QMessageBox.Yes:
+                return
+
+        if reset_annotations:
+            self._set_automated_threshold_defaults()
+        else:
+            self.sync_automated_threshold_controls_from_master()
+        compartment = self.threshold_compartment()
+        if compartment is None:
+            QMessageBox.warning(
+                self,
+                "Automated phenotyping",
+                "Select Nucleus, Cytoplasm/Membrane, or both compartments.",
+            )
+            return
+
+        channel_name = self.channel_dropdown.currentText()
+        if (
+            self.threshold_intensity_value is None
+            or self.threshold_channel_name != channel_name
+        ):
+            self._update_threshold_value(invalidate=True)
+        try:
+            features = self._shared_numeric_features()
+            if not features:
+                raise ValueError(
+                    "No shared numeric measurement columns were found across "
+                    "the loaded cell-data files."
+                )
+            for state in self.loaded_images:
+                if channel_name not in state["img"].get_channel_names():
+                    raise ValueError(
+                        f"{Path(state['image_path']).name} does not contain the "
+                        f"channel '{channel_name}'."
+                    )
+                self._cell_centroid_cache(state)
+            manual_training = (
+                [] if reset_annotations else self._automated_manual_training()
+            )
+            excluded_rows = (
+                []
+                if reset_annotations
+                else [
+                    (image_index, int(row_index))
+                    for image_index, state in enumerate(self.loaded_images)
+                    for row_index in state.get("automated_exclusions", set())
+                ]
+            )
+        except Exception as error:
+            QMessageBox.warning(
+                self, "Could not start automated phenotyping", str(error)
+            )
+            return
+
+        random_seed = int(
+            np.random.default_rng().integers(0, np.iinfo(np.uint32).max)
+        )
+        self.automated_reset_annotations = bool(reset_annotations)
+        self.automated_status_label.setText(
+            "Thresholding all cells and training the random forest…"
+        )
+        self.automated_edit_status_label.setText(
+            "Thresholding all cells and training the random forest…"
+        )
+        self.set_loading(True, "Running automated phenotyping...")
+        worker = AutomatedPhenotypeWorker(
+            image_states=list(self.loaded_images),
+            channel_name=channel_name,
+            intensity_threshold=self.threshold_intensity_value,
+            positive_pixel_fraction=self.threshold_percent_slider.value() / 100,
+            compartment=compartment,
+            inward_buffer_pixels=self.threshold_buffer_slider.value(),
+            feature_columns=features,
+            phenotype_name=self.phenotype_name.text().strip(),
+            manual_training=manual_training,
+            excluded_rows=excluded_rows,
+            random_seed=random_seed,
+        )
+        worker.signals.finished.connect(self.on_automated_phenotyping_finished)
+        worker.signals.error.connect(self.on_automated_phenotyping_error)
+        self.automated_worker = worker
+        self.thread_pool.start(worker)
+
+    def on_automated_phenotyping_finished(self, result):
+        try:
+            if len(result["model_predictions"]) != len(self.loaded_images):
+                raise ValueError(
+                    "Automated results did not match the loaded image count."
+                )
+            for image_index, state in enumerate(self.loaded_images):
+                if self.automated_reset_annotations:
+                    state["annotations"] = {}
+                    state["automated_exclusions"] = set()
+                else:
+                    state["annotations"] = {
+                        cell_id: annotation
+                        for cell_id, annotation in state["annotations"].items()
+                        if annotation.get("source") != "automated"
+                    }
+                state["annotations"].update(
+                    result["auto_annotations"][image_index]
+                )
+                state["threshold_predictions"] = result[
+                    "threshold_results"
+                ][image_index]
+                state["model_predictions"] = result[
+                    "model_predictions"
+                ][image_index]
+
+            self.model_bundle = result["model_bundle"]
+            if 0 <= self.current_image_index < len(self.loaded_images):
+                self.annotations = self.loaded_images[
+                    self.current_image_index
+                ]["annotations"]
+            training_total = self.model_bundle["training_samples"]
+            feature_total = len(self.model_bundle["feature_columns"])
+            message = (
+                f"Automated random forest trained on {training_total} cells "
+                f"and {feature_total} features, then applied to all loaded images."
+            )
+            self.model_status_label.setText(message)
+            self.automated_status_label.setText(message)
+            self.automated_edit_status_label.setText(message)
+            self.modelled_phenotypes_checkbox.setChecked(True)
+            self.training_navigation_indices = {
+                "positive": -1,
+                "negative": -1,
+            }
+            self.update_annotation_counts()
+            self.update_model_prediction_counts()
+            self.update_threshold_prediction_counts()
+            self.update_model_controls()
+            self.update_threshold_controls()
+            self.update_automated_controls()
+            self.update_display()
+            self.set_loading(False, message)
+        except Exception as error:
+            self.on_automated_phenotyping_error(str(error))
+        finally:
+            self.automated_worker = None
+
+    def on_automated_phenotyping_error(self, error_message):
+        self.automated_worker = None
+        self.set_loading(False)
+        self.automated_status_label.setText("Automated phenotyping failed.")
+        self.automated_edit_status_label.setText(
+            "Automated phenotyping failed."
+        )
+        QMessageBox.warning(
+            self,
+            "Could not auto phenotype",
+            error_message,
+        )
+
+    def update_automated_controls(self):
+        if not hasattr(self, "auto_phenotype_button"):
+            return
+        all_have_segmentation = bool(self.loaded_images) and all(
+            state["cell_data"] is not None
+            and state["segmentation_masks"] is not None
+            for state in self.loaded_images
+        )
+        has_fov = self.current_fov is not None
+        ready = all_have_segmentation and has_fov and not self.is_loading
+        has_predictions = any(
+            state.get("model_predictions") is not None
+            for state in self.loaded_images
+        )
+        all_have_predictions = bool(self.loaded_images) and all(
+            state.get("model_predictions") is not None
+            for state in self.loaded_images
+        )
+        self.auto_phenotype_button.setEnabled(ready)
+        self.automated_edit_button.setEnabled(
+            not self.is_loading
+            and any(state["annotations"] for state in self.loaded_images)
+        )
+        editable = (
+            self.active_tool == "automated"
+            and self.automated_edit_mode
+            and not self.is_loading
+        )
+        compartment_selected = (
+            self.automated_nucleus_checkbox.isChecked()
+            or self.automated_cytoplasm_checkbox.isChecked()
+        )
+        for widget in (
+            self.automated_intensity_slider,
+            self.automated_percent_slider,
+            self.automated_nucleus_checkbox,
+            self.automated_cytoplasm_checkbox,
+            self.automated_positive_checkbox,
+            self.automated_negative_checkbox,
+            self.automated_phenotype_name,
+        ):
+            widget.setEnabled(editable)
+        self.automated_buffer_slider.setEnabled(
+            editable
+            and (
+                self.automated_nucleus_checkbox.isChecked()
+                != self.automated_cytoplasm_checkbox.isChecked()
+            )
+        )
+        self.rephenotype_button.setEnabled(
+            editable and ready and compartment_selected
+        )
+        for widget in (
+            self.automated_modelled_checkbox,
+            self.automated_edit_modelled_checkbox,
+        ):
+            widget.setEnabled(has_predictions and not self.is_loading)
+        self.automated_export_button.setEnabled(
+            self.model_bundle is not None
+            and all_have_predictions
+            and not self.is_loading
+        )
 
     def apply_threshold_to_all_cells(self):
         if self.current_fov is None:
@@ -2306,6 +3595,7 @@ class OrbitFOVViewer(QWidget):
             QMessageBox.critical(self, "Could not export model", traceback.format_exc())
 
     def import_model(self):
+        self.cancel_cell_probability_hover()
         path, _ = QFileDialog.getOpenFileName(
             self, "Import ORBIT model", "", "ORBIT model (*.orbitmodel);;All files (*)"
         )
@@ -2321,6 +3611,8 @@ class OrbitFOVViewer(QWidget):
                 )
             if not bundle.get("feature_columns") or not hasattr(
                 bundle.get("pipeline"), "predict"
+            ) or not hasattr(
+                bundle.get("pipeline"), "predict_proba"
             ):
                 raise ValueError("The ORBIT model file is incomplete.")
             self.model_bundle = bundle
@@ -2350,6 +3642,7 @@ class OrbitFOVViewer(QWidget):
             )
             if choice != QMessageBox.Yes:
                 return
+        self.cancel_cell_probability_hover()
         for state in self.loaded_images:
             try:
                 state["img"].tif.close()
@@ -2366,6 +3659,7 @@ class OrbitFOVViewer(QWidget):
         self.current_pixmap = None
         self.annotations = {}
         self.model_bundle = None
+        self.automated_edit_mode = False
         self.threshold_intensity_value = None
         self.threshold_channel_name = None
         self.threshold_histogram_request_id += 1
@@ -2405,6 +3699,28 @@ class OrbitFOVViewer(QWidget):
         self.image_label.clear()
         self.image_label.setText("Select a QPTIFF image")
         self.model_status_label.setText("No model trained or loaded.")
+        self.automated_status_label.setText(
+            "Ready for automated phenotyping."
+        )
+        self.automated_edit_status_label.setText(
+            "Edit labels or thresholds."
+        )
+        self.automated_panel_stack.setCurrentIndex(0)
+        for slider, value in (
+            (self.automated_intensity_slider, AUTOMATED_INTENSITY_SLIDER_VALUE),
+            (self.automated_percent_slider, AUTOMATED_POSITIVE_PIXEL_PERCENT),
+            (self.automated_buffer_slider, 10),
+        ):
+            slider.blockSignals(True)
+            slider.setValue(value)
+            slider.blockSignals(False)
+        for checkbox in (
+            self.automated_nucleus_checkbox,
+            self.automated_cytoplasm_checkbox,
+        ):
+            checkbox.blockSignals(True)
+            checkbox.setChecked(True)
+            checkbox.blockSignals(False)
         self._refresh_image_carousel()
         self.update_annotation_counts()
         self.update_model_prediction_counts()
@@ -2412,6 +3728,7 @@ class OrbitFOVViewer(QWidget):
         self.set_tool_mode("random_forest")
         self.update_model_controls()
         self.update_threshold_controls()
+        self.update_automated_controls()
         self.set_loading(False, "New project")
 
     def project_data(self):
@@ -2427,6 +3744,10 @@ class OrbitFOVViewer(QWidget):
                     "segmentation_mask": state["segmentation_mask_path"],
                 },
                 "annotations": list(state["annotations"].values()),
+                "automated_exclusions": sorted(
+                    int(row_index)
+                    for row_index in state.get("automated_exclusions", set())
+                ),
                 "viewer": {
                     "current_x0": (
                         None if state["current_x0"] is None
@@ -2441,7 +3762,7 @@ class OrbitFOVViewer(QWidget):
             })
         return {
             "format": "ORBIT phenotype training session",
-            "version": 2,
+            "version": 3,
             "images": images,
             "current_image_index": self.current_image_index,
             "phenotype": {
@@ -2515,7 +3836,7 @@ class OrbitFOVViewer(QWidget):
             if data.get("format") != "ORBIT phenotype training session":
                 raise ValueError("The selected file is not an ORBIT training session.")
             version = data.get("version")
-            if version not in {1, 2}:
+            if version not in {1, 2, 3}:
                 raise ValueError(f"Unsupported ORBIT project version: {data.get('version')}")
             phenotype = data.get("phenotype", {})
             viewer = data.get("viewer", {})
@@ -2550,6 +3871,11 @@ class OrbitFOVViewer(QWidget):
                     str(annotation["cell_id"]): annotation
                     for annotation in entry.get("annotations", [])
                     if annotation.get("label") in {"positive", "negative"}
+                }
+                state["automated_exclusions"] = {
+                    int(row_index)
+                    for row_index in entry.get("automated_exclusions", [])
+                    if 0 <= int(row_index) < len(state["cell_data"])
                 }
                 image_viewer = entry.get("viewer", {})
                 state["current_x0"] = image_viewer.get("current_x0")
@@ -2664,7 +3990,10 @@ class OrbitFOVViewer(QWidget):
         self.current_fov, self.current_dapi_fov = marker_fov, dapi_fov
         self.set_loading(False)
         self.regenerate_button.setEnabled(True)
-        if self.active_tool == "threshold":
+        threshold_edit = (
+            self.active_tool == "automated" and self.automated_edit_mode
+        )
+        if self.active_tool == "threshold" or threshold_edit:
             if self.threshold_intensity_value is None:
                 self._update_threshold_value(invalidate=False)
             elif (
@@ -2672,7 +4001,13 @@ class OrbitFOVViewer(QWidget):
                 != self.channel_dropdown.currentText()
             ):
                 self._update_threshold_value(invalidate=True)
-            self.request_threshold_histogram_refresh()
+            if self.active_tool == "threshold":
+                self.request_threshold_histogram_refresh()
+            else:
+                self.automated_intensity_label.setText(
+                    self.threshold_intensity_label.text()
+                )
+        self.update_automated_controls()
         self.update_display()
 
     def on_fov_error(self, error_message: str):
@@ -2703,9 +4038,18 @@ class OrbitFOVViewer(QWidget):
             boundary = None
             if self.segmentation_checkbox.isChecked():
                 boundary = self.current_segmentation_boundary()
+            automated_threshold_edit = (
+                self.active_tool == "automated" and self.automated_edit_mode
+            )
             if self.active_tool == "threshold":
                 threshold_highlight = self.current_threshold_highlight()
                 annotation_markers = self.current_threshold_markers()
+            elif automated_threshold_edit:
+                threshold_highlight = self.current_threshold_highlight()
+                annotation_markers = (
+                    self.current_model_markers()
+                    + self.current_annotation_markers()
+                )
             else:
                 threshold_highlight = None
                 annotation_markers = (

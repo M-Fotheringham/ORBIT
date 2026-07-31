@@ -427,6 +427,154 @@ def cell_statistics_by_threshold(
     }
 
 
+def select_automated_training_indices(
+    positive_fractions: np.ndarray,
+    positive_pixel_fraction: float,
+    low_negative_count: int = 15,
+    mid_negative_count: int = 10,
+    positive_count: int = 25,
+    top_positive_fraction: float = 0.30,
+    fluorescence_values: np.ndarray | None = None,
+    excluded_indices: np.ndarray | None = None,
+    random_seed: int | None = None,
+) -> dict[str, np.ndarray]:
+    """Select balanced threshold-derived training rows for automation.
+
+    Negative cells are ranked by mean fluorescence within the cells that fail
+    the positive-pixel threshold. Samples are drawn without replacement from
+    the lowest 50% and the 51st-to-80th percentile band. Positives are sampled
+    without replacement from the top positive-pixel-fraction cells.
+    """
+    fractions = np.asarray(positive_fractions, dtype=float)
+    if fractions.ndim != 1:
+        raise ValueError("Positive-pixel fractions must be one-dimensional.")
+    fluorescence = (
+        fractions
+        if fluorescence_values is None
+        else np.asarray(fluorescence_values, dtype=float)
+    )
+    if fluorescence.ndim != 1 or fluorescence.shape != fractions.shape:
+        raise ValueError(
+            "Per-cell fluorescence values must match positive-pixel fractions."
+        )
+    if not 0.0 <= positive_pixel_fraction <= 1.0:
+        raise ValueError("The positive-pixel fraction must be between 0 and 1.")
+    if low_negative_count < 0 or mid_negative_count < 0 or positive_count < 0:
+        raise ValueError("Automated training counts cannot be negative.")
+    if not 0.0 < top_positive_fraction <= 1.0:
+        raise ValueError("The top-positive fraction must be above 0 and at most 1.")
+
+    excluded = np.zeros(fractions.size, dtype=bool)
+    if excluded_indices is not None:
+        excluded_indices = np.asarray(excluded_indices, dtype=np.int64)
+        valid_excluded = excluded_indices[
+            (excluded_indices >= 0) & (excluded_indices < fractions.size)
+        ]
+        excluded[valid_excluded] = True
+
+    finite = np.isfinite(fractions)
+    finite_fluorescence = finite & np.isfinite(fluorescence)
+    threshold_negative = np.flatnonzero(
+        finite_fluorescence & (fractions <= positive_pixel_fraction)
+    )
+    if threshold_negative.size == 0 and (low_negative_count or mid_negative_count):
+        raise ValueError(
+            "No cells fall below the automated positive-pixel threshold. "
+            "Raise the intensity or positive-pixel threshold in Edit mode."
+        )
+
+    negative_order = threshold_negative[
+        np.argsort(fluorescence[threshold_negative], kind="stable")
+    ]
+    low_stop = int(np.ceil(negative_order.size * 0.50))
+    mid_stop = int(np.ceil(negative_order.size * 0.80))
+    low_negative_pool = negative_order[:low_stop]
+    mid_negative_pool = negative_order[low_stop:mid_stop]
+    low_negative_pool = low_negative_pool[~excluded[low_negative_pool]]
+    mid_negative_pool = mid_negative_pool[~excluded[mid_negative_pool]]
+
+    if low_negative_pool.size < low_negative_count:
+        raise ValueError(
+            f"Automated phenotyping needs {low_negative_count} negative "
+            "training cells from the lowest-fluorescence 50% of negatively "
+            f"thresholded cells, but only {low_negative_pool.size} are available."
+        )
+    if mid_negative_pool.size < mid_negative_count:
+        raise ValueError(
+            f"Automated phenotyping needs {mid_negative_count} negative "
+            "training cells from the 51st-to-80th percentile range of "
+            "negatively thresholded cells, but only "
+            f"{mid_negative_pool.size} are available."
+        )
+
+    rng = np.random.default_rng(random_seed)
+    low_negative_indices = (
+        np.sort(
+            rng.choice(
+                low_negative_pool,
+                size=low_negative_count,
+                replace=False,
+            )
+        )
+        if low_negative_count
+        else np.array([], dtype=np.int64)
+    )
+    mid_negative_indices = (
+        np.sort(
+            rng.choice(
+                mid_negative_pool,
+                size=mid_negative_count,
+                replace=False,
+            )
+        )
+        if mid_negative_count
+        else np.array([], dtype=np.int64)
+    )
+    negative_indices = np.sort(
+        np.concatenate((low_negative_indices, mid_negative_indices))
+    )
+
+    threshold_positive = np.flatnonzero(
+        finite & (fractions > positive_pixel_fraction)
+    )
+    if threshold_positive.size == 0 and positive_count:
+        raise ValueError(
+            "No cells exceed the automated positive-pixel threshold. "
+            "Lower the intensity or positive-pixel threshold in Edit mode."
+        )
+    positive_order = threshold_positive[
+        np.argsort(fractions[threshold_positive], kind="stable")[::-1]
+    ]
+    top_count = int(np.ceil(positive_order.size * top_positive_fraction))
+    top_positive = positive_order[:top_count]
+    blocked = excluded.copy()
+    blocked[negative_indices] = True
+    positive_pool = top_positive[~blocked[top_positive]]
+    if positive_pool.size < positive_count:
+        raise ValueError(
+            f"Automated phenotyping needs {positive_count} positive training "
+            f"cells in the top {top_positive_fraction:.0%} of threshold-positive "
+            f"cells, but only {positive_pool.size} are available."
+        )
+
+    positive_indices = (
+        np.sort(
+            rng.choice(positive_pool, size=positive_count, replace=False)
+        )
+        if positive_count
+        else np.array([], dtype=np.int64)
+    )
+    return {
+        "negative": negative_indices.astype(np.int64, copy=False),
+        "negative_low": low_negative_indices.astype(np.int64, copy=False),
+        "negative_mid": mid_negative_indices.astype(np.int64, copy=False),
+        "negative_low_pool": low_negative_pool.astype(np.int64, copy=False),
+        "negative_mid_pool": mid_negative_pool.astype(np.int64, copy=False),
+        "positive": positive_indices.astype(np.int64, copy=False),
+        "positive_pool": positive_pool.astype(np.int64, copy=False),
+    }
+
+
 def phenotype_cells_by_threshold(
     channel: np.ndarray,
     masks: np.ndarray,
@@ -443,15 +591,19 @@ def phenotype_cells_by_threshold(
     if not 0.0 <= positive_pixel_fraction <= 1.0:
         raise ValueError("The positive-pixel fraction must be between 0 and 1.")
 
-    whole_cell_counts, denominator_counts, positive_counts = (
-        pixel_counts_by_mask_label(
-            channel,
-            masks,
-            intensity_threshold,
-            compartment=compartment,
-            inward_buffer_pixels=inward_buffer_pixels,
-            chunk_rows=chunk_rows,
-        )
+    (
+        whole_cell_counts,
+        denominator_counts,
+        positive_counts,
+        finite_intensity_counts,
+        intensity_sums,
+    ) = _pixel_statistics_by_mask_label(
+        channel,
+        masks,
+        intensity_threshold,
+        compartment=compartment,
+        inward_buffer_pixels=inward_buffer_pixels,
+        chunk_rows=chunk_rows,
     )
     mask_labels = map_cell_rows_to_mask_labels(
         cell_data,
@@ -467,10 +619,17 @@ def phenotype_cells_by_threshold(
         where=denominator_counts > 0,
     )
     fractions = fractions_by_label[mask_labels]
+    mean_intensity_by_label = np.divide(
+        intensity_sums,
+        finite_intensity_counts,
+        out=np.full(intensity_sums.shape, np.nan, dtype=float),
+        where=finite_intensity_counts > 0,
+    )
     denominator_pixels = denominator_counts[mask_labels]
     return {
         "mask_label": mask_labels,
         "denominator_pixels": denominator_pixels,
+        "mean_intensity": mean_intensity_by_label[mask_labels],
         "positive_fraction": fractions,
         "positive": (
             (denominator_pixels > 0)
