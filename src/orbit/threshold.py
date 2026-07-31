@@ -27,7 +27,7 @@ def intensity_threshold_from_slider(
 def _grow_counts(counts: np.ndarray, required_size: int) -> np.ndarray:
     if required_size <= counts.size:
         return counts
-    expanded = np.zeros(required_size, dtype=np.uint64)
+    expanded = np.zeros(required_size, dtype=counts.dtype)
     expanded[: counts.size] = counts
     return expanded
 
@@ -97,15 +97,15 @@ def compartment_mask_for_rows(
     return selected[row_start:row_stop]
 
 
-def pixel_counts_by_mask_label(
+def _pixel_statistics_by_mask_label(
     channel: np.ndarray,
     masks: np.ndarray,
     intensity_threshold: float,
     compartment: str = "all",
     inward_buffer_pixels: int = 10,
     chunk_rows: int = 512,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Count whole-cell, denominator, and positive pixels by mask label."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Aggregate threshold and intensity statistics by mask label."""
     channel = np.asarray(channel)
     masks = np.asarray(masks)
     if channel.ndim != 2 or masks.ndim != 2:
@@ -125,6 +125,8 @@ def pixel_counts_by_mask_label(
     whole_cell_counts = np.zeros(1, dtype=np.uint64)
     denominator_counts = np.zeros(1, dtype=np.uint64)
     positive_counts = np.zeros(1, dtype=np.uint64)
+    finite_intensity_counts = np.zeros(1, dtype=np.uint64)
+    intensity_sums = np.zeros(1, dtype=np.float64)
 
     for y0 in range(0, masks.shape[0], chunk_rows):
         y1 = min(y0 + chunk_rows, masks.shape[0])
@@ -146,6 +148,10 @@ def pixel_counts_by_mask_label(
         whole_cell_counts = _grow_counts(whole_cell_counts, required_size)
         denominator_counts = _grow_counts(denominator_counts, required_size)
         positive_counts = _grow_counts(positive_counts, required_size)
+        finite_intensity_counts = _grow_counts(
+            finite_intensity_counts, required_size
+        )
+        intensity_sums = _grow_counts(intensity_sums, required_size)
 
         chunk_whole_cell = np.bincount(whole_cell_labels)
         whole_cell_counts[: chunk_whole_cell.size] += chunk_whole_cell.astype(
@@ -172,8 +178,26 @@ def pixel_counts_by_mask_label(
             np.uint64, copy=False
         )
 
-        above_threshold = np.isfinite(channel_chunk[denominator_valid]) & (
-            channel_chunk[denominator_valid] > intensity_threshold
+        denominator_intensities = channel_chunk[denominator_valid]
+        finite_intensity = np.isfinite(denominator_intensities)
+        if np.any(finite_intensity):
+            finite_labels = denominator_labels[finite_intensity]
+            chunk_finite_counts = np.bincount(finite_labels)
+            finite_intensity_counts[
+                : chunk_finite_counts.size
+            ] += chunk_finite_counts.astype(np.uint64, copy=False)
+            chunk_intensity_sums = np.bincount(
+                finite_labels,
+                weights=denominator_intensities[finite_intensity].astype(
+                    np.float64, copy=False
+                ),
+            )
+            intensity_sums[
+                : chunk_intensity_sums.size
+            ] += chunk_intensity_sums
+
+        above_threshold = finite_intensity & (
+            denominator_intensities > intensity_threshold
         )
         if np.any(above_threshold):
             chunk_positive = np.bincount(
@@ -183,7 +207,33 @@ def pixel_counts_by_mask_label(
                 np.uint64, copy=False
             )
 
-    return whole_cell_counts, denominator_counts, positive_counts
+    return (
+        whole_cell_counts,
+        denominator_counts,
+        positive_counts,
+        finite_intensity_counts,
+        intensity_sums,
+    )
+
+
+def pixel_counts_by_mask_label(
+    channel: np.ndarray,
+    masks: np.ndarray,
+    intensity_threshold: float,
+    compartment: str = "all",
+    inward_buffer_pixels: int = 10,
+    chunk_rows: int = 512,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Count whole-cell, denominator, and positive pixels by mask label."""
+    statistics = _pixel_statistics_by_mask_label(
+        channel,
+        masks,
+        intensity_threshold,
+        compartment=compartment,
+        inward_buffer_pixels=inward_buffer_pixels,
+        chunk_rows=chunk_rows,
+    )
+    return statistics[:3]
 
 
 def _numeric_identifier_candidates(cell_data: pd.DataFrame) -> list[np.ndarray]:
@@ -322,6 +372,59 @@ def map_cell_rows_to_mask_labels(
             f"{nearest_search_radius} pixels of their segmented cells."
         )
     return resolved
+
+
+def cell_statistics_by_threshold(
+    channel: np.ndarray,
+    masks: np.ndarray,
+    cell_data: pd.DataFrame,
+    centroid_x: np.ndarray,
+    centroid_y: np.ndarray,
+    intensity_threshold: float,
+    compartment: str = "all",
+    inward_buffer_pixels: int = 10,
+    chunk_rows: int = 512,
+) -> dict[str, np.ndarray]:
+    """Return all-image per-cell intensity and positive-pixel statistics."""
+    (
+        whole_cell_counts,
+        denominator_counts,
+        positive_counts,
+        finite_intensity_counts,
+        intensity_sums,
+    ) = _pixel_statistics_by_mask_label(
+        channel,
+        masks,
+        intensity_threshold,
+        compartment=compartment,
+        inward_buffer_pixels=inward_buffer_pixels,
+        chunk_rows=chunk_rows,
+    )
+    mask_labels = map_cell_rows_to_mask_labels(
+        cell_data,
+        masks,
+        centroid_x,
+        centroid_y,
+        whole_cell_counts,
+    )
+    mean_intensity_by_label = np.divide(
+        intensity_sums,
+        finite_intensity_counts,
+        out=np.full(intensity_sums.shape, np.nan, dtype=float),
+        where=finite_intensity_counts > 0,
+    )
+    fractions_by_label = np.divide(
+        positive_counts,
+        denominator_counts,
+        out=np.zeros_like(positive_counts, dtype=float),
+        where=denominator_counts > 0,
+    )
+    return {
+        "mask_label": mask_labels,
+        "denominator_pixels": denominator_counts[mask_labels],
+        "mean_intensity": mean_intensity_by_label[mask_labels],
+        "positive_fraction": fractions_by_label[mask_labels],
+    }
 
 
 def phenotype_cells_by_threshold(
