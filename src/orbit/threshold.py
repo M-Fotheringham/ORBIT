@@ -5,6 +5,9 @@ import pandas as pd
 from scipy.ndimage import distance_transform_edt
 
 
+DEFAULT_INWARD_BUFFER_PIXELS = 4
+
+
 def intensity_threshold_from_slider(
     image: np.ndarray,
     slider_value: int,
@@ -102,7 +105,7 @@ def _pixel_statistics_by_mask_label(
     masks: np.ndarray,
     intensity_threshold: float,
     compartment: str = "all",
-    inward_buffer_pixels: int = 10,
+    inward_buffer_pixels: int = DEFAULT_INWARD_BUFFER_PIXELS,
     chunk_rows: int = 512,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Aggregate threshold and intensity statistics by mask label."""
@@ -221,7 +224,7 @@ def pixel_counts_by_mask_label(
     masks: np.ndarray,
     intensity_threshold: float,
     compartment: str = "all",
-    inward_buffer_pixels: int = 10,
+    inward_buffer_pixels: int = DEFAULT_INWARD_BUFFER_PIXELS,
     chunk_rows: int = 512,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Count whole-cell, denominator, and positive pixels by mask label."""
@@ -382,7 +385,7 @@ def cell_statistics_by_threshold(
     centroid_y: np.ndarray,
     intensity_threshold: float,
     compartment: str = "all",
-    inward_buffer_pixels: int = 10,
+    inward_buffer_pixels: int = DEFAULT_INWARD_BUFFER_PIXELS,
     chunk_rows: int = 512,
 ) -> dict[str, np.ndarray]:
     """Return all-image per-cell intensity and positive-pixel statistics."""
@@ -584,7 +587,7 @@ def phenotype_cells_by_threshold(
     intensity_threshold: float,
     positive_pixel_fraction: float,
     compartment: str = "all",
-    inward_buffer_pixels: int = 10,
+    inward_buffer_pixels: int = DEFAULT_INWARD_BUFFER_PIXELS,
     chunk_rows: int = 512,
 ) -> dict[str, np.ndarray]:
     """Assign cells using the fraction of their pixels above an intensity cutoff."""

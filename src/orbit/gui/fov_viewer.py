@@ -42,6 +42,15 @@ COLOR_MAPS = {
 
 DEFAULT_PIXEL_SIZE_UM = 0.5064
 THRESHOLD_HISTOGRAM_BINS = 30
+THRESHOLD_BUFFER_SLIDER_STEPS_PER_UM = 10
+DEFAULT_INWARD_BUFFER_UM = 2.0
+MAXIMUM_INWARD_BUFFER_UM = 5.0
+DEFAULT_INWARD_BUFFER_SLIDER_VALUE = int(
+    DEFAULT_INWARD_BUFFER_UM * THRESHOLD_BUFFER_SLIDER_STEPS_PER_UM
+)
+MAXIMUM_INWARD_BUFFER_SLIDER_VALUE = int(
+    MAXIMUM_INWARD_BUFFER_UM * THRESHOLD_BUFFER_SLIDER_STEPS_PER_UM
+)
 AUTOMATED_INTENSITY_SLIDER_VALUE = 660
 AUTOMATED_POSITIVE_PIXEL_PERCENT = 15
 AUTOMATED_NEGATIVE_TRAINING_COUNT = 25
@@ -52,6 +61,32 @@ AUTOMATED_TOP_POSITIVE_FRACTION = 0.30
 CELL_PROBABILITY_HOVER_DELAY_MS = 2000
 MODEL_FORMAT = "ORBIT phenotype model"
 MODEL_VERSION = 1
+
+
+def buffer_microns_from_slider(value):
+    return float(value) / THRESHOLD_BUFFER_SLIDER_STEPS_PER_UM
+
+
+def buffer_pixels_from_slider(value):
+    return max(
+        int(round(buffer_microns_from_slider(value) / DEFAULT_PIXEL_SIZE_UM)),
+        0,
+    )
+
+
+def buffer_slider_from_pixels(pixels):
+    microns = np.clip(
+        float(pixels) * DEFAULT_PIXEL_SIZE_UM,
+        0.0,
+        MAXIMUM_INWARD_BUFFER_UM,
+    )
+    return int(round(microns * THRESHOLD_BUFFER_SLIDER_STEPS_PER_UM))
+
+
+def buffer_distance_label(slider_value):
+    microns = buffer_microns_from_slider(slider_value)
+    pixels = buffer_pixels_from_slider(slider_value)
+    return f"Inward boundary distance: {microns:.1f} µm ({pixels} px)"
 
 
 def model_calls_and_positive_probabilities(pipeline, measurements):
@@ -1006,12 +1041,30 @@ class OrbitFOVViewer(QWidget):
         self.threshold_cytoplasm_checkbox.stateChanged.connect(
             self.threshold_compartment_changed
         )
+        self.threshold_mask_button = QPushButton("Threshold Mask: On")
+        self.threshold_mask_button.setCheckable(True)
+        self.threshold_mask_button.setChecked(True)
+        self.threshold_mask_button.setToolTip(
+            "Show or hide the yellow above-threshold pixel mask."
+        )
+        self.threshold_mask_button.toggled.connect(
+            self.threshold_mask_toggled
+        )
         self.threshold_buffer_label = QLabel(
-            "Inward boundary distance: 10 px (5.1 µm)"
+            buffer_distance_label(DEFAULT_INWARD_BUFFER_SLIDER_VALUE)
         )
         self.threshold_buffer_slider = QSlider(Qt.Horizontal)
-        self.threshold_buffer_slider.setRange(0, 50)
-        self.threshold_buffer_slider.setValue(10)
+        self.threshold_buffer_slider.setRange(
+            0, MAXIMUM_INWARD_BUFFER_SLIDER_VALUE
+        )
+        self.threshold_buffer_slider.setSingleStep(1)
+        self.threshold_buffer_slider.setPageStep(5)
+        self.threshold_buffer_slider.setValue(
+            DEFAULT_INWARD_BUFFER_SLIDER_VALUE
+        )
+        self.threshold_buffer_slider.setToolTip(
+            "Inward boundary distance from 0.0 to 5.0 µm in 0.1 µm steps."
+        )
         self.threshold_buffer_slider.valueChanged.connect(
             self.threshold_buffer_changed
         )
@@ -1051,6 +1104,7 @@ class OrbitFOVViewer(QWidget):
         )
         threshold_layout.addLayout(threshold_name_layout)
         threshold_layout.addWidget(threshold_description)
+        threshold_layout.addWidget(self.threshold_mask_button)
         threshold_layout.addSpacing(8)
         threshold_layout.addWidget(self.threshold_intensity_histogram_label)
         threshold_layout.addWidget(self.threshold_intensity_histogram)
@@ -1161,18 +1215,41 @@ class OrbitFOVViewer(QWidget):
         self.automated_cytoplasm_checkbox.stateChanged.connect(
             self.automated_compartment_changed
         )
+        self.automated_threshold_mask_button = QPushButton(
+            "Threshold Mask: On"
+        )
+        self.automated_threshold_mask_button.setCheckable(True)
+        self.automated_threshold_mask_button.setChecked(True)
+        self.automated_threshold_mask_button.setToolTip(
+            "Show or hide the yellow above-threshold pixel mask."
+        )
+        self.automated_threshold_mask_button.toggled.connect(
+            self.automated_threshold_mask_toggled
+        )
         self.automated_buffer_label = QLabel(
-            "Inward boundary distance: 10 px (5.1 µm)"
+            buffer_distance_label(DEFAULT_INWARD_BUFFER_SLIDER_VALUE)
         )
         self.automated_buffer_slider = QSlider(Qt.Horizontal)
-        self.automated_buffer_slider.setRange(0, 50)
-        self.automated_buffer_slider.setValue(10)
+        self.automated_buffer_slider.setRange(
+            0, MAXIMUM_INWARD_BUFFER_SLIDER_VALUE
+        )
+        self.automated_buffer_slider.setSingleStep(1)
+        self.automated_buffer_slider.setPageStep(5)
+        self.automated_buffer_slider.setValue(
+            DEFAULT_INWARD_BUFFER_SLIDER_VALUE
+        )
+        self.automated_buffer_slider.setToolTip(
+            "Inward boundary distance from 0.0 to 5.0 µm in 0.1 µm steps."
+        )
         self.automated_buffer_slider.valueChanged.connect(
             self.automated_buffer_changed
         )
 
         automated_threshold_panel = QGroupBox("Threshold Settings")
         automated_threshold_layout = QVBoxLayout()
+        automated_threshold_layout.addWidget(
+            self.automated_threshold_mask_button
+        )
         automated_threshold_layout.addWidget(self.automated_intensity_label)
         automated_threshold_layout.addWidget(self.automated_intensity_slider)
         automated_threshold_layout.addWidget(self.automated_percent_label)
@@ -1530,13 +1607,19 @@ class OrbitFOVViewer(QWidget):
             automated_widget.blockSignals(True)
             automated_widget.setChecked(master_widget.isChecked())
             automated_widget.blockSignals(False)
+        self.automated_threshold_mask_button.blockSignals(True)
+        self.automated_threshold_mask_button.setChecked(
+            self.threshold_mask_button.isChecked()
+        )
+        self.automated_threshold_mask_button.setText(
+            self.threshold_mask_button.text()
+        )
+        self.automated_threshold_mask_button.blockSignals(False)
         self.automated_percent_label.setText(
             f"Positive pixels required: >{self.automated_percent_slider.value()}%"
         )
-        distance = self.automated_buffer_slider.value()
         self.automated_buffer_label.setText(
-            f"Inward boundary distance: {distance} px "
-            f"({distance * DEFAULT_PIXEL_SIZE_UM:.1f} µm)"
+            buffer_distance_label(self.automated_buffer_slider.value())
         )
         if self.current_fov is not None:
             self._update_threshold_value(invalidate=False)
@@ -1593,17 +1676,33 @@ class OrbitFOVViewer(QWidget):
         self.update_automated_controls()
         self.update_display()
 
+    def threshold_mask_toggled(self, checked):
+        text = f"Threshold Mask: {'On' if checked else 'Off'}"
+        self.threshold_mask_button.setText(text)
+        self.automated_threshold_mask_button.blockSignals(True)
+        self.automated_threshold_mask_button.setChecked(bool(checked))
+        self.automated_threshold_mask_button.setText(text)
+        self.automated_threshold_mask_button.blockSignals(False)
+        self.update_display()
+
+    def automated_threshold_mask_toggled(self, checked):
+        text = f"Threshold Mask: {'On' if checked else 'Off'}"
+        self.automated_threshold_mask_button.setText(text)
+        self.threshold_mask_button.blockSignals(True)
+        self.threshold_mask_button.setChecked(bool(checked))
+        self.threshold_mask_button.setText(text)
+        self.threshold_mask_button.blockSignals(False)
+        self.update_display()
+
     def automated_buffer_changed(self, value):
         self.threshold_buffer_slider.blockSignals(True)
         self.threshold_buffer_slider.setValue(value)
         self.threshold_buffer_slider.blockSignals(False)
         self.threshold_buffer_label.setText(
-            f"Inward boundary distance: {value} px "
-            f"({value * DEFAULT_PIXEL_SIZE_UM:.1f} µm)"
+            buffer_distance_label(value)
         )
         self.automated_buffer_label.setText(
-            f"Inward boundary distance: {value} px "
-            f"({value * DEFAULT_PIXEL_SIZE_UM:.1f} µm)"
+            buffer_distance_label(value)
         )
         self._invalidate_threshold_predictions()
         self.automated_edit_status_label.setText(
@@ -1751,7 +1850,9 @@ class OrbitFOVViewer(QWidget):
             channel_name=self.channel_dropdown.currentText(),
             intensity_threshold=self.threshold_intensity_value,
             compartment=compartment,
-            inward_buffer_pixels=self.threshold_buffer_slider.value(),
+            inward_buffer_pixels=buffer_pixels_from_slider(
+                self.threshold_buffer_slider.value()
+            ),
         )
         worker.signals.finished.connect(self.on_threshold_histograms_ready)
         worker.signals.error.connect(self.on_threshold_histograms_error)
@@ -1859,10 +1960,13 @@ class OrbitFOVViewer(QWidget):
         self.update_display()
 
     def threshold_buffer_changed(self, value):
-        distance_um = value * DEFAULT_PIXEL_SIZE_UM
         self.threshold_buffer_label.setText(
-            f"Inward boundary distance: {value} px ({distance_um:.1f} µm)"
+            buffer_distance_label(value)
         )
+        self.automated_buffer_slider.blockSignals(True)
+        self.automated_buffer_slider.setValue(value)
+        self.automated_buffer_slider.blockSignals(False)
+        self.automated_buffer_label.setText(buffer_distance_label(value))
         self._invalidate_threshold_predictions()
         self.request_threshold_histogram_refresh(delay_ms=300)
         self.update_display()
@@ -1883,8 +1987,13 @@ class OrbitFOVViewer(QWidget):
         self.reload_current_fov()
 
     def current_threshold_highlight(self):
-        threshold_visible = self.active_tool == "threshold" or (
-            self.active_tool == "automated" and self.automated_edit_mode
+        threshold_visible = (
+            self.active_tool == "threshold"
+            and self.threshold_mask_button.isChecked()
+        ) or (
+            self.active_tool == "automated"
+            and self.automated_edit_mode
+            and self.automated_threshold_mask_button.isChecked()
         )
         if not threshold_visible or self.current_fov is None:
             return None
@@ -2918,7 +3027,10 @@ class OrbitFOVViewer(QWidget):
         for slider, value in (
             (self.threshold_intensity_slider, AUTOMATED_INTENSITY_SLIDER_VALUE),
             (self.threshold_percent_slider, AUTOMATED_POSITIVE_PIXEL_PERCENT),
-            (self.threshold_buffer_slider, 10),
+            (
+                self.threshold_buffer_slider,
+                DEFAULT_INWARD_BUFFER_SLIDER_VALUE,
+            ),
         ):
             slider.blockSignals(True)
             slider.setValue(value)
@@ -2934,9 +3046,12 @@ class OrbitFOVViewer(QWidget):
             f"Positive pixels required: >{AUTOMATED_POSITIVE_PIXEL_PERCENT}%"
         )
         self.threshold_buffer_label.setText(
-            "Inward boundary distance: 10 px "
-            f"({10 * DEFAULT_PIXEL_SIZE_UM:.1f} µm)"
+            buffer_distance_label(DEFAULT_INWARD_BUFFER_SLIDER_VALUE)
         )
+        self.threshold_mask_button.blockSignals(True)
+        self.threshold_mask_button.setChecked(True)
+        self.threshold_mask_button.setText("Threshold Mask: On")
+        self.threshold_mask_button.blockSignals(False)
         self.threshold_intensity_value = None
         self.threshold_channel_name = None
         if self.current_fov is not None:
@@ -3063,7 +3178,9 @@ class OrbitFOVViewer(QWidget):
             intensity_threshold=self.threshold_intensity_value,
             positive_pixel_fraction=self.threshold_percent_slider.value() / 100,
             compartment=compartment,
-            inward_buffer_pixels=self.threshold_buffer_slider.value(),
+            inward_buffer_pixels=buffer_pixels_from_slider(
+                self.threshold_buffer_slider.value()
+            ),
             feature_columns=features,
             phenotype_name=self.phenotype_name.text().strip(),
             manual_training=manual_training,
@@ -3183,6 +3300,7 @@ class OrbitFOVViewer(QWidget):
             self.automated_percent_slider,
             self.automated_nucleus_checkbox,
             self.automated_cytoplasm_checkbox,
+            self.automated_threshold_mask_button,
             self.automated_positive_checkbox,
             self.automated_negative_checkbox,
             self.automated_phenotype_name,
@@ -3257,7 +3375,9 @@ class OrbitFOVViewer(QWidget):
             return
 
         positive_pixel_fraction = self.threshold_percent_slider.value() / 100
-        inward_buffer_pixels = self.threshold_buffer_slider.value()
+        inward_buffer_pixels = buffer_pixels_from_slider(
+            self.threshold_buffer_slider.value()
+        )
         self._invalidate_threshold_predictions()
         self.set_loading(
             True,
@@ -3388,6 +3508,7 @@ class OrbitFOVViewer(QWidget):
         editable = threshold_mode and not self.is_loading
         compartment = self.threshold_compartment()
         self.threshold_phenotype_name.setEnabled(editable)
+        self.threshold_mask_button.setEnabled(editable and has_fov)
         self.threshold_intensity_slider.setEnabled(editable and has_fov)
         self.threshold_percent_slider.setEnabled(editable and has_fov)
         self.threshold_nucleus_checkbox.setEnabled(editable)
@@ -3680,12 +3801,18 @@ class OrbitFOVViewer(QWidget):
         self.threshold_cytoplasm_checkbox.setChecked(True)
         self.threshold_cytoplasm_checkbox.blockSignals(False)
         self.threshold_buffer_slider.blockSignals(True)
-        self.threshold_buffer_slider.setValue(10)
+        self.threshold_buffer_slider.setValue(
+            DEFAULT_INWARD_BUFFER_SLIDER_VALUE
+        )
         self.threshold_buffer_slider.blockSignals(False)
         self.threshold_percent_label.setText("Positive pixels required: >25%")
         self.threshold_buffer_label.setText(
-            "Inward boundary distance: 10 px (5.1 µm)"
+            buffer_distance_label(DEFAULT_INWARD_BUFFER_SLIDER_VALUE)
         )
+        self.threshold_mask_button.blockSignals(True)
+        self.threshold_mask_button.setChecked(True)
+        self.threshold_mask_button.setText("Threshold Mask: On")
+        self.threshold_mask_button.blockSignals(False)
         self.threshold_intensity_label.setText("Intensity threshold: —")
         self.threshold_intensity_histogram_label.setText(
             "All-image mean fluorescence per cell"
@@ -3709,7 +3836,10 @@ class OrbitFOVViewer(QWidget):
         for slider, value in (
             (self.automated_intensity_slider, AUTOMATED_INTENSITY_SLIDER_VALUE),
             (self.automated_percent_slider, AUTOMATED_POSITIVE_PIXEL_PERCENT),
-            (self.automated_buffer_slider, 10),
+            (
+                self.automated_buffer_slider,
+                DEFAULT_INWARD_BUFFER_SLIDER_VALUE,
+            ),
         ):
             slider.blockSignals(True)
             slider.setValue(value)
@@ -3721,6 +3851,10 @@ class OrbitFOVViewer(QWidget):
             checkbox.blockSignals(True)
             checkbox.setChecked(True)
             checkbox.blockSignals(False)
+        self.automated_threshold_mask_button.blockSignals(True)
+        self.automated_threshold_mask_button.setChecked(True)
+        self.automated_threshold_mask_button.setText("Threshold Mask: On")
+        self.automated_threshold_mask_button.blockSignals(False)
         self._refresh_image_carousel()
         self.update_annotation_counts()
         self.update_model_prediction_counts()
@@ -3787,8 +3921,14 @@ class OrbitFOVViewer(QWidget):
                     "use_cytoplasm_membrane": (
                         self.threshold_cytoplasm_checkbox.isChecked()
                     ),
-                    "inward_buffer_pixels": (
+                    "show_mask": self.threshold_mask_button.isChecked(),
+                    "inward_buffer_microns": buffer_microns_from_slider(
                         self.threshold_buffer_slider.value()
+                    ),
+                    "inward_buffer_pixels": (
+                        buffer_pixels_from_slider(
+                            self.threshold_buffer_slider.value()
+                        )
                     ),
                 },
             },
@@ -3923,19 +4063,50 @@ class OrbitFOVViewer(QWidget):
                 )
             )
             self.threshold_cytoplasm_checkbox.blockSignals(False)
+            show_threshold_mask = bool(
+                threshold_settings.get("show_mask", True)
+            )
+            threshold_mask_text = (
+                f"Threshold Mask: {'On' if show_threshold_mask else 'Off'}"
+            )
+            for threshold_mask_button in (
+                self.threshold_mask_button,
+                self.automated_threshold_mask_button,
+            ):
+                threshold_mask_button.blockSignals(True)
+                threshold_mask_button.setChecked(show_threshold_mask)
+                threshold_mask_button.setText(threshold_mask_text)
+                threshold_mask_button.blockSignals(False)
+            if "inward_buffer_microns" in threshold_settings:
+                buffer_slider_value = int(round(
+                    float(threshold_settings["inward_buffer_microns"])
+                    * THRESHOLD_BUFFER_SLIDER_STEPS_PER_UM
+                ))
+            elif "inward_buffer_pixels" in threshold_settings:
+                buffer_slider_value = buffer_slider_from_pixels(
+                    threshold_settings["inward_buffer_pixels"]
+                )
+            else:
+                buffer_slider_value = DEFAULT_INWARD_BUFFER_SLIDER_VALUE
             self.threshold_buffer_slider.blockSignals(True)
             self.threshold_buffer_slider.setValue(
-                int(threshold_settings.get("inward_buffer_pixels", 10))
+                buffer_slider_value
             )
             self.threshold_buffer_slider.blockSignals(False)
+            self.automated_buffer_slider.blockSignals(True)
+            self.automated_buffer_slider.setValue(
+                self.threshold_buffer_slider.value()
+            )
+            self.automated_buffer_slider.blockSignals(False)
             self.threshold_percent_label.setText(
                 "Positive pixels required: "
                 f">{self.threshold_percent_slider.value()}%"
             )
             self.threshold_buffer_label.setText(
-                "Inward boundary distance: "
-                f"{self.threshold_buffer_slider.value()} px "
-                f"({self.threshold_buffer_slider.value() * DEFAULT_PIXEL_SIZE_UM:.1f} µm)"
+                buffer_distance_label(self.threshold_buffer_slider.value())
+            )
+            self.automated_buffer_label.setText(
+                buffer_distance_label(self.automated_buffer_slider.value())
             )
             self.positive_annotations_checkbox.setChecked(
                 phenotype.get("show_positive", True)
