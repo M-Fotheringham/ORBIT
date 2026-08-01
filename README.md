@@ -17,6 +17,7 @@ The platform is designed for rapid, pathologist-guided biomarker training using 
 - Biomarker/channel selection
 - Custom fluorescence color overlays
 - Interactive, supervised machine-learning-based phenotyping
+- Automated phenotyping
 - Designed for multiplex pathology and spatial biology
 
 ---
