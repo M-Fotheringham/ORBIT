@@ -13,7 +13,16 @@ set "PYTHON=python"
 set "ENTRY=%ROOT%\src\orbit\app.py"
 set "ICON=%ROOT%\docs\figs\icon_logo.ico"
 set "BUILD_DIR=%ROOT%\build"
+set "NUITKA_DIST=%BUILD_DIR%\app.dist"
 set "FINAL_DIST=%BUILD_DIR%\ORBIT.dist"
+set "APP_VERSION=1.1.0"
+set "FILE_VERSION=1.1.0.0"
+
+if defined PYTHONPATH (
+    set "PYTHONPATH=%ROOT%\src;%PYTHONPATH%"
+) else (
+    set "PYTHONPATH=%ROOT%\src"
+)
 
 rem ------------------------------------------------------------
 rem Validate Python and required files
@@ -40,8 +49,11 @@ if not exist "%ICON%" (
 
 echo.
 "%PYTHON%" -c "import sys; print('Using Python:', sys.executable)"
+if errorlevel 1 exit /b 1
 
-"%PYTHON%" -m nuitka --version >nul 2>&1
+echo.
+echo Checking Nuitka installation...
+"%PYTHON%" -m nuitka --version
 if errorlevel 1 (
     echo.
     echo ERROR: Nuitka is not installed in the active environment.
@@ -50,7 +62,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
-"%PYTHON%" -c "import PySide6, numpy, pandas, sklearn, tifffile, skimage, joblib" >nul 2>&1
+echo.
+echo Checking ORBIT and runtime dependencies...
+"%PYTHON%" -c "import orbit.app, orbit.gui.fov_viewer, PySide6, numpy, pandas, scipy, sklearn, tifffile, skimage, joblib, qptifffile; print('Dependency check passed.')"
 if errorlevel 1 (
     echo.
     echo ERROR: One or more ORBIT dependencies are unavailable.
@@ -70,20 +84,29 @@ if exist "%FINAL_DIST%" (
     rmdir /s /q "%FINAL_DIST%"
 )
 
-set "PYTHONPATH=%ROOT%\src"
+if exist "%NUITKA_DIST%" (
+    echo Removing previous Nuitka distribution...
+    rmdir /s /q "%NUITKA_DIST%"
+)
 
 rem ------------------------------------------------------------
 rem Build
 rem ------------------------------------------------------------
 
 echo.
-echo Building ORBIT...
+echo Building ORBIT %APP_VERSION%...
+echo This can take several minutes. Nuitka will print progress below.
 echo.
 
 pushd "%ROOT%"
+if errorlevel 1 (
+    echo ERROR: Could not enter repository directory:
+    echo %ROOT%
+    exit /b 1
+)
 
 "%PYTHON%" -m nuitka ^
-    --mode=standalone ^
+    --standalone ^
     --enable-plugin=pyside6 ^
     --windows-console-mode=disable ^
     "--windows-icon-from-ico=%ICON%" ^
@@ -91,10 +114,11 @@ pushd "%ROOT%"
     --include-package=orbit ^
     "--output-dir=%BUILD_DIR%" ^
     --output-filename=ORBIT.exe ^
-    --product-name=ORBIT ^
-    --file-description="ORBIT Phenotype Viewer" ^
-    --file-version=1.0.0.0 ^
-    --product-version=1.0.0.0 ^
+    "--company-name=Michael Fotheringham" ^
+    "--product-name=ORBIT" ^
+    "--file-description=ORBIT Phenotype Viewer" ^
+    "--file-version=%FILE_VERSION%" ^
+    "--product-version=%FILE_VERSION%" ^
     --assume-yes-for-downloads ^
     --remove-output ^
     "--report=%BUILD_DIR%\nuitka-report.xml" ^
@@ -105,9 +129,9 @@ if errorlevel 1 goto :build_failed
 rem Nuitka may name the folder after app.py.
 rem Rename app.dist to ORBIT.dist for a predictable installer path.
 
-if exist "%BUILD_DIR%\app.dist" (
+if exist "%NUITKA_DIST%" (
     if exist "%FINAL_DIST%" rmdir /s /q "%FINAL_DIST%"
-    move "%BUILD_DIR%\app.dist" "%FINAL_DIST%" >nul
+    move "%NUITKA_DIST%" "%FINAL_DIST%" >nul
 )
 
 if not exist "%FINAL_DIST%\ORBIT.exe" (
@@ -127,6 +151,7 @@ echo Executable:
 echo %FINAL_DIST%\ORBIT.exe
 echo.
 echo Test the executable before creating the installer.
+echo Then compile orbit_installer_setup.iss with Inno Setup.
 echo.
 
 popd
