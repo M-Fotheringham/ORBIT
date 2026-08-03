@@ -30,6 +30,7 @@ from orbit.threshold import (
     cell_statistics_by_threshold,
     intensity_threshold_from_slider,
     phenotype_cells_by_threshold,
+    select_automated_refinement_indices,
     select_automated_training_indices,
 )
 
@@ -58,6 +59,10 @@ AUTOMATED_LOW_NEGATIVE_TRAINING_COUNT = 15
 AUTOMATED_MID_NEGATIVE_TRAINING_COUNT = 10
 AUTOMATED_POSITIVE_TRAINING_COUNT = 25
 AUTOMATED_TOP_POSITIVE_FRACTION = 0.30
+AUTOMATED_REFINEMENT_TRAINING_COUNT = 5
+AUTOMATED_REFINEMENT_MAX_CALL_PROBABILITY = 0.60
+AUTOMATED_SECOND_REFINEMENT_MAX_CALL_PROBABILITY = 0.55
+AUTOMATED_REFINEMENT_FLUORESCENCE_FRACTION = 0.10
 CELL_PROBABILITY_HOVER_DELAY_MS = 2000
 MODEL_FORMAT = "ORBIT phenotype model"
 MODEL_VERSION = 1
@@ -627,11 +632,10 @@ class AutomatedPhenotypeWorker(QRunnable):
             ])
             auto_annotations = [dict() for _ in self.image_states]
             training_references = list(manual_global)
-            for label, global_indices in (
-                ("negative", selected["negative"]),
-                ("positive", selected["positive"]),
-            ):
+
+            def add_automated_annotations(label, global_indices):
                 for global_index in global_indices:
+                    global_index = int(global_index)
                     image_index = int(image_for_global[global_index])
                     row_index = int(row_for_global[global_index])
                     threshold_result = threshold_results[image_index]
@@ -644,51 +648,163 @@ class AutomatedPhenotypeWorker(QRunnable):
                         "row_index": row_index,
                         "source": "automated",
                     }
-                    training_references.append((int(global_index), label))
+                    training_references.append((global_index, label))
 
-            rows = []
-            targets = []
-            for global_index, label in training_references:
-                image_index = int(image_for_global[global_index])
-                row_index = int(row_for_global[global_index])
-                rows.append(
-                    self.image_states[image_index]["cell_data"].iloc[row_index][
-                        self.feature_columns
-                    ]
-                )
-                targets.append(1 if label == "positive" else 0)
-            if set(targets) != {0, 1}:
-                raise ValueError(
-                    "Automated phenotyping requires both positive and negative "
-                    "training cells."
-                )
+            for label, global_indices in (
+                ("negative", selected["negative"]),
+                ("positive", selected["positive"]),
+            ):
+                add_automated_annotations(label, global_indices)
 
-            training_data = pd.DataFrame(
-                rows, columns=self.feature_columns
-            ).apply(pd.to_numeric, errors="coerce")
-            usable_features = [
-                column for column in self.feature_columns
-                if training_data[column].notna().any()
-                and training_data[column].nunique(dropna=True) > 1
-            ]
-            if not usable_features:
-                raise ValueError(
-                    "The automated training cells do not vary in any shared "
-                    "measurement column."
-                )
+            def fit_automated_model(references):
+                rows = []
+                targets = []
+                for global_index, label in references:
+                    image_index = int(image_for_global[global_index])
+                    row_index = int(row_for_global[global_index])
+                    rows.append(
+                        self.image_states[image_index]["cell_data"].iloc[
+                            row_index
+                        ][self.feature_columns]
+                    )
+                    targets.append(1 if label == "positive" else 0)
+                if set(targets) != {0, 1}:
+                    raise ValueError(
+                        "Automated phenotyping requires both positive and "
+                        "negative training cells."
+                    )
 
-            pipeline = Pipeline([
-                ("imputer", SimpleImputer(strategy="median")),
-                ("classifier", RandomForestClassifier(
-                    n_estimators=300,
-                    class_weight="balanced",
-                    random_state=42,
-                    n_jobs=-1,
-                )),
-            ])
-            pipeline.fit(
-                training_data[usable_features],
-                np.asarray(targets, dtype=np.uint8),
+                training_data = pd.DataFrame(
+                    rows, columns=self.feature_columns
+                ).apply(pd.to_numeric, errors="coerce")
+                usable_features = [
+                    column for column in self.feature_columns
+                    if training_data[column].notna().any()
+                    and training_data[column].nunique(dropna=True) > 1
+                ]
+                if not usable_features:
+                    raise ValueError(
+                        "The automated training cells do not vary in any shared "
+                        "measurement column."
+                    )
+
+                pipeline = Pipeline([
+                    ("imputer", SimpleImputer(strategy="median")),
+                    ("classifier", RandomForestClassifier(
+                        n_estimators=300,
+                        class_weight="balanced",
+                        random_state=42,
+                        n_jobs=-1,
+                    )),
+                ])
+                pipeline.fit(
+                    training_data[usable_features],
+                    np.asarray(targets, dtype=np.uint8),
+                )
+                return pipeline, usable_features, targets
+
+            # First fit: the original balanced 25-positive/25-negative set.
+            initial_pipeline, initial_features, _ = fit_automated_model(
+                training_references
+            )
+            initial_calls = []
+            initial_positive_probabilities = []
+            for state in self.image_states:
+                measurements = state["cell_data"][initial_features].apply(
+                    pd.to_numeric, errors="coerce"
+                )
+                calls, probabilities = model_calls_and_positive_probabilities(
+                    initial_pipeline, measurements
+                )
+                initial_calls.append(calls)
+                initial_positive_probabilities.append(probabilities)
+
+            first_refinement_excluded = excluded_global | {
+                int(global_index) for global_index, _ in training_references
+            }
+            first_refinement_seed = (
+                int(self.random_seed) + 1
+            ) % (np.iinfo(np.uint32).max + 1)
+            first_refinement = select_automated_refinement_indices(
+                predicted_positive=np.concatenate(initial_calls),
+                positive_probabilities=np.concatenate(
+                    initial_positive_probabilities
+                ),
+                fluorescence_values=all_fluorescence,
+                positive_count=AUTOMATED_REFINEMENT_TRAINING_COUNT,
+                negative_count=AUTOMATED_REFINEMENT_TRAINING_COUNT,
+                maximum_call_probability=(
+                    AUTOMATED_REFINEMENT_MAX_CALL_PROBABILITY
+                ),
+                fluorescence_tail_fraction=(
+                    AUTOMATED_REFINEMENT_FLUORESCENCE_FRACTION
+                ),
+                excluded_indices=np.asarray(
+                    sorted(first_refinement_excluded), dtype=np.int64
+                ),
+                random_seed=first_refinement_seed,
+            )
+            # High-fluorescence uncertain negatives teach the positive class;
+            # low-fluorescence uncertain positives teach the negative class.
+            add_automated_annotations(
+                "positive", first_refinement["positive"]
+            )
+            add_automated_annotations(
+                "negative", first_refinement["negative"]
+            )
+
+            # Second fit: retrain with 30 examples per class, then identify a
+            # second set of harder examples using a stricter 55% confidence.
+            second_pipeline, second_features, _ = fit_automated_model(
+                training_references
+            )
+            second_calls = []
+            second_positive_probabilities = []
+            for state in self.image_states:
+                measurements = state["cell_data"][second_features].apply(
+                    pd.to_numeric, errors="coerce"
+                )
+                calls, probabilities = model_calls_and_positive_probabilities(
+                    second_pipeline, measurements
+                )
+                second_calls.append(calls)
+                second_positive_probabilities.append(probabilities)
+
+            second_refinement_excluded = excluded_global | {
+                int(global_index) for global_index, _ in training_references
+            }
+            second_refinement_seed = (
+                int(self.random_seed) + 2
+            ) % (np.iinfo(np.uint32).max + 1)
+            second_refinement = select_automated_refinement_indices(
+                predicted_positive=np.concatenate(second_calls),
+                positive_probabilities=np.concatenate(
+                    second_positive_probabilities
+                ),
+                fluorescence_values=all_fluorescence,
+                positive_count=AUTOMATED_REFINEMENT_TRAINING_COUNT,
+                negative_count=AUTOMATED_REFINEMENT_TRAINING_COUNT,
+                maximum_call_probability=(
+                    AUTOMATED_SECOND_REFINEMENT_MAX_CALL_PROBABILITY
+                ),
+                fluorescence_tail_fraction=(
+                    AUTOMATED_REFINEMENT_FLUORESCENCE_FRACTION
+                ),
+                excluded_indices=np.asarray(
+                    sorted(second_refinement_excluded), dtype=np.int64
+                ),
+                random_seed=second_refinement_seed,
+            )
+            add_automated_annotations(
+                "positive", second_refinement["positive"]
+            )
+            add_automated_annotations(
+                "negative", second_refinement["negative"]
+            )
+
+            # Third and final fit: train from scratch on 35 examples per class.
+            pipeline, usable_features, targets = fit_automated_model(
+                training_references
             )
             model_bundle = {
                 "format": MODEL_FORMAT,
@@ -707,6 +823,27 @@ class AutomatedPhenotypeWorker(QRunnable):
                     "negative_low_fluorescence_fraction": 0.50,
                     "negative_mid_fluorescence_range": [0.51, 0.80],
                     "top_positive_fraction": AUTOMATED_TOP_POSITIVE_FRACTION,
+                    "refinement_max_call_probability": (
+                        AUTOMATED_REFINEMENT_MAX_CALL_PROBABILITY
+                    ),
+                    "refinement_fluorescence_tail_fraction": (
+                        AUTOMATED_REFINEMENT_FLUORESCENCE_FRACTION
+                    ),
+                    "refinement_positive_count": len(
+                        first_refinement["positive"]
+                    ),
+                    "refinement_negative_count": len(
+                        first_refinement["negative"]
+                    ),
+                    "second_refinement_max_call_probability": (
+                        AUTOMATED_SECOND_REFINEMENT_MAX_CALL_PROBABILITY
+                    ),
+                    "second_refinement_positive_count": len(
+                        second_refinement["positive"]
+                    ),
+                    "second_refinement_negative_count": len(
+                        second_refinement["negative"]
+                    ),
                     "random_seed": self.random_seed,
                 },
             }
@@ -734,8 +871,16 @@ class AutomatedPhenotypeWorker(QRunnable):
                 "auto_annotations": auto_annotations,
                 "model_bundle": model_bundle,
                 "model_predictions": model_predictions,
-                "automatic_positive_count": len(selected["positive"]),
-                "automatic_negative_count": len(selected["negative"]),
+                "automatic_positive_count": (
+                    len(selected["positive"])
+                    + len(first_refinement["positive"])
+                    + len(second_refinement["positive"])
+                ),
+                "automatic_negative_count": (
+                    len(selected["negative"])
+                    + len(first_refinement["negative"])
+                    + len(second_refinement["negative"])
+                ),
                 "manual_positive_count": manual_positive,
                 "manual_negative_count": manual_negative,
             })
@@ -1137,8 +1282,11 @@ class OrbitFOVViewer(QWidget):
 
         automated_description = QLabel(
             "Automatically thresholds the displayed channel, selects 25 "
-            "negative and 25 positive training cells, trains a random forest, "
-            "and applies it to every loaded image."
+            "negative and 25 positive training cells, then runs two "
+            "low-confidence refinement rounds at 60% and 55%, adding five "
+            "fluorescence-discordant cells to each class per round. The final "
+            "35-positive/35-negative random forest is applied to every loaded "
+            "image."
         )
         automated_description.setWordWrap(True)
         self.auto_phenotype_button = QPushButton("Auto Phenotype")

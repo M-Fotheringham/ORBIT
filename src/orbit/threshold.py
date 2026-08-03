@@ -578,6 +578,140 @@ def select_automated_training_indices(
     }
 
 
+def select_automated_refinement_indices(
+    predicted_positive: np.ndarray,
+    positive_probabilities: np.ndarray,
+    fluorescence_values: np.ndarray,
+    positive_count: int = 5,
+    negative_count: int = 5,
+    maximum_call_probability: float = 0.60,
+    fluorescence_tail_fraction: float = 0.10,
+    excluded_indices: np.ndarray | None = None,
+    random_seed: int | None = None,
+) -> dict[str, np.ndarray]:
+    """Select low-confidence, fluorescence-discordant refinement cells.
+
+    Five high-fluorescence cells from the top fluorescence decile of
+    low-confidence negative model calls become positive training examples.
+    Five low-fluorescence cells from the bottom fluorescence decile of
+    low-confidence positive model calls become negative training examples.
+    Existing or explicitly excluded training rows are never selected again.
+    """
+    calls = np.asarray(predicted_positive, dtype=bool)
+    probabilities = np.asarray(positive_probabilities, dtype=float)
+    fluorescence = np.asarray(fluorescence_values, dtype=float)
+    if calls.ndim != 1:
+        raise ValueError("Model calls must be one-dimensional.")
+    if probabilities.ndim != 1 or probabilities.shape != calls.shape:
+        raise ValueError(
+            "Positive probabilities must contain one value per model call."
+        )
+    if fluorescence.ndim != 1 or fluorescence.shape != calls.shape:
+        raise ValueError(
+            "Per-cell fluorescence values must contain one value per model call."
+        )
+    if positive_count < 0 or negative_count < 0:
+        raise ValueError("Automated refinement counts cannot be negative.")
+    if not 0.50 < maximum_call_probability <= 1.0:
+        raise ValueError(
+            "The maximum call probability must be above 0.50 and at most 1."
+        )
+    if not 0.0 < fluorescence_tail_fraction <= 1.0:
+        raise ValueError(
+            "The fluorescence-tail fraction must be above 0 and at most 1."
+        )
+
+    excluded = np.zeros(calls.size, dtype=bool)
+    if excluded_indices is not None:
+        excluded_indices = np.asarray(excluded_indices, dtype=np.int64)
+        valid_excluded = excluded_indices[
+            (excluded_indices >= 0) & (excluded_indices < calls.size)
+        ]
+        excluded[valid_excluded] = True
+
+    valid = (
+        np.isfinite(probabilities)
+        & np.isfinite(fluorescence)
+        & (probabilities >= 0.0)
+        & (probabilities <= 1.0)
+        & ~excluded
+    )
+    call_probabilities = np.where(calls, probabilities, 1.0 - probabilities)
+    low_confidence = valid & (
+        call_probabilities < maximum_call_probability
+    )
+
+    called_negative = np.flatnonzero(low_confidence & ~calls)
+    called_positive = np.flatnonzero(low_confidence & calls)
+
+    high_fluorescence_order = called_negative[
+        np.argsort(fluorescence[called_negative], kind="stable")
+    ]
+    high_tail_count = int(np.ceil(
+        high_fluorescence_order.size * fluorescence_tail_fraction
+    ))
+    high_fluorescence_pool = high_fluorescence_order[-high_tail_count:]
+
+    low_fluorescence_order = called_positive[
+        np.argsort(fluorescence[called_positive], kind="stable")
+    ]
+    low_tail_count = int(np.ceil(
+        low_fluorescence_order.size * fluorescence_tail_fraction
+    ))
+    low_fluorescence_pool = low_fluorescence_order[:low_tail_count]
+
+    if high_fluorescence_pool.size < positive_count:
+        raise ValueError(
+            "Automated refinement needs "
+            f"{positive_count} cells from the top "
+            f"{fluorescence_tail_fraction:.0%} of fluorescence among "
+            "low-confidence negative calls, but only "
+            f"{high_fluorescence_pool.size} are available."
+        )
+    if low_fluorescence_pool.size < negative_count:
+        raise ValueError(
+            "Automated refinement needs "
+            f"{negative_count} cells from the bottom "
+            f"{fluorescence_tail_fraction:.0%} of fluorescence among "
+            "low-confidence positive calls, but only "
+            f"{low_fluorescence_pool.size} are available."
+        )
+
+    rng = np.random.default_rng(random_seed)
+    positive_indices = (
+        np.sort(
+            rng.choice(
+                high_fluorescence_pool,
+                size=positive_count,
+                replace=False,
+            )
+        )
+        if positive_count
+        else np.array([], dtype=np.int64)
+    )
+    negative_indices = (
+        np.sort(
+            rng.choice(
+                low_fluorescence_pool,
+                size=negative_count,
+                replace=False,
+            )
+        )
+        if negative_count
+        else np.array([], dtype=np.int64)
+    )
+    return {
+        "positive": positive_indices.astype(np.int64, copy=False),
+        "negative": negative_indices.astype(np.int64, copy=False),
+        "positive_pool": high_fluorescence_pool.astype(
+            np.int64, copy=False
+        ),
+        "negative_pool": low_fluorescence_pool.astype(
+            np.int64, copy=False
+        ),
+    }
+
+
 def phenotype_cells_by_threshold(
     channel: np.ndarray,
     masks: np.ndarray,
