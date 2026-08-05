@@ -15,8 +15,8 @@ set "ICON=%ROOT%\docs\figs\icon_logo.ico"
 set "BUILD_DIR=%ROOT%\build"
 set "NUITKA_DIST=%BUILD_DIR%\app.dist"
 set "FINAL_DIST=%BUILD_DIR%\ORBIT.dist"
-set "APP_VERSION=1.1.0"
-set "FILE_VERSION=1.1.0.0"
+set "APP_VERSION=1.1.1"
+set "FILE_VERSION=1.1.1.0"
 
 if defined PYTHONPATH (
     set "PYTHONPATH=%ROOT%\src;%PYTHONPATH%"
