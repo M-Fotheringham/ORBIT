@@ -7,9 +7,6 @@ import pandas as pd
 import tifffile
 import joblib
 from skimage.segmentation import find_boundaries
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.impute import SimpleImputer
-from sklearn.pipeline import Pipeline
 
 from PySide6.QtWidgets import (
     QWidget, QPushButton, QLabel, QFileDialog, QVBoxLayout, QHBoxLayout,
@@ -26,12 +23,34 @@ from PySide6.QtCore import (
 
 from orbit.image import QPTiffImage
 from orbit.fov import RandomFOVGenerator
+from orbit.models.random_forest import (
+    MODEL_FORMAT,
+    MODEL_VERSION,
+    RANDOM_FOREST_ALGORITHM,
+    fit_random_forest,
+    model_calls_and_positive_probabilities,
+)
+from orbit.models.automated import (
+    AUTOMATED_INTENSITY_SLIDER_VALUE,
+    AUTOMATED_LOW_NEGATIVE_TRAINING_COUNT,
+    AUTOMATED_MID_NEGATIVE_TRAINING_COUNT,
+    AUTOMATED_NEGATIVE_TRAINING_COUNT,
+    AUTOMATED_POSITIVE_PIXEL_PERCENT,
+    AUTOMATED_POSITIVE_TRAINING_COUNT,
+    AUTOMATED_RANDOM_SEED,
+    AUTOMATED_REFINEMENT_FLUORESCENCE_FRACTION,
+    AUTOMATED_REFINEMENT_MAX_CALL_PROBABILITY,
+    AUTOMATED_REFINEMENT_TRAINING_COUNT,
+    AUTOMATED_SECOND_REFINEMENT_MAX_CALL_PROBABILITY,
+    AUTOMATED_TOP_POSITIVE_FRACTION,
+    random_seed_for_stage,
+    select_automated_refinement_indices,
+    select_automated_training_indices,
+)
 from orbit.threshold import (
     cell_statistics_by_threshold,
     intensity_threshold_from_slider,
     phenotype_cells_by_threshold,
-    select_automated_refinement_indices,
-    select_automated_training_indices,
 )
 
 
@@ -52,20 +71,7 @@ DEFAULT_INWARD_BUFFER_SLIDER_VALUE = int(
 MAXIMUM_INWARD_BUFFER_SLIDER_VALUE = int(
     MAXIMUM_INWARD_BUFFER_UM * THRESHOLD_BUFFER_SLIDER_STEPS_PER_UM
 )
-AUTOMATED_INTENSITY_SLIDER_VALUE = 660
-AUTOMATED_POSITIVE_PIXEL_PERCENT = 15
-AUTOMATED_NEGATIVE_TRAINING_COUNT = 25
-AUTOMATED_LOW_NEGATIVE_TRAINING_COUNT = 15
-AUTOMATED_MID_NEGATIVE_TRAINING_COUNT = 10
-AUTOMATED_POSITIVE_TRAINING_COUNT = 25
-AUTOMATED_TOP_POSITIVE_FRACTION = 0.30
-AUTOMATED_REFINEMENT_TRAINING_COUNT = 5
-AUTOMATED_REFINEMENT_MAX_CALL_PROBABILITY = 0.60
-AUTOMATED_SECOND_REFINEMENT_MAX_CALL_PROBABILITY = 0.55
-AUTOMATED_REFINEMENT_FLUORESCENCE_FRACTION = 0.10
 CELL_PROBABILITY_HOVER_DELAY_MS = 2000
-MODEL_FORMAT = "ORBIT phenotype model"
-MODEL_VERSION = 1
 
 
 def buffer_microns_from_slider(value):
@@ -92,22 +98,6 @@ def buffer_distance_label(slider_value):
     microns = buffer_microns_from_slider(slider_value)
     pixels = buffer_pixels_from_slider(slider_value)
     return f"Inward boundary distance: {microns:.1f} µm ({pixels} px)"
-
-
-def model_calls_and_positive_probabilities(pipeline, measurements):
-    """Return Boolean calls and probabilities for the positive phenotype."""
-    predictions = np.asarray(pipeline.predict(measurements), dtype=np.uint8)
-    probabilities = np.asarray(pipeline.predict_proba(measurements), dtype=float)
-    classes = np.asarray(pipeline.classes_)
-    positive_columns = np.flatnonzero(classes == 1)
-    if positive_columns.size != 1:
-        raise ValueError(
-            "The phenotype model does not expose a single positive class."
-        )
-    positive_probability = np.clip(
-        probabilities[:, int(positive_columns[0])], 0.0, 1.0
-    )
-    return predictions.astype(bool), positive_probability
 
 
 def normalize_channel(arr: np.ndarray) -> np.ndarray:
@@ -676,30 +666,12 @@ class AutomatedPhenotypeWorker(QRunnable):
 
                 training_data = pd.DataFrame(
                     rows, columns=self.feature_columns
-                ).apply(pd.to_numeric, errors="coerce")
-                usable_features = [
-                    column for column in self.feature_columns
-                    if training_data[column].notna().any()
-                    and training_data[column].nunique(dropna=True) > 1
-                ]
-                if not usable_features:
-                    raise ValueError(
-                        "The automated training cells do not vary in any shared "
-                        "measurement column."
-                    )
-
-                pipeline = Pipeline([
-                    ("imputer", SimpleImputer(strategy="median")),
-                    ("classifier", RandomForestClassifier(
-                        n_estimators=300,
-                        class_weight="balanced",
-                        random_state=42,
-                        n_jobs=-1,
-                    )),
-                ])
-                pipeline.fit(
-                    training_data[usable_features],
-                    np.asarray(targets, dtype=np.uint8),
+                )
+                pipeline, usable_features = fit_random_forest(
+                    training_data=training_data,
+                    targets=targets,
+                    feature_columns=self.feature_columns,
+                    random_seed=self.random_seed,
                 )
                 return pipeline, usable_features, targets
 
@@ -722,9 +694,9 @@ class AutomatedPhenotypeWorker(QRunnable):
             first_refinement_excluded = excluded_global | {
                 int(global_index) for global_index, _ in training_references
             }
-            first_refinement_seed = (
-                int(self.random_seed) + 1
-            ) % (np.iinfo(np.uint32).max + 1)
+            first_refinement_seed = random_seed_for_stage(
+                1, self.random_seed
+            )
             first_refinement = select_automated_refinement_indices(
                 predicted_positive=np.concatenate(initial_calls),
                 positive_probabilities=np.concatenate(
@@ -773,9 +745,9 @@ class AutomatedPhenotypeWorker(QRunnable):
             second_refinement_excluded = excluded_global | {
                 int(global_index) for global_index, _ in training_references
             }
-            second_refinement_seed = (
-                int(self.random_seed) + 2
-            ) % (np.iinfo(np.uint32).max + 1)
+            second_refinement_seed = random_seed_for_stage(
+                2, self.random_seed
+            )
             second_refinement = select_automated_refinement_indices(
                 predicted_positive=np.concatenate(second_calls),
                 positive_probabilities=np.concatenate(
@@ -811,7 +783,7 @@ class AutomatedPhenotypeWorker(QRunnable):
                 "version": MODEL_VERSION,
                 "phenotype_name": self.phenotype_name,
                 "feature_columns": usable_features,
-                "algorithm": "RandomForestClassifier",
+                "algorithm": RANDOM_FOREST_ALGORITHM,
                 "training_samples": len(targets),
                 "pipeline": pipeline,
                 "automated": {
@@ -2983,35 +2955,18 @@ class OrbitFOVViewer(QWidget):
                 raise ValueError(
                     "Label at least one Positive and one Negative cell before training."
                 )
-            training_data = pd.DataFrame(rows, columns=features).apply(
-                pd.to_numeric, errors="coerce"
+            training_data = pd.DataFrame(rows, columns=features)
+            pipeline, features = fit_random_forest(
+                training_data=training_data,
+                targets=targets,
+                feature_columns=features,
             )
-            features = [
-                column for column in features
-                if training_data[column].notna().any()
-                and training_data[column].nunique(dropna=True) > 1
-            ]
-            if not features:
-                raise ValueError(
-                    "The labelled cells do not vary in any shared measurement column."
-                )
-
-            pipeline = Pipeline([
-                ("imputer", SimpleImputer(strategy="median")),
-                ("classifier", RandomForestClassifier(
-                    n_estimators=300,
-                    class_weight="balanced",
-                    random_state=42,
-                    n_jobs=-1,
-                )),
-            ])
-            pipeline.fit(training_data[features], np.asarray(targets, dtype=np.uint8))
             self.model_bundle = {
                 "format": MODEL_FORMAT,
                 "version": MODEL_VERSION,
                 "phenotype_name": self.phenotype_name.text().strip(),
                 "feature_columns": features,
-                "algorithm": "RandomForestClassifier",
+                "algorithm": RANDOM_FOREST_ALGORITHM,
                 "training_samples": len(targets),
                 "pipeline": pipeline,
             }
@@ -3309,9 +3264,9 @@ class OrbitFOVViewer(QWidget):
             )
             return
 
-        random_seed = int(
-            np.random.default_rng().integers(0, np.iinfo(np.uint32).max)
-        )
+        # A fixed seed makes automated cell selection reproducible whenever
+        # the images, segmentation, measurements, and settings are unchanged.
+        random_seed = AUTOMATED_RANDOM_SEED
         self.automated_reset_annotations = bool(reset_annotations)
         self.automated_status_label.setText(
             "Thresholding all cells and training the random forest…"
