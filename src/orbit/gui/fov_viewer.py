@@ -150,7 +150,7 @@ def array_to_qpixmap(
                 if marker.get("source") in {"model", "threshold"}
                 else 5
             )
-            color = QColor("#00e640" if marker["label"] == "positive" else "#ff3030")
+            color = QColor("#00eeff" if marker["label"] == "positive" else "#ff3030")
             painter.setPen(QPen(QColor("black"), 1))
             painter.setBrush(color)
             x, y = round(marker["x"]), round(marker["y"])
@@ -966,7 +966,7 @@ class OrbitFOVViewer(QWidget):
         self.phenotype_name.setPlaceholderText("e.g. CD8-positive")
         self.positive_annotations_checkbox = QCheckBox("Show Positive")
         self.positive_annotations_checkbox.setChecked(True)
-        self.positive_annotations_checkbox.setStyleSheet("color: #00b832;")
+        self.positive_annotations_checkbox.setStyleSheet("color: #00afd1;")
         self.positive_annotations_checkbox.stateChanged.connect(self.update_display)
         self.positive_annotations_checkbox.stateChanged.connect(
             self.sync_automated_annotation_visibility
@@ -1383,7 +1383,7 @@ class OrbitFOVViewer(QWidget):
 
         self.automated_positive_checkbox = QCheckBox("Show Positive")
         self.automated_positive_checkbox.setChecked(True)
-        self.automated_positive_checkbox.setStyleSheet("color: #00b832;")
+        self.automated_positive_checkbox.setStyleSheet("color: #00afd1;")
         self.automated_positive_checkbox.stateChanged.connect(
             self.automated_annotation_visibility_changed
         )
