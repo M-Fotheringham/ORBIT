@@ -64,7 +64,7 @@ if errorlevel 1 (
 
 echo.
 echo Checking ORBIT and runtime dependencies...
-"%PYTHON%" -c "import orbit.app, orbit.gui.fov_viewer, PySide6, numpy, pandas, scipy, sklearn, tifffile, skimage, joblib, qptifffile; print('Dependency check passed.')"
+"%PYTHON%" -c "import orbit.app, orbit.gui.fov_viewer, PySide6, numpy, pandas, scipy, sklearn, tifffile, skimage, joblib, qptifffile, cellpose, torch; print('Dependency check passed.')"
 if errorlevel 1 (
     echo.
     echo ERROR: One or more ORBIT dependencies are unavailable.
@@ -112,6 +112,7 @@ if errorlevel 1 (
     "--windows-icon-from-ico=%ICON%" ^
     "--include-data-files=%ICON%=docs/figs/icon_logo.ico" ^
     --include-package=orbit ^
+    --include-package=cellpose ^
     "--output-dir=%BUILD_DIR%" ^
     --output-filename=ORBIT.exe ^
     "--company-name=Michael Fotheringham" ^
