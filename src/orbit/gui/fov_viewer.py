@@ -47,6 +47,14 @@ from orbit.models.automated import (
     select_automated_refinement_indices,
     select_automated_training_indices,
 )
+from orbit.models.cellpose_segmentation import (
+    CELLPOSE_SAM_MODEL,
+    cuda_compatible_gpu_available,
+    dapi_channel_name,
+    membrane_marker_names,
+    output_paths_for_image,
+    segment_project_images,
+)
 from orbit.threshold import (
     cell_statistics_by_threshold,
     intensity_threshold_from_slider,
@@ -360,6 +368,49 @@ class FOVLoadWorker(QRunnable):
                 channel=self.dapi_channel,
             )
             self.signals.finished.emit(marker_fov, dapi_fov)
+        except Exception:
+            self.signals.error.emit(traceback.format_exc())
+
+
+class SegmentationWorkerSignals(QObject):
+    finished = Signal(object)
+    progress = Signal(str)
+    error = Signal(str)
+
+
+class CellposeSegmentationWorker(QRunnable):
+    """Run Cellpose-SAM across all loaded images away from the UI thread."""
+
+    def __init__(self, images, marker_names, pixel_size_um):
+        super().__init__()
+        self.images = list(images)
+        self.marker_names = list(marker_names)
+        self.pixel_size_um = float(pixel_size_um)
+        self.signals = SegmentationWorkerSignals()
+
+    def run(self):
+        try:
+            results = segment_project_images(
+                self.images,
+                self.marker_names,
+                pixel_size_um=self.pixel_size_um,
+                progress_callback=self.signals.progress.emit,
+            )
+            self.signals.finished.emit(results)
+        except Exception:
+            self.signals.error.emit(traceback.format_exc())
+
+
+class CudaDetectionWorker(QRunnable):
+    """Detect CUDA without delaying construction of the main window."""
+
+    def __init__(self):
+        super().__init__()
+        self.signals = SegmentationWorkerSignals()
+
+    def run(self):
+        try:
+            self.signals.finished.emit(cuda_compatible_gpu_available())
         except Exception:
             self.signals.error.emit(traceback.format_exc())
 
@@ -880,7 +931,12 @@ class OrbitFOVViewer(QWidget):
         self.loaded_images = []
         self.current_image_index = -1
         self.model_bundle = None
-        self.active_tool = "random_forest"
+        self.active_tool = "automated"
+        self.cellpose_worker = None
+        self.cuda_detection_worker = None
+        self.cuda_gpu_available = None
+        self.segmenting_selected_markers = set()
+        self.released_generated_segmentations = {}
         self.automated_worker = None
         self.automated_edit_mode = False
         self.threshold_intensity_value = None
@@ -1508,9 +1564,68 @@ class OrbitFOVViewer(QWidget):
         automated_page_layout.setContentsMargins(0, 0, 0, 0)
         automated_page_layout.addWidget(self.automated_panel_stack)
 
+        self.segmenting_gpu_status_label = QLabel(
+            "● Checking for a CUDA-compatible GPU..."
+        )
+        self.segmenting_gpu_status_label.setWordWrap(True)
+        self.segmenting_gpu_status_label.setStyleSheet(
+            "color: #b26a00; font-weight: bold;"
+        )
+        segmenting_description = QLabel(
+            "Select one or more membrane-guiding markers shared by the loaded "
+            "images. Selected channels are normalized and merged before "
+            f"segmentation with Cellpose-SAM ({CELLPOSE_SAM_MODEL})."
+        )
+        segmenting_description.setWordWrap(True)
+        self.segmenting_dapi_label = QLabel(
+            "DAPI will be supplied as the nuclear channel when available."
+        )
+        self.segmenting_dapi_label.setWordWrap(True)
+        self.segmenting_marker_content = QWidget()
+        self.segmenting_marker_layout = QVBoxLayout(
+            self.segmenting_marker_content
+        )
+        self.segmenting_marker_layout.setContentsMargins(4, 4, 4, 4)
+        self.segmenting_marker_layout.setSpacing(3)
+        self.segmenting_marker_checkboxes = []
+        self.segmenting_marker_scroll = QScrollArea()
+        self.segmenting_marker_scroll.setWidgetResizable(True)
+        self.segmenting_marker_scroll.setMinimumHeight(220)
+        self.segmenting_marker_scroll.setWidget(
+            self.segmenting_marker_content
+        )
+        self.segment_button = QPushButton("Segment")
+        self.segment_button.setToolTip(
+            "Replace segmentation and cell-level measurements for every "
+            "loaded image using the selected markers."
+        )
+        self.segment_button.clicked.connect(self.start_cellpose_segmentation)
+        self.segmenting_status_label = QLabel(
+            "Load images, select membrane markers, then click Segment."
+        )
+        self.segmenting_status_label.setWordWrap(True)
+
+        segmenting_panel = QGroupBox("CellPoseSAM Segmentation")
+        segmenting_layout = QVBoxLayout()
+        segmenting_layout.addWidget(self.segmenting_gpu_status_label)
+        segmenting_layout.addSpacing(6)
+        segmenting_layout.addWidget(segmenting_description)
+        segmenting_layout.addWidget(self.segmenting_dapi_label)
+        segmenting_layout.addSpacing(6)
+        segmenting_layout.addWidget(QLabel("Membrane-guiding markers:"))
+        segmenting_layout.addWidget(self.segmenting_marker_scroll, stretch=1)
+        segmenting_layout.addWidget(self.segment_button)
+        segmenting_layout.addWidget(self.segmenting_status_label)
+        segmenting_panel.setLayout(segmenting_layout)
+        segmenting_page = QWidget()
+        segmenting_page_layout = QVBoxLayout(segmenting_page)
+        segmenting_page_layout.setContentsMargins(0, 0, 0, 0)
+        segmenting_page_layout.addWidget(segmenting_panel)
+
         self.right_panel_stack = QStackedWidget()
         self.right_panel_stack.setMinimumWidth(220)
         self.right_panel_stack.setMaximumWidth(330)
+        self.right_panel_stack.addWidget(segmenting_page)
         self.right_panel_stack.addWidget(random_forest_page)
         self.right_panel_stack.addWidget(threshold_page)
         self.right_panel_stack.addWidget(automated_page)
@@ -1559,12 +1674,20 @@ class OrbitFOVViewer(QWidget):
         file_menu.addAction(self.import_model_action)
         file_menu.addAction(self.export_model_action)
 
-        phenotyping_menu = self.menu_bar.addMenu("&Phenotyping")
         self.tool_action_group = QActionGroup(self)
         self.tool_action_group.setExclusive(True)
+        segmenting_menu = self.menu_bar.addMenu("&Segmenting")
+        self.cellpose_sam_tool_action = QAction("CellPoseSAM", self)
+        self.cellpose_sam_tool_action.setCheckable(True)
+        self.cellpose_sam_tool_action.triggered.connect(
+            lambda: self.set_tool_mode("cellpose_sam")
+        )
+        self.tool_action_group.addAction(self.cellpose_sam_tool_action)
+        segmenting_menu.addAction(self.cellpose_sam_tool_action)
+
+        phenotyping_menu = self.menu_bar.addMenu("&Phenotyping")
         self.random_forest_tool_action = QAction("Random Forest", self)
         self.random_forest_tool_action.setCheckable(True)
-        self.random_forest_tool_action.setChecked(True)
         self.random_forest_tool_action.triggered.connect(
             lambda: self.set_tool_mode("random_forest")
         )
@@ -1575,6 +1698,7 @@ class OrbitFOVViewer(QWidget):
         )
         self.automated_tool_action = QAction("Automated", self)
         self.automated_tool_action.setCheckable(True)
+        self.automated_tool_action.setChecked(True)
         self.automated_tool_action.triggered.connect(
             lambda: self.set_tool_mode("automated")
         )
@@ -1620,6 +1744,10 @@ class OrbitFOVViewer(QWidget):
         self.update_model_controls()
         self.update_threshold_controls()
         self.update_automated_controls()
+        self.refresh_cellpose_marker_list()
+        self.set_tool_mode("automated")
+        self.start_cuda_detection()
+        self.update_segmentation_controls()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1839,14 +1967,357 @@ class OrbitFOVViewer(QWidget):
         self.update_automated_controls()
         self.update_display()
 
+    def start_cuda_detection(self):
+        self.cuda_gpu_available = None
+        self.segmenting_gpu_status_label.setText(
+            "● Checking for a CUDA-compatible GPU..."
+        )
+        self.segmenting_gpu_status_label.setStyleSheet(
+            "color: #b26a00; font-weight: bold;"
+        )
+        self.update_segmentation_controls()
+        worker = CudaDetectionWorker()
+        worker.signals.finished.connect(self.on_cuda_detection_finished)
+        worker.signals.error.connect(self.on_cuda_detection_error)
+        self.cuda_detection_worker = worker
+        self.thread_pool.start(worker)
+
+    def on_cuda_detection_finished(self, available):
+        self.cuda_detection_worker = None
+        self.cuda_gpu_available = bool(available)
+        if self.cuda_gpu_available:
+            self.segmenting_gpu_status_label.setText(
+                "● CUDA-compatible GPU detected"
+            )
+            self.segmenting_gpu_status_label.setStyleSheet(
+                "color: #238636; font-weight: bold;"
+            )
+            self.segmenting_status_label.setText(
+                "Load images, select membrane markers, then click Segment."
+            )
+        else:
+            self.segmenting_gpu_status_label.setText(
+                "● CUDA-compatible GPU not detected"
+            )
+            self.segmenting_gpu_status_label.setStyleSheet(
+                "color: #c62828; font-weight: bold;"
+            )
+            self.segmenting_status_label.setText(
+                "Segmentation options are disabled because Cellpose-SAM "
+                "requires a CUDA-compatible GPU."
+            )
+        self.update_segmentation_controls()
+
+    def on_cuda_detection_error(self, _error_message):
+        self.on_cuda_detection_finished(False)
+
+    def _shared_membrane_markers(self):
+        """Return membrane-marker names available in every loaded image."""
+        if not self.loaded_images:
+            return []
+        first_names = membrane_marker_names(
+            self.loaded_images[0]["img"].get_channel_names()
+        )
+        shared = set(first_names)
+        for state in self.loaded_images[1:]:
+            shared.intersection_update(
+                membrane_marker_names(state["img"].get_channel_names())
+            )
+        return [name for name in first_names if name in shared]
+
+    def selected_cellpose_markers(self):
+        return [
+            checkbox.text()
+            for checkbox in self.segmenting_marker_checkboxes
+            if checkbox.isChecked()
+        ]
+
+    def refresh_cellpose_marker_list(self):
+        """Rebuild the scrollable list from channels shared by the project."""
+        if not hasattr(self, "segmenting_marker_layout"):
+            return
+        selected = set(self.segmenting_selected_markers)
+        selected.update(self.selected_cellpose_markers())
+        while self.segmenting_marker_layout.count():
+            item = self.segmenting_marker_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self.segmenting_marker_checkboxes = []
+
+        shared_markers = self._shared_membrane_markers()
+        self.segmenting_selected_markers = selected.intersection(shared_markers)
+        if shared_markers:
+            for marker_name in shared_markers:
+                checkbox = QCheckBox(marker_name)
+                checkbox.setChecked(
+                    marker_name in self.segmenting_selected_markers
+                )
+                checkbox.toggled.connect(
+                    lambda checked, name=marker_name:
+                    self.cellpose_marker_selection_changed(name, checked)
+                )
+                self.segmenting_marker_layout.addWidget(checkbox)
+                self.segmenting_marker_checkboxes.append(checkbox)
+            self.segmenting_marker_layout.addStretch()
+        else:
+            message = (
+                "Load an image to list markers."
+                if not self.loaded_images
+                else "No non-DAPI marker is shared by every loaded image."
+            )
+            placeholder = QLabel(message)
+            placeholder.setWordWrap(True)
+            self.segmenting_marker_layout.addWidget(placeholder)
+            self.segmenting_marker_layout.addStretch()
+
+        nuclear_names = [
+            dapi_channel_name(state["img"].get_channel_names())
+            for state in self.loaded_images
+        ]
+        if not nuclear_names:
+            dapi_message = (
+                "DAPI will be supplied as the nuclear channel when available."
+            )
+        elif all(name is not None for name in nuclear_names):
+            unique_names = list(dict.fromkeys(nuclear_names))
+            if len(unique_names) == 1:
+                dapi_message = f"Nuclear channel: {unique_names[0]}"
+            else:
+                dapi_message = "DAPI nuclear channels will be used by name."
+        elif any(name is not None for name in nuclear_names):
+            dapi_message = (
+                "DAPI will be used where available; some images have no DAPI "
+                "channel."
+            )
+        else:
+            dapi_message = (
+                "No DAPI channel was found; segmentation will use membrane "
+                "guidance only."
+            )
+        self.segmenting_dapi_label.setText(dapi_message)
+        self.update_segmentation_controls()
+
+    def cellpose_marker_selection_changed(self, marker_name, checked):
+        if checked:
+            self.segmenting_selected_markers.add(marker_name)
+        else:
+            self.segmenting_selected_markers.discard(marker_name)
+        self.update_segmentation_controls()
+
+    def update_segmentation_controls(self):
+        if not hasattr(self, "segment_button"):
+            return
+        gpu_ready = self.cuda_gpu_available is True
+        ready = (
+            gpu_ready
+            and bool(self.loaded_images)
+            and bool(self.selected_cellpose_markers())
+            and not self.is_loading
+            and self.cellpose_worker is None
+        )
+        self.segment_button.setEnabled(ready)
+        self.segmenting_marker_scroll.setEnabled(
+            gpu_ready and not self.is_loading
+        )
+        for checkbox in self.segmenting_marker_checkboxes:
+            checkbox.setEnabled(gpu_ready and not self.is_loading)
+
+    def _release_generated_mask_handles(self):
+        """Release generated memmaps so Windows can atomically replace them."""
+        self.released_generated_segmentations = {}
+        for image_index, state in enumerate(self.loaded_images):
+            _cell_output, mask_output = output_paths_for_image(
+                state["image_path"]
+            )
+            current_path = state.get("segmentation_mask_path")
+            if current_path is None:
+                continue
+            if Path(current_path).resolve() != mask_output.resolve():
+                continue
+            masks = state.get("segmentation_masks")
+            if not isinstance(masks, np.memmap):
+                continue
+            self.released_generated_segmentations[image_index] = (
+                state.get("cell_data_path"),
+                current_path,
+            )
+            try:
+                masks._mmap.close()
+            except Exception:
+                pass
+            state["segmentation_masks"] = None
+            if image_index == self.current_image_index:
+                self.segmentation_masks = None
+
+    def _restore_released_segmentations(self):
+        for image_index, paths in self.released_generated_segmentations.items():
+            cell_path, mask_path = paths
+            if not cell_path or not mask_path:
+                continue
+            try:
+                cell_data, masks, cell_path, mask_path = self._read_segmentation(
+                    cell_path,
+                    mask_path,
+                    self.loaded_images[image_index]["img"],
+                )
+            except Exception:
+                continue
+            self.loaded_images[image_index].update({
+                "cell_data": cell_data,
+                "segmentation_masks": masks,
+                "cell_data_path": cell_path,
+                "segmentation_mask_path": mask_path,
+            })
+        self.released_generated_segmentations = {}
+        if 0 <= self.current_image_index < len(self.loaded_images):
+            state = self.loaded_images[self.current_image_index]
+            self.cell_data = state["cell_data"]
+            self.segmentation_masks = state["segmentation_masks"]
+
+    def start_cellpose_segmentation(self):
+        marker_names = self.selected_cellpose_markers()
+        if self.cuda_gpu_available is not True:
+            QMessageBox.warning(
+                self,
+                "CellPoseSAM segmentation",
+                "A CUDA-compatible GPU is required for segmentation.",
+            )
+            return
+        if not self.loaded_images:
+            QMessageBox.warning(
+                self,
+                "CellPoseSAM segmentation",
+                "Load at least one image before segmenting.",
+            )
+            return
+        if not marker_names:
+            QMessageBox.warning(
+                self,
+                "CellPoseSAM segmentation",
+                "Select at least one membrane-guiding marker.",
+            )
+            return
+
+        self._capture_current_image_state()
+        self._release_generated_mask_handles()
+        self.set_loading(
+            True,
+            f"Loading Cellpose-SAM model {CELLPOSE_SAM_MODEL}...",
+        )
+        self.segmenting_status_label.setText(
+            "Segmentation is running. The model may be downloaded on first use."
+        )
+        worker = CellposeSegmentationWorker(
+            images=[state["img"] for state in self.loaded_images],
+            marker_names=marker_names,
+            pixel_size_um=DEFAULT_PIXEL_SIZE_UM,
+        )
+        worker.signals.progress.connect(self.on_cellpose_segmentation_progress)
+        worker.signals.finished.connect(self.on_cellpose_segmentation_finished)
+        worker.signals.error.connect(self.on_cellpose_segmentation_error)
+        self.cellpose_worker = worker
+        self.thread_pool.start(worker)
+
+    def on_cellpose_segmentation_progress(self, message):
+        self.status_label.setText(message)
+        self.segmenting_status_label.setText(message)
+
+    def on_cellpose_segmentation_finished(self, results):
+        try:
+            result_by_image = {
+                str(Path(result["image_path"]).resolve()): result
+                for result in results
+            }
+            if len(result_by_image) != len(self.loaded_images):
+                raise ValueError(
+                    "Cellpose results did not match the loaded image count."
+                )
+
+            total_cells = 0
+            for state in self.loaded_images:
+                image_key = str(Path(state["image_path"]).resolve())
+                if image_key not in result_by_image:
+                    raise ValueError(
+                        f"No Cellpose result was returned for {image_key}."
+                    )
+                result = result_by_image[image_key]
+                cell_data, masks, cell_path, mask_path = self._read_segmentation(
+                    result["cell_data_path"],
+                    result["segmentation_mask_path"],
+                    state["img"],
+                )
+                state.update({
+                    "cell_data_path": cell_path,
+                    "segmentation_mask_path": mask_path,
+                    "cell_data": cell_data,
+                    "segmentation_masks": masks,
+                    "annotations": {},
+                    "centroid_cache": None,
+                    "mask_label_row_cache": None,
+                    "model_predictions": None,
+                    "threshold_predictions": None,
+                    "automated_exclusions": set(),
+                })
+                total_cells += len(cell_data)
+
+            self.released_generated_segmentations = {}
+            self.model_bundle = None
+            self.training_navigation_indices = {
+                "positive": -1,
+                "negative": -1,
+            }
+            self.threshold_intensity_value = None
+            self.threshold_channel_name = None
+            self.threshold_histogram_request_id += 1
+            self.model_status_label.setText(
+                "No model trained or loaded after re-segmentation."
+            )
+            current_index = self.current_image_index
+            self._activate_image(current_index)
+            self.segmentation_checkbox.setChecked(True)
+            self.update_annotation_counts()
+            self.update_model_prediction_counts()
+            self.update_threshold_prediction_counts()
+            message = (
+                f"Cellpose-SAM replaced segmentation for "
+                f"{len(results)} image(s), producing {total_cells:,} cells."
+            )
+            self.segmenting_status_label.setText(message)
+            self.cellpose_worker = None
+            self.set_loading(False, message)
+            self.update_display()
+        except Exception:
+            self.on_cellpose_segmentation_error(traceback.format_exc())
+
+    def on_cellpose_segmentation_error(self, error_message):
+        self._restore_released_segmentations()
+        self.cellpose_worker = None
+        self.segmenting_status_label.setText("Cellpose-SAM segmentation failed.")
+        self.set_loading(False, "Cellpose-SAM segmentation failed.")
+        self.update_display()
+        QMessageBox.warning(
+            self,
+            "Could not segment images",
+            error_message,
+        )
+
     def set_tool_mode(self, tool):
-        if tool not in {"random_forest", "threshold", "automated"}:
+        if tool not in {
+            "cellpose_sam", "random_forest", "threshold", "automated"
+        }:
             tool = "random_forest"
         self.active_tool = tool
+        segmenting_mode = tool == "cellpose_sam"
         threshold_mode = tool == "threshold"
         automated_mode = tool == "automated"
-        page_index = 2 if automated_mode else (1 if threshold_mode else 0)
+        page_index = {
+            "cellpose_sam": 0,
+            "random_forest": 1,
+            "threshold": 2,
+            "automated": 3,
+        }[tool]
         self.right_panel_stack.setCurrentIndex(page_index)
+        self.cellpose_sam_tool_action.setChecked(segmenting_mode)
         self.random_forest_tool_action.setChecked(tool == "random_forest")
         self.threshold_tool_action.setChecked(threshold_mode)
         self.automated_tool_action.setChecked(automated_mode)
@@ -1869,6 +2340,7 @@ class OrbitFOVViewer(QWidget):
         self.update_model_controls()
         self.update_threshold_controls()
         self.update_automated_controls()
+        self.update_segmentation_controls()
         self.update_display()
 
     def _invalidate_threshold_predictions(self):
@@ -2147,6 +2619,7 @@ class OrbitFOVViewer(QWidget):
         self.update_model_controls()
         self.update_threshold_controls()
         self.update_automated_controls()
+        self.update_segmentation_controls()
 
     def open_qptiff(self):
         image_path, _ = QFileDialog.getOpenFileName(
@@ -2154,29 +2627,20 @@ class OrbitFOVViewer(QWidget):
         )
         if not image_path:
             return
-        cell_path, _ = QFileDialog.getOpenFileName(
-            self, "Select corresponding cell data", "",
-            "Cell data (*.tsv *.txt *.csv);;All files (*)",
-        )
-        if not cell_path:
-            return
-        mask_path, _ = QFileDialog.getOpenFileName(
-            self, "Select corresponding annotation mask", "",
-            "TIFF masks (*.tif *.tiff);;All files (*)",
-        )
-        if not mask_path:
-            return
 
-        self.set_loading(True, "Loading image and segmentation...")
+        self.set_loading(True, "Loading image...")
         try:
-            state = self._create_image_state(image_path, cell_path, mask_path)
+            state = self._create_image_state(image_path)
             self._capture_current_image_state()
             self.loaded_images.append(state)
             self._refresh_image_carousel()
             self._activate_image(len(self.loaded_images) - 1)
+            self.refresh_cellpose_marker_list()
             self.status_label.setText(
                 f"Loaded {Path(state['image_path']).name} "
-                f"({len(self.loaded_images)} image(s) in the carousel)."
+                f"({len(self.loaded_images)} image(s) in the carousel). Use "
+                "Load Segmentation to import existing data, or choose "
+                "Segmenting > CellPoseSAM to generate it."
             )
         except Exception:
             self.status_label.setText(traceback.format_exc())
@@ -2383,6 +2847,7 @@ class OrbitFOVViewer(QWidget):
         self.update_model_controls()
         self.update_threshold_controls()
         self.update_automated_controls()
+        self.update_segmentation_controls()
         if self.active_tool in {"threshold", "automated"}:
             if self.current_fov is not None:
                 self._update_threshold_value(invalidate=False)
@@ -3883,6 +4348,9 @@ class OrbitFOVViewer(QWidget):
         self.current_pixmap = None
         self.annotations = {}
         self.model_bundle = None
+        self.cellpose_worker = None
+        self.segmenting_selected_markers = set()
+        self.released_generated_segmentations = {}
         self.automated_edit_mode = False
         self.threshold_intensity_value = None
         self.threshold_channel_name = None
@@ -3959,10 +4427,20 @@ class OrbitFOVViewer(QWidget):
         self.automated_threshold_mask_button.setText("Threshold Mask: On")
         self.automated_threshold_mask_button.blockSignals(False)
         self._refresh_image_carousel()
+        self.refresh_cellpose_marker_list()
+        if self.cuda_gpu_available is False:
+            self.segmenting_status_label.setText(
+                "Segmentation options are disabled because Cellpose-SAM "
+                "requires a CUDA-compatible GPU."
+            )
+        else:
+            self.segmenting_status_label.setText(
+                "Load images, select membrane markers, then click Segment."
+            )
         self.update_annotation_counts()
         self.update_model_prediction_counts()
         self.update_threshold_prediction_counts()
-        self.set_tool_mode("random_forest")
+        self.set_tool_mode("automated")
         self.update_model_controls()
         self.update_threshold_controls()
         self.update_automated_controls()
@@ -3999,7 +4477,7 @@ class OrbitFOVViewer(QWidget):
             })
         return {
             "format": "ORBIT phenotype training session",
-            "version": 3,
+            "version": 4,
             "images": images,
             "current_image_index": self.current_image_index,
             "phenotype": {
@@ -4013,6 +4491,11 @@ class OrbitFOVViewer(QWidget):
                 "show_dapi": self.dapi_checkbox.isChecked(),
                 "show_segmentation": self.segmentation_checkbox.isChecked(),
                 "tool": self.active_tool,
+                "segmenting": {
+                    "tool": "cellpose_sam",
+                    "markers": self.selected_cellpose_markers(),
+                    "model": CELLPOSE_SAM_MODEL,
+                },
                 "threshold": {
                     "intensity_slider": self.threshold_intensity_slider.value(),
                     "positive_pixel_percent": (
@@ -4079,7 +4562,7 @@ class OrbitFOVViewer(QWidget):
             if data.get("format") != "ORBIT phenotype training session":
                 raise ValueError("The selected file is not an ORBIT training session.")
             version = data.get("version")
-            if version not in {1, 2, 3}:
+            if version not in {1, 2, 3, 4}:
                 raise ValueError(f"Unsupported ORBIT project version: {data.get('version')}")
             phenotype = data.get("phenotype", {})
             viewer = data.get("viewer", {})
@@ -4115,10 +4598,14 @@ class OrbitFOVViewer(QWidget):
                     for annotation in entry.get("annotations", [])
                     if annotation.get("label") in {"positive", "negative"}
                 }
+                cell_count = (
+                    0 if state["cell_data"] is None
+                    else len(state["cell_data"])
+                )
                 state["automated_exclusions"] = {
                     int(row_index)
                     for row_index in entry.get("automated_exclusions", [])
-                    if 0 <= int(row_index) < len(state["cell_data"])
+                    if 0 <= int(row_index) < cell_count
                 }
                 image_viewer = entry.get("viewer", {})
                 state["current_x0"] = image_viewer.get("current_x0")
@@ -4135,6 +4622,12 @@ class OrbitFOVViewer(QWidget):
                     pass
             self.loaded_images = loaded_states
             self.current_image_index = -1
+            segmenting_settings = viewer.get("segmenting", {})
+            self.segmenting_selected_markers = {
+                str(marker)
+                for marker in segmenting_settings.get("markers", [])
+            }
+            self.refresh_cellpose_marker_list()
             self.model_bundle = None
             self.threshold_intensity_value = None
             self.threshold_channel_name = None
@@ -4227,7 +4720,7 @@ class OrbitFOVViewer(QWidget):
             target_index = min(max(target_index, 0), len(self.loaded_images) - 1)
             self._refresh_image_carousel()
             self._activate_image(target_index)
-            self.set_tool_mode(viewer.get("tool", "random_forest"))
+            self.set_tool_mode(viewer.get("tool", "automated"))
             self.project_path = str(Path(path).resolve())
             has_fov = self.current_x0 is not None and self.current_y0 is not None
             message = f"Opened project: {self.project_path}"
