@@ -1,5 +1,7 @@
 # ORBIT
 
+[![python](https://img.shields.io/badge/Python-3.11-3776AB.svg?style=flat&logo=python&logoColor=ffdd54)](https://www.python.org)
+
 ## Operator-guided Random-field Biomarker Immunophenotyping Training
 
 ![ORBIT Logo](docs/figs/main_page_logo.png)
