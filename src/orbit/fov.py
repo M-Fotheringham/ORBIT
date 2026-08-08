@@ -31,6 +31,10 @@ class RandomFOVGenerator:
         size: int = 512,
         channel: int = 0,
     ):
-        channel_img = self.qptiff_image.get_channel(channel)
-
-        return channel_img[y0 : y0 + size, x0 : x0 + size]
+        return self.qptiff_image.get_region(
+            channel=channel,
+            y0=y0,
+            x0=x0,
+            height=size,
+            width=size,
+        )
