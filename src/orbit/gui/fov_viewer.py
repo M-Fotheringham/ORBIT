@@ -52,8 +52,10 @@ from orbit.models.cellpose_segmentation import (
     CELLPOSE_SAM_MODEL,
     cuda_compatible_gpu_available,
     dapi_channel_name,
+    export_segmentation_outputs,
     membrane_marker_names,
     output_paths_for_image,
+    segmentation_export_paths,
     segment_project_images,
 )
 from orbit.threshold import (
@@ -1590,6 +1592,15 @@ class OrbitFOVViewer(QWidget):
             "Load images, select membrane markers, then click Segment."
         )
         self.segmenting_status_label.setWordWrap(True)
+        self.export_segmentation_button = QPushButton("Export Segmentation")
+        self.export_segmentation_button.setToolTip(
+            "Export the complete Cellpose cell-data TSV and label-mask TIFF "
+            "for each segmented image."
+        )
+        self.export_segmentation_button.clicked.connect(
+            self.export_cellpose_segmentation
+        )
+        self.export_segmentation_button.setEnabled(False)
 
         segmenting_panel = QGroupBox("CellPoseSAM Segmentation")
         segmenting_layout = QVBoxLayout()
@@ -1602,6 +1613,8 @@ class OrbitFOVViewer(QWidget):
         segmenting_layout.addWidget(self.segmenting_marker_scroll, stretch=1)
         segmenting_layout.addWidget(self.segment_button)
         segmenting_layout.addWidget(self.segmenting_status_label)
+        segmenting_layout.addStretch()
+        segmenting_layout.addWidget(self.export_segmentation_button)
         segmenting_panel.setLayout(segmenting_layout)
         segmenting_page = QWidget()
         segmenting_page_layout = QVBoxLayout(segmenting_page)
@@ -2099,11 +2112,130 @@ class OrbitFOVViewer(QWidget):
             and self.cellpose_worker is None
         )
         self.segment_button.setEnabled(ready)
+        has_segmentation = any(
+            state.get("cell_data") is not None
+            and state.get("segmentation_masks") is not None
+            and state.get("cellpose_metadata") is not None
+            for state in self.loaded_images
+        )
+        self.export_segmentation_button.setEnabled(
+            has_segmentation
+            and not self.is_loading
+            and self.cellpose_worker is None
+        )
         self.segmenting_marker_scroll.setEnabled(
             gpu_ready and not self.is_loading
         )
         for checkbox in self.segmenting_marker_checkboxes:
             checkbox.setEnabled(gpu_ready and not self.is_loading)
+
+    def export_cellpose_segmentation(self):
+        """Export generated Cellpose tables and masks for all project images."""
+        self._capture_current_image_state()
+        exportable = [
+            state
+            for state in self.loaded_images
+            if state.get("cell_data") is not None
+            and state.get("segmentation_masks") is not None
+            and state.get("cellpose_metadata") is not None
+        ]
+        if not exportable:
+            QMessageBox.warning(
+                self,
+                "Export Segmentation",
+                "Run CellPoseSAM before exporting segmentation outputs.",
+            )
+            return
+
+        destination = QFileDialog.getExistingDirectory(
+            self,
+            "Select segmentation export folder",
+            "",
+        )
+        if not destination:
+            return
+
+        used_stems = set()
+        plans = []
+        for state in exportable:
+            base_stem = Path(state["image_path"]).stem
+            filename_stem = base_stem
+            suffix = 2
+            while filename_stem.casefold() in used_stems:
+                filename_stem = f"{base_stem}_{suffix}"
+                suffix += 1
+            used_stems.add(filename_stem.casefold())
+            cell_target, mask_target = segmentation_export_paths(
+                destination,
+                state["image_path"],
+                filename_stem=filename_stem,
+            )
+            current_cell_path = state.get("cell_data_path")
+            current_mask_path = state.get("segmentation_mask_path")
+            already_at_destination = bool(
+                current_cell_path
+                and current_mask_path
+                and Path(current_cell_path).resolve() == cell_target.resolve()
+                and Path(current_mask_path).resolve() == mask_target.resolve()
+            )
+            plans.append({
+                "state": state,
+                "filename_stem": filename_stem,
+                "cell_target": cell_target,
+                "mask_target": mask_target,
+                "already_at_destination": already_at_destination,
+            })
+
+        existing_targets = [
+            target
+            for plan in plans
+            if not plan["already_at_destination"]
+            for target in (plan["cell_target"], plan["mask_target"])
+            if target.exists()
+        ]
+        if existing_targets:
+            choice = QMessageBox.question(
+                self,
+                "Replace segmentation exports?",
+                f"{len(existing_targets)} export file(s) already exist in the "
+                "selected folder. Replace them?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if choice != QMessageBox.Yes:
+                return
+
+        try:
+            for plan in plans:
+                if plan["already_at_destination"]:
+                    continue
+                state = plan["state"]
+                metadata = state["cellpose_metadata"]
+                export_segmentation_outputs(
+                    destination_directory=destination,
+                    image_path=state["image_path"],
+                    masks=state["segmentation_masks"],
+                    cell_data=state["cell_data"],
+                    marker_names=metadata.get("marker_names", ()),
+                    nuclear_channel_name=metadata.get(
+                        "nuclear_channel_name"
+                    ),
+                    filename_stem=plan["filename_stem"],
+                )
+
+            message = (
+                f"Exported cell data and segmentation masks for "
+                f"{len(plans)} image(s) to {Path(destination).resolve()}"
+            )
+            self.segmenting_status_label.setText(message)
+            self.status_label.setText(message)
+            QMessageBox.information(self, "Segmentation exported", message)
+        except Exception:
+            QMessageBox.critical(
+                self,
+                "Could not export segmentation",
+                traceback.format_exc(),
+            )
 
     def _release_generated_mask_handles(self):
         """Release generated memmaps so Windows can atomically replace them."""
@@ -2234,6 +2366,15 @@ class OrbitFOVViewer(QWidget):
                     "segmentation_mask_path": mask_path,
                     "cell_data": cell_data,
                     "segmentation_masks": masks,
+                    "cellpose_metadata": {
+                        "marker_names": list(result.get("marker_names", ())),
+                        "nuclear_channel_name": result.get(
+                            "nuclear_channel_name"
+                        ),
+                        "model_name": result.get(
+                            "model_name", CELLPOSE_SAM_MODEL
+                        ),
+                    },
                     "annotations": {},
                     "centroid_cache": None,
                     "mask_label_row_cache": None,
@@ -2699,6 +2840,9 @@ class OrbitFOVViewer(QWidget):
             self.loaded_images[self.current_image_index][
                 "automated_exclusions"
             ] = set()
+            self.loaded_images[self.current_image_index][
+                "cellpose_metadata"
+            ] = None
             self._capture_current_image_state()
             self.update_annotation_counts()
             self.segmentation_checkbox.setChecked(True)
@@ -2736,6 +2880,7 @@ class OrbitFOVViewer(QWidget):
             "fov_generator": RandomFOVGenerator(image),
             "cell_data": cell_data,
             "segmentation_masks": masks,
+            "cellpose_metadata": None,
             "annotations": {},
             "current_y0": None,
             "current_x0": None,
@@ -4633,6 +4778,7 @@ class OrbitFOVViewer(QWidget):
                     int(row_index)
                     for row_index in state.get("automated_exclusions", set())
                 ),
+                "cellpose_metadata": state.get("cellpose_metadata"),
                 "viewer": {
                     "current_x0": (
                         None if state["current_x0"] is None
@@ -4778,6 +4924,12 @@ class OrbitFOVViewer(QWidget):
                     for row_index in entry.get("automated_exclusions", [])
                     if 0 <= int(row_index) < cell_count
                 }
+                cellpose_metadata = entry.get("cellpose_metadata")
+                state["cellpose_metadata"] = (
+                    dict(cellpose_metadata)
+                    if isinstance(cellpose_metadata, dict)
+                    else None
+                )
                 image_viewer = entry.get("viewer", {})
                 state["current_x0"] = image_viewer.get("current_x0")
                 state["current_y0"] = image_viewer.get("current_y0")
