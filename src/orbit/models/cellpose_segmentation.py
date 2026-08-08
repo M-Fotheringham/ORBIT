@@ -440,7 +440,9 @@ def segment_project_images(
                 image,
                 selected,
                 model,
-                pixel_size_um=pixel_size_um,
+                pixel_size_um=image.get_pixel_size_um(
+                    default=pixel_size_um
+                ),
             )
         )
     return results

@@ -1,10 +1,10 @@
 [project]
 name = "orbit"
-version = "1.1.1"
+version = "1.2.0"
 description = "Supervised Machine-Learning Phenotyping for multiplex pathology images."
 readme = "README.md"
 authors = [{name = "Michael Fotheringham"}]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 
 dependencies = [
     "numpy",
@@ -15,6 +15,7 @@ dependencies = [
     "scikit-image",
     "matplotlib",
     "napari",
+    "ome-zarr>=0.12,<0.13",
     "qtpy",
     "pyside6",
     "qptifffile",
@@ -25,5 +26,5 @@ dependencies = [
 orbit = "orbit.app:main"
 
 [build-system]
-requires = ["uv_build>=0.12"]
+requires = ["uv_build>=0.12,<0.13"]
 build-backend = "uv_build"

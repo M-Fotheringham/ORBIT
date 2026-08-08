@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QToolTip,
 )
 from PySide6.QtGui import (
-    QPixmap, QImage, QPainter, QColor, QPen, QAction, QActionGroup,
+    QPainter, QColor, QPen, QAction, QActionGroup,
 )
 from PySide6.QtCore import (
     Qt, QObject, Signal, QRunnable, QThreadPool, QTimer, QPoint,
@@ -23,6 +23,7 @@ from PySide6.QtCore import (
 
 from orbit.image import QPTiffImage
 from orbit.fov import RandomFOVGenerator
+from orbit.gui.napari_canvas import NapariImageCanvas
 from orbit.models.random_forest import (
     MODEL_FORMAT,
     MODEL_VERSION,
@@ -106,112 +107,6 @@ def buffer_distance_label(slider_value):
     microns = buffer_microns_from_slider(slider_value)
     pixels = buffer_pixels_from_slider(slider_value)
     return f"Inward boundary distance: {microns:.1f} µm ({pixels} px)"
-
-
-def normalize_channel(arr: np.ndarray) -> np.ndarray:
-    low, high = np.percentile(arr, (1, 99))
-    arr = np.clip(arr, low, high)
-    return ((arr - low) / (high - low + 1e-8) * 255).astype(np.uint8)
-
-
-def array_to_qpixmap(
-    marker_arr: np.ndarray,
-    marker_color: str = "Green",
-    dapi_arr: np.ndarray | None = None,
-    show_dapi: bool = True,
-    segmentation_boundary: np.ndarray | None = None,
-    threshold_highlight: np.ndarray | None = None,
-    annotation_markers: list[dict] | None = None,
-) -> QPixmap:
-    marker = normalize_channel(marker_arr)
-    r_scale, g_scale, b_scale = COLOR_MAPS[marker_color]
-    rgb = np.zeros((*marker.shape, 3), dtype=np.uint8)
-    rgb[:, :, 0] = np.maximum(rgb[:, :, 0], marker * r_scale)
-    rgb[:, :, 1] = np.maximum(rgb[:, :, 1], marker * g_scale)
-    rgb[:, :, 2] = np.maximum(rgb[:, :, 2], marker * b_scale)
-
-    if show_dapi and dapi_arr is not None:
-        rgb[:, :, 2] = np.maximum(rgb[:, :, 2], normalize_channel(dapi_arr))
-
-    if threshold_highlight is not None:
-        highlighted = threshold_highlight.astype(bool)
-        rgb[highlighted, 0] = 255
-        rgb[highlighted, 1] = 255
-        rgb[highlighted, 2] = 0
-
-    if segmentation_boundary is not None:
-        boundary = segmentation_boundary.astype(bool)
-        rgb[boundary, 0] = 255
-        rgb[boundary, 1] = 0
-        rgb[boundary, 2] = 0
-
-    h, w, _ = rgb.shape
-    qimage = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
-    pixmap = QPixmap.fromImage(qimage.copy())
-
-    if annotation_markers:
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing)
-        for marker in annotation_markers:
-            radius = (
-                3
-                if marker.get("source") in {"model", "threshold"}
-                else 5
-            )
-            color = QColor("#00eeff" if marker["label"] == "positive" else "#ff3030")
-            painter.setPen(QPen(QColor("black"), 1))
-            painter.setBrush(color)
-            x, y = round(marker["x"]), round(marker["y"])
-            painter.drawEllipse(x - radius, y - radius, radius * 2, radius * 2)
-        painter.end()
-
-    return pixmap
-
-
-class ClickableImageLabel(QLabel):
-    """QLabel that reports pointer positions within the displayed pixmap."""
-
-    image_clicked = Signal(float, float)
-    image_hovered = Signal(float, float, object)
-    image_hover_left = Signal()
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.setMouseTracking(True)
-
-    def _pixmap_position(self, position):
-        pixmap = self.pixmap()
-        if pixmap is None or pixmap.width() <= 0 or pixmap.height() <= 0:
-            return None
-        left = (self.width() - pixmap.width()) / 2
-        top = (self.height() - pixmap.height()) / 2
-        x = position.x() - left
-        y = position.y() - top
-        if not (0 <= x < pixmap.width() and 0 <= y < pixmap.height()):
-            return None
-        return x / pixmap.width(), y / pixmap.height()
-
-    def mousePressEvent(self, event):
-        relative_position = self._pixmap_position(event.position())
-        if event.button() == Qt.LeftButton and relative_position is not None:
-            self.image_clicked.emit(*relative_position)
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        relative_position = self._pixmap_position(event.position())
-        if relative_position is None:
-            self.image_hover_left.emit()
-        else:
-            self.image_hovered.emit(
-                relative_position[0],
-                relative_position[1],
-                event.globalPosition().toPoint(),
-            )
-        super().mouseMoveEvent(event)
-
-    def leaveEvent(self, event):
-        self.image_hover_left.emit()
-        super().leaveEvent(event)
 
 
 class CellHistogramWidget(QWidget):
@@ -969,7 +864,7 @@ class OrbitFOVViewer(QWidget):
         self.cell_data_path = None
         self.segmentation_mask_path = None
 
-        self.image_label = ClickableImageLabel("Select a QPTIFF image")
+        self.image_label = NapariImageCanvas("Select a TIFF or OME-Zarr image")
         self.image_label.image_clicked.connect(self.label_clicked_cell)
         self.image_label.image_hovered.connect(self.track_cell_probability_hover)
         self.image_label.image_hover_left.connect(self.cancel_cell_probability_hover)
@@ -977,8 +872,7 @@ class OrbitFOVViewer(QWidget):
         self.image_label.setMinimumSize(700, 700)
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.image_label.setStyleSheet("""
-            QLabel { background-color: black; border: 1px solid #333;
-                     color: white; font-size: 16px; }
+            QWidget { background-color: black; border: 1px solid #333; }
         """)
 
         self.status_label = QLabel("")
@@ -1755,11 +1649,8 @@ class OrbitFOVViewer(QWidget):
             self.display_pixmap()
 
     def display_pixmap(self):
-        if self.current_pixmap is None:
-            return
-        self.image_label.setPixmap(self.current_pixmap.scaled(
-            self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-        ))
+        # Napari renders directly into the embedded canvas.
+        return
 
     def sync_phenotype_name_from_random_forest(self, text):
         for widget in (
@@ -2622,9 +2513,35 @@ class OrbitFOVViewer(QWidget):
         self.update_segmentation_controls()
 
     def open_qptiff(self):
-        image_path, _ = QFileDialog.getOpenFileName(
-            self, "Select QPTIFF image", "", "QPTIFF files (*.qptiff *.tif *.tiff)"
+        source_dialog = QMessageBox(self)
+        source_dialog.setWindowTitle("Add image")
+        source_dialog.setText("Select the image format to add:")
+        tiff_button = source_dialog.addButton(
+            "TIFF / QPTIFF", QMessageBox.AcceptRole
         )
+        zarr_button = source_dialog.addButton(
+            "OME-Zarr directory", QMessageBox.ActionRole
+        )
+        source_dialog.addButton(QMessageBox.Cancel)
+        source_dialog.exec()
+
+        selected = source_dialog.clickedButton()
+        if selected is tiff_button:
+            image_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select TIFF image",
+                "",
+                "TIFF images (*.qptiff *.tif *.tiff);;All files (*)",
+            )
+        elif selected is zarr_button:
+            image_path = QFileDialog.getExistingDirectory(
+                self,
+                "Select OME-Zarr directory",
+                "",
+                QFileDialog.ShowDirsOnly,
+            )
+        else:
+            return
         if not image_path:
             return
 
@@ -2638,6 +2555,7 @@ class OrbitFOVViewer(QWidget):
             self.refresh_cellpose_marker_list()
             self.status_label.setText(
                 f"Loaded {Path(state['image_path']).name} "
+                f"as {state['img'].format_name} "
                 f"({len(self.loaded_images)} image(s) in the carousel). Use "
                 "Load Segmentation to import existing data, or choose "
                 "Segmenting > CellPoseSAM to generate it."
@@ -2703,8 +2621,8 @@ class OrbitFOVViewer(QWidget):
 
     def _create_image_state(self, image_path, cell_path=None, mask_path=None):
         image_path = str(Path(image_path).expanduser().resolve())
-        if not Path(image_path).is_file():
-            raise FileNotFoundError(f"Image file not found: {image_path}")
+        if not Path(image_path).exists():
+            raise FileNotFoundError(f"Image path not found: {image_path}")
         image = QPTiffImage(image_path)
         if cell_path or mask_path:
             if not cell_path or not mask_path:
@@ -4334,7 +4252,7 @@ class OrbitFOVViewer(QWidget):
         self.cancel_cell_probability_hover()
         for state in self.loaded_images:
             try:
-                state["img"].tif.close()
+                state["img"].close()
             except Exception:
                 pass
         self.loaded_images = []
@@ -4395,7 +4313,7 @@ class OrbitFOVViewer(QWidget):
         self.threshold_fraction_histogram.set_message("Load an image")
         self.channel_dropdown.clear()
         self.image_label.clear()
-        self.image_label.setText("Select a QPTIFF image")
+        self.image_label.setText("Select a TIFF or OME-Zarr image")
         self.model_status_label.setText("No model trained or loaded.")
         self.automated_status_label.setText(
             "Ready for automated phenotyping."
@@ -4617,7 +4535,7 @@ class OrbitFOVViewer(QWidget):
 
             for old_state in self.loaded_images:
                 try:
-                    old_state["img"].tif.close()
+                    old_state["img"].close()
                 except Exception:
                     pass
             self.loaded_images = loaded_states
@@ -4747,7 +4665,9 @@ class OrbitFOVViewer(QWidget):
         self.set_loading(True, "Loading field of view...")
         worker = FOVLoadWorker(
             self.fov_generator, self.current_y0, self.current_x0,
-            self.fov_size, self.channel_dropdown.currentIndex(), 0,
+            self.fov_size,
+            self.channel_dropdown.currentIndex(),
+            self.img.get_dapi_channel_index(default=0),
         )
         worker.signals.finished.connect(self.on_fov_loaded)
         worker.signals.error.connect(self.on_fov_error)
@@ -4823,7 +4743,8 @@ class OrbitFOVViewer(QWidget):
                     self.current_model_markers()
                     + self.current_annotation_markers()
                 )
-            self.current_pixmap = array_to_qpixmap(
+            self.current_pixmap = None
+            self.image_label.set_scene(
                 marker_arr=self.current_fov,
                 marker_color=self.color_dropdown.currentText(),
                 dapi_arr=self.current_dapi_fov,
@@ -4832,6 +4753,5 @@ class OrbitFOVViewer(QWidget):
                 threshold_highlight=threshold_highlight,
                 annotation_markers=annotation_markers,
             )
-            self.display_pixmap()
         except Exception:
             self.status_label.setText(traceback.format_exc())

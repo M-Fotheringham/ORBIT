@@ -116,7 +116,9 @@ def _pixel_statistics_by_mask_label(
     chunk_rows: int = 512,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Aggregate threshold and intensity statistics by mask label."""
-    channel = np.asarray(channel)
+    # Keep chunked OME-Zarr channels lazy. Individual row blocks are
+    # materialized inside the loop, so global phenotyping does not require a
+    # second full-slide fluorescence array in memory.
     masks = np.asarray(masks)
     if channel.ndim != 2 or masks.ndim != 2:
         raise ValueError("Threshold phenotyping requires two-dimensional arrays.")
