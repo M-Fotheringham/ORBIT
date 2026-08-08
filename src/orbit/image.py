@@ -48,6 +48,7 @@ class QPTiffImage:
 
         self.tif = None
         self.series = None
+        self._tiff_levels = []
         self._levels = []
         self._axes: tuple[str, ...] = ()
         self._metadata: dict[str, Any] = {}
@@ -113,10 +114,12 @@ class QPTiffImage:
                 "ORBIT expected TIFF series 0 to be a three-dimensional C-Y-X "
                 f"image; got shape {primary.shape}."
             )
-        return max(
+        self._tiff_levels = sorted(
             compatible,
             key=lambda level: int(level.shape[-2]) * int(level.shape[-1]),
+            reverse=True,
         )
+        return self._tiff_levels[0]
 
     def _open_ome_zarr(self):
         try:
@@ -258,6 +261,56 @@ class QPTiffImage:
         if self.is_ome_zarr:
             return [level[channel] for level in self._levels]
         return [self.get_channel(channel)]
+
+    def get_overview(self, channel: int = 0, max_size: int = 512) -> np.ndarray:
+        """Return a low-power channel view without changing full-resolution data.
+
+        The smallest pyramid level that still meets ``max_size`` is preferred,
+        minimizing I/O while retaining enough pixels for a crisp navigator.
+        Images without a pyramid are sampled after reading their source level.
+        """
+        self._validate_channel(channel)
+        max_size = int(max_size)
+        if max_size <= 0:
+            raise ValueError("max_size must be positive.")
+
+        if self.is_ome_zarr:
+            level_index = self._overview_level_index(self._levels, max_size)
+            overview = _compute(self._levels[level_index][channel])
+        else:
+            levels = self._tiff_levels or [self.series]
+            level_index = self._overview_level_index(levels, max_size)
+            overview = _compute(levels[level_index].asarray(key=channel))
+
+        overview = np.squeeze(overview)
+        if overview.ndim != 2:
+            raise ValueError(
+                f"Expected a two-dimensional overview; got {overview.shape}."
+            )
+        height, width = overview.shape
+        scale = max(height / max_size, width / max_size, 1.0)
+        if scale <= 1.0:
+            return overview
+        output_height = max(int(round(height / scale)), 1)
+        output_width = max(int(round(width / scale)), 1)
+        rows = np.linspace(0, height - 1, output_height).astype(np.int64)
+        columns = np.linspace(0, width - 1, output_width).astype(np.int64)
+        return overview[np.ix_(rows, columns)]
+
+    @staticmethod
+    def _overview_level_index(levels, max_size: int) -> int:
+        dimensions = [
+            max(int(level.shape[-2]), int(level.shape[-1]))
+            for level in levels
+        ]
+        large_enough = [
+            index
+            for index, dimension in enumerate(dimensions)
+            if dimension >= max_size
+        ]
+        if large_enough:
+            return min(large_enough, key=lambda index: dimensions[index])
+        return max(range(len(levels)), key=lambda index: dimensions[index])
 
     def get_dapi_channel_index(self, default: int = 0) -> int:
         for index, name in enumerate(self.channel_names):

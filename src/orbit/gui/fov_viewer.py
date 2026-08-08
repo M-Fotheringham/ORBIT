@@ -22,7 +22,7 @@ from PySide6.QtCore import (
 )
 
 from orbit.image import QPTiffImage
-from orbit.fov import RandomFOVGenerator
+from orbit.fov import DEFAULT_MINIMUM_DAPI_FRACTION, RandomFOVGenerator
 from orbit.gui.napari_canvas import NapariImageCanvas
 from orbit.models.random_forest import (
     MODEL_FORMAT,
@@ -52,8 +52,10 @@ from orbit.models.cellpose_segmentation import (
     CELLPOSE_SAM_MODEL,
     cuda_compatible_gpu_available,
     dapi_channel_name,
+    export_segmentation_outputs,
     membrane_marker_names,
     output_paths_for_image,
+    segmentation_export_paths,
     segment_project_images,
 )
 from orbit.threshold import (
@@ -81,6 +83,7 @@ MAXIMUM_INWARD_BUFFER_SLIDER_VALUE = int(
     MAXIMUM_INWARD_BUFFER_UM * THRESHOLD_BUFFER_SLIDER_STEPS_PER_UM
 )
 CELL_PROBABILITY_HOVER_DELAY_MS = 2000
+OVERVIEW_MAXIMUM_SIZE = 768
 
 
 def buffer_microns_from_slider(value):
@@ -241,28 +244,96 @@ class CellHistogramWidget(QWidget):
 
 
 class WorkerSignals(QObject):
-    finished = Signal(object, object)
+    finished = Signal(object)
     error = Signal(str)
 
 
 class FOVLoadWorker(QRunnable):
-    def __init__(self, fov_generator, y0, x0, size, channel, dapi_channel=0):
+    def __init__(
+        self,
+        fov_generator,
+        y0,
+        x0,
+        size,
+        channel,
+        dapi_channel=0,
+        choose_random_dapi_field=False,
+        minimum_dapi_fraction=DEFAULT_MINIMUM_DAPI_FRACTION,
+    ):
         super().__init__()
         self.fov_generator = fov_generator
         self.y0, self.x0, self.size = y0, x0, size
         self.channel, self.dapi_channel = channel, dapi_channel
+        self.choose_random_dapi_field = bool(choose_random_dapi_field)
+        self.minimum_dapi_fraction = float(minimum_dapi_fraction)
         self.signals = WorkerSignals()
 
     def run(self):
         try:
+            y0, x0 = self.y0, self.x0
+            if self.choose_random_dapi_field:
+                y0, x0 = self.fov_generator.random_position(
+                    size=self.size,
+                    seed=None,
+                    dapi_channel=self.dapi_channel,
+                    minimum_dapi_fraction=self.minimum_dapi_fraction,
+                )
             marker_fov = self.fov_generator.get_fov(
-                y0=self.y0, x0=self.x0, size=self.size, channel=self.channel
+                y0=y0, x0=x0, size=self.size, channel=self.channel
             )
             dapi_fov = self.fov_generator.get_fov(
-                y0=self.y0, x0=self.x0, size=self.size,
+                y0=y0, x0=x0, size=self.size,
                 channel=self.dapi_channel,
             )
-            self.signals.finished.emit(marker_fov, dapi_fov)
+            self.signals.finished.emit({
+                "marker_fov": marker_fov,
+                "dapi_fov": dapi_fov,
+                "y0": int(y0),
+                "x0": int(x0),
+            })
+        except Exception:
+            self.signals.error.emit(traceback.format_exc())
+
+
+class OverviewLoadWorker(QRunnable):
+    """Load a low-power marker/DAPI pair without blocking the Qt thread."""
+
+    def __init__(
+        self,
+        request_id,
+        image_index,
+        image,
+        channel,
+        dapi_channel,
+        max_size,
+    ):
+        super().__init__()
+        self.request_id = int(request_id)
+        self.image_index = int(image_index)
+        self.image = image
+        self.channel = int(channel)
+        self.dapi_channel = int(dapi_channel)
+        self.max_size = int(max_size)
+        self.signals = WorkerSignals()
+
+    def run(self):
+        try:
+            marker = self.image.get_overview(
+                channel=self.channel,
+                max_size=self.max_size,
+            )
+            dapi = self.image.get_overview(
+                channel=self.dapi_channel,
+                max_size=self.max_size,
+            )
+            self.signals.finished.emit({
+                "request_id": self.request_id,
+                "image_index": self.image_index,
+                "channel": self.channel,
+                "dapi_channel": self.dapi_channel,
+                "marker": marker,
+                "dapi": dapi,
+            })
         except Exception:
             self.signals.error.emit(traceback.format_exc())
 
@@ -819,6 +890,9 @@ class OrbitFOVViewer(QWidget):
         self.current_fov = self.current_dapi_fov = None
         self.current_pixmap = None
         self.is_loading = False
+        self.fov_worker = None
+        self.overview_worker = None
+        self.overview_request_id = 0
         self.image_path = None
         self.project_path = None
         self.annotations = {}
@@ -868,6 +942,9 @@ class OrbitFOVViewer(QWidget):
         self.image_label.image_clicked.connect(self.label_clicked_cell)
         self.image_label.image_hovered.connect(self.track_cell_probability_hover)
         self.image_label.image_hover_left.connect(self.cancel_cell_probability_hover)
+        self.image_label.overview_clicked.connect(
+            self.jump_to_overview_position
+        )
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMinimumSize(700, 700)
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -902,15 +979,30 @@ class OrbitFOVViewer(QWidget):
         self.color_dropdown.addItems(COLOR_MAPS.keys())
         self.color_dropdown.setCurrentText("Green")
         self.color_dropdown.currentTextChanged.connect(self.update_display)
+        self.color_dropdown.currentTextChanged.connect(
+            self.refresh_overview_from_cache
+        )
         self.color_dropdown.setEnabled(False)
         self.dapi_checkbox = QCheckBox("DAPI")
         self.dapi_checkbox.setChecked(True)
         self.dapi_checkbox.stateChanged.connect(self.update_display)
+        self.dapi_checkbox.stateChanged.connect(
+            self.refresh_overview_from_cache
+        )
         self.dapi_checkbox.setEnabled(False)
         self.segmentation_checkbox = QCheckBox("Segmentation")
         self.segmentation_checkbox.setChecked(True)
         self.segmentation_checkbox.stateChanged.connect(self.update_display)
         self.segmentation_checkbox.setEnabled(False)
+        self.overview_checkbox = QCheckBox("Overview")
+        self.overview_checkbox.setChecked(True)
+        self.overview_checkbox.setToolTip(
+            "Show or hide the clickable whole-image navigator"
+        )
+        self.overview_checkbox.stateChanged.connect(
+            self.overview_visibility_changed
+        )
+        self.overview_checkbox.setEnabled(False)
 
         self.phenotype_name = QLineEdit()
         self.phenotype_name.setPlaceholderText("e.g. CD8-positive")
@@ -1500,6 +1592,15 @@ class OrbitFOVViewer(QWidget):
             "Load images, select membrane markers, then click Segment."
         )
         self.segmenting_status_label.setWordWrap(True)
+        self.export_segmentation_button = QPushButton("Export Segmentation")
+        self.export_segmentation_button.setToolTip(
+            "Export the complete Cellpose cell-data TSV and label-mask TIFF "
+            "for each segmented image."
+        )
+        self.export_segmentation_button.clicked.connect(
+            self.export_cellpose_segmentation
+        )
+        self.export_segmentation_button.setEnabled(False)
 
         segmenting_panel = QGroupBox("CellPoseSAM Segmentation")
         segmenting_layout = QVBoxLayout()
@@ -1512,6 +1613,8 @@ class OrbitFOVViewer(QWidget):
         segmenting_layout.addWidget(self.segmenting_marker_scroll, stretch=1)
         segmenting_layout.addWidget(self.segment_button)
         segmenting_layout.addWidget(self.segmenting_status_label)
+        segmenting_layout.addStretch()
+        segmenting_layout.addWidget(self.export_segmentation_button)
         segmenting_panel.setLayout(segmenting_layout)
         segmenting_page = QWidget()
         segmenting_page_layout = QVBoxLayout(segmenting_page)
@@ -1535,7 +1638,7 @@ class OrbitFOVViewer(QWidget):
         toolbar.addSpacing(20)
         for widget in (
             self.channel_dropdown, self.color_dropdown, self.dapi_checkbox,
-            self.segmentation_checkbox,
+            self.segmentation_checkbox, self.overview_checkbox,
         ):
             toolbar.addWidget(widget)
 
@@ -2009,11 +2112,130 @@ class OrbitFOVViewer(QWidget):
             and self.cellpose_worker is None
         )
         self.segment_button.setEnabled(ready)
+        has_segmentation = any(
+            state.get("cell_data") is not None
+            and state.get("segmentation_masks") is not None
+            and state.get("cellpose_metadata") is not None
+            for state in self.loaded_images
+        )
+        self.export_segmentation_button.setEnabled(
+            has_segmentation
+            and not self.is_loading
+            and self.cellpose_worker is None
+        )
         self.segmenting_marker_scroll.setEnabled(
             gpu_ready and not self.is_loading
         )
         for checkbox in self.segmenting_marker_checkboxes:
             checkbox.setEnabled(gpu_ready and not self.is_loading)
+
+    def export_cellpose_segmentation(self):
+        """Export generated Cellpose tables and masks for all project images."""
+        self._capture_current_image_state()
+        exportable = [
+            state
+            for state in self.loaded_images
+            if state.get("cell_data") is not None
+            and state.get("segmentation_masks") is not None
+            and state.get("cellpose_metadata") is not None
+        ]
+        if not exportable:
+            QMessageBox.warning(
+                self,
+                "Export Segmentation",
+                "Run CellPoseSAM before exporting segmentation outputs.",
+            )
+            return
+
+        destination = QFileDialog.getExistingDirectory(
+            self,
+            "Select segmentation export folder",
+            "",
+        )
+        if not destination:
+            return
+
+        used_stems = set()
+        plans = []
+        for state in exportable:
+            base_stem = Path(state["image_path"]).stem
+            filename_stem = base_stem
+            suffix = 2
+            while filename_stem.casefold() in used_stems:
+                filename_stem = f"{base_stem}_{suffix}"
+                suffix += 1
+            used_stems.add(filename_stem.casefold())
+            cell_target, mask_target = segmentation_export_paths(
+                destination,
+                state["image_path"],
+                filename_stem=filename_stem,
+            )
+            current_cell_path = state.get("cell_data_path")
+            current_mask_path = state.get("segmentation_mask_path")
+            already_at_destination = bool(
+                current_cell_path
+                and current_mask_path
+                and Path(current_cell_path).resolve() == cell_target.resolve()
+                and Path(current_mask_path).resolve() == mask_target.resolve()
+            )
+            plans.append({
+                "state": state,
+                "filename_stem": filename_stem,
+                "cell_target": cell_target,
+                "mask_target": mask_target,
+                "already_at_destination": already_at_destination,
+            })
+
+        existing_targets = [
+            target
+            for plan in plans
+            if not plan["already_at_destination"]
+            for target in (plan["cell_target"], plan["mask_target"])
+            if target.exists()
+        ]
+        if existing_targets:
+            choice = QMessageBox.question(
+                self,
+                "Replace segmentation exports?",
+                f"{len(existing_targets)} export file(s) already exist in the "
+                "selected folder. Replace them?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if choice != QMessageBox.Yes:
+                return
+
+        try:
+            for plan in plans:
+                if plan["already_at_destination"]:
+                    continue
+                state = plan["state"]
+                metadata = state["cellpose_metadata"]
+                export_segmentation_outputs(
+                    destination_directory=destination,
+                    image_path=state["image_path"],
+                    masks=state["segmentation_masks"],
+                    cell_data=state["cell_data"],
+                    marker_names=metadata.get("marker_names", ()),
+                    nuclear_channel_name=metadata.get(
+                        "nuclear_channel_name"
+                    ),
+                    filename_stem=plan["filename_stem"],
+                )
+
+            message = (
+                f"Exported cell data and segmentation masks for "
+                f"{len(plans)} image(s) to {Path(destination).resolve()}"
+            )
+            self.segmenting_status_label.setText(message)
+            self.status_label.setText(message)
+            QMessageBox.information(self, "Segmentation exported", message)
+        except Exception:
+            QMessageBox.critical(
+                self,
+                "Could not export segmentation",
+                traceback.format_exc(),
+            )
 
     def _release_generated_mask_handles(self):
         """Release generated memmaps so Windows can atomically replace them."""
@@ -2144,6 +2366,15 @@ class OrbitFOVViewer(QWidget):
                     "segmentation_mask_path": mask_path,
                     "cell_data": cell_data,
                     "segmentation_masks": masks,
+                    "cellpose_metadata": {
+                        "marker_names": list(result.get("marker_names", ())),
+                        "nuclear_channel_name": result.get(
+                            "nuclear_channel_name"
+                        ),
+                        "model_name": result.get(
+                            "model_name", CELLPOSE_SAM_MODEL
+                        ),
+                    },
                     "annotations": {},
                     "centroid_cache": None,
                     "mask_label_row_cache": None,
@@ -2469,6 +2700,7 @@ class OrbitFOVViewer(QWidget):
                 self.threshold_histogram_timer.stop()
                 self.threshold_intensity_histogram.set_message("Loading channel…")
                 self.threshold_fraction_histogram.set_message("Loading channel…")
+        self.request_overview_refresh()
         self.reload_current_fov()
 
     def current_threshold_highlight(self):
@@ -2504,6 +2736,9 @@ class OrbitFOVViewer(QWidget):
         self.channel_dropdown.setEnabled(not loading and self.img is not None)
         self.color_dropdown.setEnabled(not loading and self.img is not None)
         self.dapi_checkbox.setEnabled(not loading and self.img is not None)
+        self.overview_checkbox.setEnabled(
+            not loading and self.img is not None
+        )
         self.segmentation_checkbox.setEnabled(
             not loading and self.segmentation_masks is not None
         )
@@ -2605,6 +2840,9 @@ class OrbitFOVViewer(QWidget):
             self.loaded_images[self.current_image_index][
                 "automated_exclusions"
             ] = set()
+            self.loaded_images[self.current_image_index][
+                "cellpose_metadata"
+            ] = None
             self._capture_current_image_state()
             self.update_annotation_counts()
             self.segmentation_checkbox.setChecked(True)
@@ -2642,12 +2880,14 @@ class OrbitFOVViewer(QWidget):
             "fov_generator": RandomFOVGenerator(image),
             "cell_data": cell_data,
             "segmentation_masks": masks,
+            "cellpose_metadata": None,
             "annotations": {},
             "current_y0": None,
             "current_x0": None,
             "current_fov": None,
             "current_dapi_fov": None,
             "channel_index": 0,
+            "overview_cache": {},
             "centroid_cache": None,
             "mask_label_row_cache": None,
             "model_predictions": None,
@@ -2763,6 +3003,7 @@ class OrbitFOVViewer(QWidget):
             )
         else:
             self.update_display()
+        self.request_overview_refresh()
         self.update_image_carousel_controls()
         self.update_model_controls()
         self.update_threshold_controls()
@@ -2786,6 +3027,154 @@ class OrbitFOVViewer(QWidget):
             return
         index = (self.current_image_index + step) % len(self.loaded_images)
         self.switch_image(index)
+
+    def current_overview_fov_rect(self):
+        if self.current_x0 is None or self.current_y0 is None:
+            return None
+        if self.current_fov is None:
+            height = width = self.fov_size
+        else:
+            height, width = self.current_fov.shape[:2]
+        return (
+            int(self.current_x0),
+            int(self.current_y0),
+            int(width),
+            int(height),
+        )
+
+    def request_overview_refresh(self):
+        """Load the active channel's whole-image navigator in the background."""
+        self.overview_request_id += 1
+        if not (
+            self.img is not None
+            and 0 <= self.current_image_index < len(self.loaded_images)
+            and self.channel_dropdown.currentIndex() >= 0
+        ):
+            self.image_label.set_overview_visible(False)
+            return
+
+        state = self.loaded_images[self.current_image_index]
+        channel = self.channel_dropdown.currentIndex()
+        dapi_channel = self.img.get_dapi_channel_index(default=0)
+        cache_key = (int(channel), int(dapi_channel))
+        cached = state.setdefault("overview_cache", {}).get(cache_key)
+        if cached is not None:
+            self._display_overview(cached)
+            return
+        if self.overview_worker is not None:
+            return
+
+        worker = OverviewLoadWorker(
+            request_id=self.overview_request_id,
+            image_index=self.current_image_index,
+            image=self.img,
+            channel=channel,
+            dapi_channel=dapi_channel,
+            max_size=OVERVIEW_MAXIMUM_SIZE,
+        )
+        worker.signals.finished.connect(self.on_overview_loaded)
+        worker.signals.error.connect(self.on_overview_error)
+        self.overview_worker = worker
+        self.thread_pool.start(worker)
+
+    def on_overview_loaded(self, result):
+        self.overview_worker = None
+        image_index = int(result["image_index"])
+        if 0 <= image_index < len(self.loaded_images):
+            state = self.loaded_images[image_index]
+            cache_key = (
+                int(result["channel"]),
+                int(result["dapi_channel"]),
+            )
+            state.setdefault("overview_cache", {})[cache_key] = {
+                "marker": result["marker"],
+                "dapi": result["dapi"],
+            }
+
+        request_is_current = (
+            int(result["request_id"]) == self.overview_request_id
+            and image_index == self.current_image_index
+            and int(result["channel"])
+            == self.channel_dropdown.currentIndex()
+        )
+        if request_is_current:
+            self._display_overview(result)
+        else:
+            self.refresh_overview_from_cache()
+
+    def on_overview_error(self, error_message):
+        failed_worker = self.overview_worker
+        self.overview_worker = None
+        if failed_worker is not None and (
+            failed_worker.request_id != self.overview_request_id
+            or failed_worker.image_index != self.current_image_index
+            or failed_worker.channel != self.channel_dropdown.currentIndex()
+        ):
+            self.refresh_overview_from_cache()
+            return
+        self.status_label.setText(
+            "Could not load the whole-image overview.\n" + error_message
+        )
+
+    def _display_overview(self, overview):
+        if self.img is None:
+            return
+        _channels, full_height, full_width = self.img.get_shape()
+        self.image_label.set_overview_scene(
+            marker_arr=overview["marker"],
+            marker_color=self.color_dropdown.currentText(),
+            dapi_arr=overview.get("dapi"),
+            show_dapi=self.dapi_checkbox.isChecked(),
+            full_shape=(full_height, full_width),
+            fov_rect=self.current_overview_fov_rect(),
+        )
+        self.image_label.set_overview_visible(
+            self.overview_checkbox.isChecked()
+        )
+
+    def refresh_overview_from_cache(self, *_args):
+        if not (
+            self.img is not None
+            and 0 <= self.current_image_index < len(self.loaded_images)
+            and self.channel_dropdown.currentIndex() >= 0
+        ):
+            return
+        state = self.loaded_images[self.current_image_index]
+        cache_key = (
+            self.channel_dropdown.currentIndex(),
+            self.img.get_dapi_channel_index(default=0),
+        )
+        cached = state.setdefault("overview_cache", {}).get(cache_key)
+        if cached is None:
+            self.request_overview_refresh()
+        else:
+            self._display_overview(cached)
+
+    def overview_visibility_changed(self, *_args):
+        visible = self.overview_checkbox.isChecked()
+        self.image_label.set_overview_visible(visible)
+        if visible:
+            self.refresh_overview_from_cache()
+
+    def jump_to_overview_position(self, x_fraction, y_fraction):
+        """Center and load a full-resolution FOV at a navigator click."""
+        if self.img is None or self.is_loading:
+            return
+        _channels, image_height, image_width = self.img.get_shape()
+        maximum_y0 = max(image_height - self.fov_size, 0)
+        maximum_x0 = max(image_width - self.fov_size, 0)
+        self.current_y0 = min(
+            max(int(round(y_fraction * image_height - self.fov_size / 2)), 0),
+            maximum_y0,
+        )
+        self.current_x0 = min(
+            max(int(round(x_fraction * image_width - self.fov_size / 2)), 0),
+            maximum_x0,
+        )
+        self.image_label.update_overview_fov(
+            self.current_overview_fov_rect()
+        )
+        self.reload_current_fov()
 
     def _refresh_image_carousel(self):
         self.image_carousel.blockSignals(True)
@@ -4269,6 +4658,9 @@ class OrbitFOVViewer(QWidget):
         self.annotations = {}
         self.model_bundle = None
         self.cellpose_worker = None
+        self.fov_worker = None
+        self.overview_worker = None
+        self.overview_request_id += 1
         self.segmenting_selected_markers = set()
         self.released_generated_segmentations = {}
         self.automated_edit_mode = False
@@ -4314,6 +4706,9 @@ class OrbitFOVViewer(QWidget):
         self.threshold_intensity_histogram.set_message("Load an image")
         self.threshold_fraction_histogram.set_message("Load an image")
         self.channel_dropdown.clear()
+        self.overview_checkbox.blockSignals(True)
+        self.overview_checkbox.setChecked(True)
+        self.overview_checkbox.blockSignals(False)
         self.image_label.clear()
         self.image_label.setText("Select a TIFF or OME-Zarr image")
         self.model_status_label.setText("No model trained or loaded.")
@@ -4383,6 +4778,7 @@ class OrbitFOVViewer(QWidget):
                     int(row_index)
                     for row_index in state.get("automated_exclusions", set())
                 ),
+                "cellpose_metadata": state.get("cellpose_metadata"),
                 "viewer": {
                     "current_x0": (
                         None if state["current_x0"] is None
@@ -4410,6 +4806,7 @@ class OrbitFOVViewer(QWidget):
                 "color": self.color_dropdown.currentText(),
                 "show_dapi": self.dapi_checkbox.isChecked(),
                 "show_segmentation": self.segmentation_checkbox.isChecked(),
+                "show_overview": self.overview_checkbox.isChecked(),
                 "tool": self.active_tool,
                 "segmenting": {
                     "tool": "cellpose_sam",
@@ -4527,6 +4924,12 @@ class OrbitFOVViewer(QWidget):
                     for row_index in entry.get("automated_exclusions", [])
                     if 0 <= int(row_index) < cell_count
                 }
+                cellpose_metadata = entry.get("cellpose_metadata")
+                state["cellpose_metadata"] = (
+                    dict(cellpose_metadata)
+                    if isinstance(cellpose_metadata, dict)
+                    else None
+                )
                 image_viewer = entry.get("viewer", {})
                 state["current_x0"] = image_viewer.get("current_x0")
                 state["current_y0"] = image_viewer.get("current_y0")
@@ -4637,6 +5040,9 @@ class OrbitFOVViewer(QWidget):
             self.segmentation_checkbox.setChecked(
                 viewer.get("show_segmentation", True)
             )
+            self.overview_checkbox.setChecked(
+                viewer.get("show_overview", True)
+            )
             target_index = min(max(target_index, 0), len(self.loaded_images) - 1)
             self._refresh_image_carousel()
             self._activate_image(target_index)
@@ -4654,12 +5060,23 @@ class OrbitFOVViewer(QWidget):
             self.reload_current_fov()
 
     def generate_fov(self):
-        if self.fov_generator is None:
+        if self.fov_generator is None or self.is_loading:
             return
-        self.current_y0, self.current_x0 = self.fov_generator.random_position(
-            size=self.fov_size, seed=None
+        self.set_loading(True, "Finding a DAPI-positive field of view...")
+        worker = FOVLoadWorker(
+            self.fov_generator,
+            y0=None,
+            x0=None,
+            size=self.fov_size,
+            channel=self.channel_dropdown.currentIndex(),
+            dapi_channel=self.img.get_dapi_channel_index(default=0),
+            choose_random_dapi_field=True,
+            minimum_dapi_fraction=DEFAULT_MINIMUM_DAPI_FRACTION,
         )
-        self.reload_current_fov()
+        worker.signals.finished.connect(self.on_fov_loaded)
+        worker.signals.error.connect(self.on_fov_error)
+        self.fov_worker = worker
+        self.thread_pool.start(worker)
 
     def reload_current_fov(self):
         if self.is_loading or self.current_y0 is None:
@@ -4673,10 +5090,16 @@ class OrbitFOVViewer(QWidget):
         )
         worker.signals.finished.connect(self.on_fov_loaded)
         worker.signals.error.connect(self.on_fov_error)
+        self.fov_worker = worker
         self.thread_pool.start(worker)
 
-    def on_fov_loaded(self, marker_fov, dapi_fov):
-        self.current_fov, self.current_dapi_fov = marker_fov, dapi_fov
+    def on_fov_loaded(self, result):
+        self.fov_worker = None
+        self.current_y0 = int(result["y0"])
+        self.current_x0 = int(result["x0"])
+        self.current_fov = result["marker_fov"]
+        self.current_dapi_fov = result["dapi_fov"]
+        self._capture_current_image_state()
         self.set_loading(False)
         self.regenerate_button.setEnabled(True)
         threshold_edit = (
@@ -4700,8 +5123,10 @@ class OrbitFOVViewer(QWidget):
         self.update_display()
 
     def on_fov_error(self, error_message: str):
+        self.fov_worker = None
         self.set_loading(False)
-        self.image_label.setText("Failed to generate FOV.")
+        if self.current_fov is None:
+            self.image_label.setText("Failed to generate FOV.")
         self.status_label.setText(error_message)
 
     def current_segmentation_boundary(self):
@@ -4754,6 +5179,9 @@ class OrbitFOVViewer(QWidget):
                 segmentation_boundary=boundary,
                 threshold_highlight=threshold_highlight,
                 annotation_markers=annotation_markers,
+            )
+            self.image_label.update_overview_fov(
+                self.current_overview_fov_rect()
             )
         except Exception:
             self.status_label.setText(traceback.format_exc())

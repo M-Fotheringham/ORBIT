@@ -50,10 +50,23 @@ def cuda_compatible_gpu_available() -> bool:
 def output_paths_for_image(image_path: str | Path) -> tuple[Path, Path]:
     """Return deterministic cell-data and mask paths beside an image."""
     image_path = Path(image_path).expanduser().resolve()
-    base_name = image_path.stem
+    return segmentation_export_paths(image_path.parent, image_path)
+
+
+def segmentation_export_paths(
+    destination_directory: str | Path,
+    image_path: str | Path,
+    filename_stem: str | None = None,
+) -> tuple[Path, Path]:
+    """Return cell-data and mask paths in a selected export directory."""
+    destination = Path(destination_directory).expanduser().resolve()
+    base_name = Path(image_path).stem if filename_stem is None else str(filename_stem)
+    base_name = Path(base_name).name.strip()
+    if not base_name:
+        raise ValueError("The segmentation export filename cannot be empty.")
     return (
-        image_path.with_name(f"{base_name}_orbit_cellpose_cells.tsv"),
-        image_path.with_name(f"{base_name}_orbit_cellpose_masks.tif"),
+        destination / f"{base_name}_orbit_cellpose_cells.tsv",
+        destination / f"{base_name}_orbit_cellpose_masks.tif",
     )
 
 
@@ -337,15 +350,17 @@ def _temporary_path(target: Path) -> Path:
     return Path(name)
 
 
-def save_segmentation_outputs(
-    image_path: str | Path,
+def _write_segmentation_outputs(
+    cell_path: Path,
+    mask_path: Path,
     masks: np.ndarray,
     cell_data: pd.DataFrame,
     marker_names: Iterable[str],
     nuclear_channel_name: str | None,
 ) -> tuple[Path, Path]:
-    """Atomically replace ORBIT's generated mask and cell-data outputs."""
-    cell_path, mask_path = output_paths_for_image(image_path)
+    """Atomically write one cell-data/mask output pair."""
+    cell_path.parent.mkdir(parents=True, exist_ok=True)
+    mask_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_cell_path = _temporary_path(cell_path)
     temporary_mask_path = _temporary_path(mask_path)
     try:
@@ -367,6 +382,55 @@ def save_segmentation_outputs(
         temporary_cell_path.unlink(missing_ok=True)
         temporary_mask_path.unlink(missing_ok=True)
     return cell_path, mask_path
+
+
+def save_segmentation_outputs(
+    image_path: str | Path,
+    masks: np.ndarray,
+    cell_data: pd.DataFrame,
+    marker_names: Iterable[str],
+    nuclear_channel_name: str | None,
+) -> tuple[Path, Path]:
+    """Atomically replace ORBIT's generated mask and cell-data outputs."""
+    cell_path, mask_path = output_paths_for_image(image_path)
+    return _write_segmentation_outputs(
+        cell_path,
+        mask_path,
+        masks,
+        cell_data,
+        marker_names,
+        nuclear_channel_name,
+    )
+
+
+def export_segmentation_outputs(
+    destination_directory: str | Path,
+    image_path: str | Path,
+    masks: np.ndarray,
+    cell_data: pd.DataFrame,
+    marker_names: Iterable[str] = (),
+    nuclear_channel_name: str | None = None,
+    filename_stem: str | None = None,
+) -> tuple[Path, Path]:
+    """Export a Cellpose data table and label mask to a chosen directory."""
+    destination = Path(destination_directory).expanduser().resolve()
+    if not destination.is_dir():
+        raise NotADirectoryError(
+            f"Segmentation export directory not found: {destination}"
+        )
+    cell_path, mask_path = segmentation_export_paths(
+        destination,
+        image_path,
+        filename_stem=filename_stem,
+    )
+    return _write_segmentation_outputs(
+        cell_path,
+        mask_path,
+        masks,
+        cell_data,
+        marker_names,
+        nuclear_channel_name,
+    )
 
 
 def segment_image(
@@ -455,11 +519,13 @@ __all__ = [
     "create_cellpose_sam_model",
     "cuda_compatible_gpu_available",
     "dapi_channel_name",
+    "export_segmentation_outputs",
     "is_dapi_channel",
     "measure_segmented_cells",
     "membrane_marker_names",
     "output_paths_for_image",
     "save_segmentation_outputs",
+    "segmentation_export_paths",
     "segment_image",
     "segment_project_images",
 ]
