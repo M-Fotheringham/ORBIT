@@ -7,7 +7,7 @@ from collections import defaultdict
 import numpy as np
 import napari
 from PySide6.QtCore import QEvent, QPoint, Qt, Signal
-from PySide6.QtGui import QCursor, QPixmap
+from PySide6.QtGui import QColor, QCursor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QLabel, QStackedLayout, QWidget
 
 
@@ -19,6 +19,16 @@ NAPARI_COLORMAPS = {
     "Cyan": "cyan",
     "Magenta": "magenta",
     "Yellow": "yellow",
+}
+
+OVERVIEW_COLOR_SCALES = {
+    "Gray": (1.0, 1.0, 1.0),
+    "Red": (1.0, 0.0, 0.0),
+    "Green": (0.0, 1.0, 0.0),
+    "Blue": (0.0, 0.0, 1.0),
+    "Cyan": (0.0, 1.0, 1.0),
+    "Magenta": (1.0, 0.0, 1.0),
+    "Yellow": (1.0, 1.0, 0.0),
 }
 
 # The original QLabel canvas uses Qt.SmoothTransformation when enlarging a
@@ -44,6 +54,121 @@ def _contrast_limits(data: np.ndarray) -> tuple[float, float]:
     return float(low), float(high)
 
 
+def _normalize_to_uint8(data: np.ndarray) -> np.ndarray:
+    values = np.asarray(data)
+    low, high = _contrast_limits(values)
+    normalized = np.asarray(values, dtype=np.float32)
+    normalized = np.nan_to_num(
+        normalized,
+        nan=low,
+        posinf=high,
+        neginf=low,
+    )
+    normalized = np.clip((normalized - low) / (high - low), 0.0, 1.0)
+    return np.rint(normalized * 255.0).astype(np.uint8)
+
+
+class OverviewNavigator(QWidget):
+    """Top-left whole-image navigator with a full-resolution FOV outline."""
+
+    clicked = Signal(float, float)
+    BORDER = 3
+    MAXIMUM_IMAGE_SIZE = 250
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pixmap = None
+        self._full_shape = None
+        self._fov_rect = None
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("Click to center the field of view at this location")
+        self.hide()
+
+    @property
+    def has_image(self):
+        return self._pixmap is not None
+
+    def set_image(self, rgb, full_shape, fov_rect=None):
+        rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+        if rgb.ndim != 3 or rgb.shape[2] != 3:
+            raise ValueError(
+                f"The overview navigator requires RGB data; got {rgb.shape}."
+            )
+        height, width = rgb.shape[:2]
+        qimage = QImage(
+            rgb.data,
+            width,
+            height,
+            3 * width,
+            QImage.Format_RGB888,
+        ).copy()
+        source = QPixmap.fromImage(qimage)
+        self._pixmap = source.scaled(
+            self.MAXIMUM_IMAGE_SIZE,
+            self.MAXIMUM_IMAGE_SIZE,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self._full_shape = tuple(int(value) for value in full_shape)
+        self._fov_rect = fov_rect
+        self.setFixedSize(
+            self._pixmap.width() + 2 * self.BORDER,
+            self._pixmap.height() + 2 * self.BORDER,
+        )
+        self.update()
+
+    def set_fov_rect(self, fov_rect):
+        self._fov_rect = fov_rect
+        self.update()
+
+    def clear(self):
+        self._pixmap = None
+        self._full_shape = None
+        self._fov_rect = None
+        self.hide()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._pixmap is None:
+            return
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#101010"))
+        painter.drawPixmap(self.BORDER, self.BORDER, self._pixmap)
+
+        if self._fov_rect is not None and self._full_shape is not None:
+            full_height, full_width = self._full_shape
+            x0, y0, fov_width, fov_height = self._fov_rect
+            left = self.BORDER + x0 / full_width * self._pixmap.width()
+            top = self.BORDER + y0 / full_height * self._pixmap.height()
+            width = max(fov_width / full_width * self._pixmap.width(), 2.0)
+            height = max(fov_height / full_height * self._pixmap.height(), 2.0)
+            painter.setPen(QPen(QColor("#ff2020"), 2))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(
+                round(left),
+                round(top),
+                max(round(width), 2),
+                max(round(height), 2),
+            )
+        painter.end()
+
+    def mousePressEvent(self, event):
+        if (
+            self._pixmap is not None
+            and event.button() == Qt.LeftButton
+        ):
+            x = event.position().x() - self.BORDER
+            y = event.position().y() - self.BORDER
+            if 0 <= x < self._pixmap.width() and 0 <= y < self._pixmap.height():
+                self.clicked.emit(
+                    float(x / self._pixmap.width()),
+                    float(y / self._pixmap.height()),
+                )
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+
 class NapariImageCanvas(QWidget):
     """Napari-powered drop-in replacement for ORBIT's clickable image label.
 
@@ -54,6 +179,7 @@ class NapariImageCanvas(QWidget):
     image_clicked = Signal(float, float)
     image_hovered = Signal(float, float, object)
     image_hover_left = Signal()
+    overview_clicked = Signal(float, float)
 
     def __init__(self, message: str = "", parent=None):
         super().__init__(parent)
@@ -89,6 +215,11 @@ class NapariImageCanvas(QWidget):
         layout.addWidget(self._native_canvas)
         layout.addWidget(self._message_label)
         self.setLayout(layout)
+
+        self._overview_visible = True
+        self._overview = OverviewNavigator(self)
+        self._overview.clicked.connect(self.overview_clicked.emit)
+        self._overview.move(12, 12)
 
     def set_scene(
         self,
@@ -147,6 +278,49 @@ class NapariImageCanvas(QWidget):
 
         if is_new_fov:
             self.viewer.reset_view()
+        self._overview.raise_()
+
+    def set_overview_scene(
+        self,
+        marker_arr: np.ndarray,
+        marker_color: str,
+        dapi_arr: np.ndarray | None,
+        show_dapi: bool,
+        full_shape: tuple[int, int],
+        fov_rect=None,
+    ):
+        marker = _normalize_to_uint8(marker_arr)
+        red, green, blue = OVERVIEW_COLOR_SCALES.get(
+            marker_color,
+            OVERVIEW_COLOR_SCALES["Green"],
+        )
+        rgb = np.zeros((*marker.shape, 3), dtype=np.uint8)
+        rgb[..., 0] = marker * red
+        rgb[..., 1] = marker * green
+        rgb[..., 2] = marker * blue
+        if show_dapi and dapi_arr is not None:
+            dapi = _normalize_to_uint8(dapi_arr)
+            if dapi.shape != marker.shape:
+                raise ValueError(
+                    "The marker and DAPI overview dimensions do not match "
+                    f"({marker.shape} versus {dapi.shape})."
+                )
+            rgb[..., 2] = np.maximum(rgb[..., 2], dapi)
+        self._overview.set_image(rgb, full_shape, fov_rect=fov_rect)
+        self._overview.setVisible(self._overview_visible)
+        self._overview.raise_()
+
+    def update_overview_fov(self, fov_rect):
+        self._overview.set_fov_rect(fov_rect)
+        self._overview.raise_()
+
+    def set_overview_visible(self, visible: bool):
+        self._overview_visible = bool(visible)
+        self._overview.setVisible(
+            self._overview_visible and self._overview.has_image
+        )
+        if self._overview.isVisible():
+            self._overview.raise_()
 
     def _set_image_layer(
         self,
@@ -283,6 +457,7 @@ class NapariImageCanvas(QWidget):
         self.viewer.layers.clear()
         self._image_shape = None
         self._marker_identity = None
+        self._overview.clear()
         self._message_label.show()
 
     def setText(self, text: str):
