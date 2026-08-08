@@ -1203,15 +1203,17 @@ class OrbitFOVViewer(QWidget):
         threshold_page_layout.addStretch()
 
         automated_description = QLabel(
-            "Automatically thresholds the displayed channel, selects 25 "
-            "negative and 25 positive training cells, then runs two "
-            "low-confidence refinement rounds at 60% and 55%, adding five "
-            "fluorescence-discordant cells to each class per round. The final "
-            "35-positive/35-negative random forest is applied to every loaded "
-            "image."
+            "Automatically thresholds pixels by the displayed fluorescence " \
+            "channel, then builds a random forest classifier using 25 " \
+            "positive and 25 negative training cells based on positive " \
+            "pixel proportions followed by two low-confidence refinement " \
+            "rounds, adding five fluorescence-discordant cells to each " \
+            "class per round. The final 35-positive/35-negative random " \
+            "forest is applied to every loaded image."
         )
         automated_description.setWordWrap(True)
         self.auto_phenotype_button = QPushButton("Auto Phenotype")
+        automated_description.setAlignment(Qt.AlignmentFlag.AlignJustify)
         self.auto_phenotype_button.clicked.connect(
             lambda: self.start_automated_phenotyping(reset_annotations=True)
         )
@@ -3589,7 +3591,7 @@ class OrbitFOVViewer(QWidget):
                 self,
                 "Replace training labels?",
                 "Auto Phenotype will replace the existing training labels with "
-                "25 automatically selected positive and 25 negative cells. Continue?",
+                "35 automatically selected positive and 35 negative cells. Continue?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
