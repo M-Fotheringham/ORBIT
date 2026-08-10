@@ -1,3 +1,6 @@
+# Keep ORBIT's bundled font and assistant artwork in Nuitka distributions.
+# nuitka-project: --include-package-data=orbit
+
 import ctypes
 import sys
 from pathlib import Path
@@ -6,6 +9,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from orbit.gui.fov_viewer import OrbitFOVViewer
+from orbit.resources import install_cosmic_alien_font
 
 
 def find_icon_path():
@@ -39,6 +43,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("ORBIT")
     app.setApplicationDisplayName("ORBIT")
+    install_cosmic_alien_font(app)
 
     icon_path = find_icon_path()
     if icon_path is not None:

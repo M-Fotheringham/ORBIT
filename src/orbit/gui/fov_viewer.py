@@ -23,6 +23,7 @@ from PySide6.QtCore import (
 
 from orbit.image import QPTiffImage
 from orbit.fov import DEFAULT_MINIMUM_DAPI_FRACTION, RandomFOVGenerator
+from orbit.gui.alien_assistant import AlienAssistantWidget
 from orbit.gui.napari_canvas import NapariImageCanvas
 from orbit.models.random_forest import (
     MODEL_FORMAT,
@@ -84,6 +85,26 @@ MAXIMUM_INWARD_BUFFER_SLIDER_VALUE = int(
 )
 CELL_PROBABILITY_HOVER_DELAY_MS = 2000
 OVERVIEW_MAXIMUM_SIZE = 768
+
+TOOL_GUIDANCE = {
+    "cellpose_sam": (
+        "Select shared membrane markers and click Segment. ORBIT merges the "
+        "selected channels, with DAPI supplied for nuclei when available."
+    ),
+    "random_forest": (
+        "Click segmented cells to label positive and negative examples. "
+        "Then train the random forest and apply it to the loaded images."
+    ),
+    "threshold": (
+        "Choose a fluorescence channel, adjust the intensity and positive-pixel "
+        "thresholds, then apply them to all cells; thresholded pixels appear yellow."
+    ),
+    "automated": (
+        "Choose a fluorescence channel, name the phenotype, and click Auto "
+        "Phenotype. ORBIT deterministically trains 35 positive and 35 negative "
+        "examples; use Edit to review or refine them."
+    ),
+}
 
 
 def buffer_microns_from_slider(value):
@@ -952,8 +973,12 @@ class OrbitFOVViewer(QWidget):
             QWidget { background-color: black; border: 1px solid #333; }
         """)
 
-        self.status_label = QLabel("")
-        self.status_label.setAlignment(Qt.AlignCenter)
+        self.assistant_widget = AlienAssistantWidget(
+            "Welcome to ORBIT. Add a TIFF/QPTIFF or OME-Zarr image to begin."
+        )
+        # Retain the existing status-label interface so every current status
+        # and error message is presented through the assistant's speech bubble.
+        self.status_label = self.assistant_widget.message_label
         self.spinner = QProgressBar()
         self.spinner.setRange(0, 0)
         self.spinner.setTextVisible(False)
@@ -1138,11 +1163,6 @@ class OrbitFOVViewer(QWidget):
             self.sync_phenotype_name_from_automated
         )
 
-        threshold_description = QLabel(
-            "Pixels in the displayed channel above the intensity threshold "
-            "are highlighted yellow."
-        )
-        threshold_description.setWordWrap(True)
         self.threshold_intensity_label = QLabel("Intensity threshold: —")
         self.threshold_intensity_slider = QSlider(Qt.Horizontal)
         self.threshold_intensity_slider.setRange(0, 1000)
@@ -1262,7 +1282,6 @@ class OrbitFOVViewer(QWidget):
             "Phenotype:", self.threshold_phenotype_name
         )
         threshold_layout.addLayout(threshold_name_layout)
-        threshold_layout.addWidget(threshold_description)
         threshold_layout.addWidget(self.threshold_mask_button)
         threshold_layout.addSpacing(8)
         threshold_layout.addWidget(self.threshold_intensity_histogram_label)
@@ -1294,18 +1313,7 @@ class OrbitFOVViewer(QWidget):
         threshold_page_layout.addWidget(threshold_panel)
         threshold_page_layout.addStretch()
 
-        automated_description = QLabel(
-            "Automatically thresholds pixels by the displayed fluorescence " \
-            "channel, then builds a random forest classifier using 25 " \
-            "positive and 25 negative training cells based on positive " \
-            "pixel proportions followed by two low-confidence refinement " \
-            "rounds, adding five fluorescence-discordant cells to each " \
-            "class per round. The final 35-positive/35-negative random " \
-            "forest is applied to every loaded image."
-        )
-        automated_description.setWordWrap(True)
         self.auto_phenotype_button = QPushButton("Auto Phenotype")
-        automated_description.setAlignment(Qt.AlignmentFlag.AlignJustify)
         self.auto_phenotype_button.clicked.connect(
             lambda: self.start_automated_phenotyping(reset_annotations=True)
         )
@@ -1327,8 +1335,6 @@ class OrbitFOVViewer(QWidget):
 
         automated_default_panel = QGroupBox("Automated Phenotyping")
         automated_default_layout = QVBoxLayout()
-        automated_default_layout.addWidget(automated_description)
-        automated_default_layout.addSpacing(8)
         automated_default_layout.addWidget(self.auto_phenotype_button)
         automated_default_layout.addWidget(self.automated_status_label)
         automated_default_layout.addWidget(self.automated_edit_button)
@@ -1559,12 +1565,6 @@ class OrbitFOVViewer(QWidget):
         self.segmenting_gpu_status_label.setStyleSheet(
             "color: #b26a00; font-weight: bold;"
         )
-        segmenting_description = QLabel(
-            "Select one or more membrane-guiding markers shared by the loaded "
-            "images. Selected channels are normalized and merged before "
-            f"segmentation with Cellpose-SAM ({CELLPOSE_SAM_MODEL})."
-        )
-        segmenting_description.setWordWrap(True)
         self.segmenting_dapi_label = QLabel(
             "DAPI will be supplied as the nuclear channel when available."
         )
@@ -1606,7 +1606,6 @@ class OrbitFOVViewer(QWidget):
         segmenting_layout = QVBoxLayout()
         segmenting_layout.addWidget(self.segmenting_gpu_status_label)
         segmenting_layout.addSpacing(6)
-        segmenting_layout.addWidget(segmenting_description)
         segmenting_layout.addWidget(self.segmenting_dapi_label)
         segmenting_layout.addSpacing(6)
         segmenting_layout.addWidget(QLabel("Membrane-guiding markers:"))
@@ -1714,7 +1713,7 @@ class OrbitFOVViewer(QWidget):
         viewer_layout.addWidget(self.right_panel_stack)
         layout.addLayout(viewer_layout, stretch=1)
         layout.addWidget(self.spinner)
-        layout.addWidget(self.status_label)
+        layout.addWidget(self.assistant_widget)
         layout.addLayout(toolbar)
 
         carousel = QGroupBox("Loaded Images")
@@ -2466,6 +2465,8 @@ class OrbitFOVViewer(QWidget):
         self.update_automated_controls()
         self.update_segmentation_controls()
         self.update_display()
+        if not self.is_loading:
+            self.assistant_widget.set_message(TOOL_GUIDANCE[tool])
 
     def _invalidate_threshold_predictions(self):
         for state in self.loaded_images:
@@ -4759,7 +4760,10 @@ class OrbitFOVViewer(QWidget):
         self.update_model_controls()
         self.update_threshold_controls()
         self.update_automated_controls()
-        self.set_loading(False, "New project")
+        self.set_loading(
+            False,
+            "New project ready. Add a TIFF/QPTIFF or OME-Zarr image to begin.",
+        )
 
     def project_data(self):
         if not self.loaded_images:
