@@ -45,7 +45,7 @@ An AMD GPU is not CUDA-compatible; however, you can still load images, import ex
 
 ### Windows standalone application
 
-Download the lates installer for Windows from [Windows Installer (Releases)](https://github.com/M-Fotheringham/ORBIT/releases).
+Download the latest installer for Windows from [Windows Installer (Releases)](https://github.com/M-Fotheringham/ORBIT/releases).
 
 ### Editable source installation with uv
 
