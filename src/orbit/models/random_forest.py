@@ -16,6 +16,7 @@ MODEL_VERSION = 1
 RANDOM_FOREST_ALGORITHM = "RandomForestClassifier"
 RANDOM_FOREST_RANDOM_SEED = 42
 RANDOM_FOREST_ESTIMATORS = 300
+DEFAULT_POSITIVE_PROBABILITY_THRESHOLD = 0.50
 
 
 def fit_random_forest(
@@ -66,9 +67,12 @@ def fit_random_forest(
 def model_calls_and_positive_probabilities(
     pipeline: Pipeline,
     measurements: pd.DataFrame,
+    positive_probability_threshold: float = DEFAULT_POSITIVE_PROBABILITY_THRESHOLD,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return Boolean phenotype calls and positive-class probabilities."""
-    predictions = np.asarray(pipeline.predict(measurements), dtype=np.uint8)
+    """Return probability-thresholded calls and positive-class probabilities."""
+    decision_threshold = float(positive_probability_threshold)
+    if not 0.0 <= decision_threshold <= 1.0:
+        raise ValueError("The positive probability threshold must be between 0 and 1.")
     probabilities = np.asarray(
         pipeline.predict_proba(measurements), dtype=float
     )
@@ -81,4 +85,4 @@ def model_calls_and_positive_probabilities(
     positive_probability = np.clip(
         probabilities[:, int(positive_columns[0])], 0.0, 1.0
     )
-    return predictions.astype(bool), positive_probability
+    return positive_probability >= decision_threshold, positive_probability

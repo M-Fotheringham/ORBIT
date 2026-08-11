@@ -166,9 +166,9 @@ def build_cellpose_input(
     return model_input, nuclear_name
 
 
-def create_cellpose_sam_model():
-    """Load the current Cellpose-SAM model, using a GPU when available."""
-    if not cuda_compatible_gpu_available():
+def create_cellpose_sam_model(gpu: bool = True):
+    """Load Cellpose-SAM for CUDA batch work or CPU FOV previews."""
+    if gpu and not cuda_compatible_gpu_available():
         raise RuntimeError(
             "Cellpose-SAM segmentation requires a CUDA-compatible GPU, but "
             "none was detected by PyTorch."
@@ -182,9 +182,27 @@ def create_cellpose_sam_model():
         ) from error
 
     return models.CellposeModel(
-        gpu=True,
+        gpu=bool(gpu),
         pretrained_model=CELLPOSE_SAM_MODEL,
     )
+
+
+class _RegionImage:
+    """Small in-memory image adapter used for current-FOV CPU segmentation."""
+
+    def __init__(self, source, y0: int, x0: int, height: int, width: int):
+        self.path = source.path
+        self._names = [str(name) for name in source.get_channel_names()]
+        self._channels = [
+            source.get_region(index, y0, x0, height, width)
+            for index in range(len(self._names))
+        ]
+
+    def get_channel_names(self):
+        return list(self._names)
+
+    def get_channel(self, index: int):
+        return self._channels[int(index)]
 
 
 def _safe_channel_labels(channel_names: Iterable[str]) -> list[str]:
@@ -340,6 +358,155 @@ def measure_segmented_cells(
     return cells
 
 
+def _offset_fov_measurements(
+    cells: pd.DataFrame,
+    y0: int,
+    x0: int,
+    pixel_size_um: float,
+) -> pd.DataFrame:
+    cells = cells.copy()
+    for column in ("Centroid X px", "Bounding box X min px", "Bounding box X max px"):
+        if column in cells:
+            cells[column] = cells[column] + int(x0)
+    for column in ("Centroid Y px", "Bounding box Y min px", "Bounding box Y max px"):
+        if column in cells:
+            cells[column] = cells[column] + int(y0)
+    if "Centroid X px" in cells:
+        cells["Centroid X µm"] = cells["Centroid X px"] * float(pixel_size_um)
+    if "Centroid Y px" in cells:
+        cells["Centroid Y µm"] = cells["Centroid Y px"] * float(pixel_size_um)
+    return cells
+
+
+def segment_fov_preview(
+    image,
+    selected_marker_names: Iterable[str],
+    y0: int,
+    x0: int,
+    height: int,
+    width: int,
+    pixel_size_um: float = DEFAULT_PIXEL_SIZE_UM,
+    model=None,
+) -> dict:
+    """Segment only the displayed FOV on CPU without changing project data."""
+    selected = list(dict.fromkeys(str(name) for name in selected_marker_names))
+    region_image = _RegionImage(image, int(y0), int(x0), int(height), int(width))
+    model_input, nuclear_name = build_cellpose_input(region_image, selected)
+    if model is None:
+        model = create_cellpose_sam_model(gpu=False)
+    masks, _flows, _styles = model.eval(
+        model_input,
+        channel_axis=-1,
+        normalize=True,
+        diameter=None,
+        batch_size=8,
+        tile_overlap=0.1,
+    )
+    masks = np.asarray(masks, dtype=np.uint32)
+    cell_data = measure_segmented_cells(
+        masks, region_image, pixel_size_um=pixel_size_um
+    )
+    cell_data = _offset_fov_measurements(
+        cell_data, y0=int(y0), x0=int(x0), pixel_size_um=pixel_size_um
+    )
+    return {
+        "image_path": str(Path(image.path).resolve()),
+        "x0": int(x0),
+        "y0": int(y0),
+        "width": int(width),
+        "height": int(height),
+        "masks": masks,
+        "cell_data": cell_data,
+        "cell_count": len(cell_data),
+        "marker_names": selected,
+        "nuclear_channel_name": nuclear_name,
+        "model_name": CELLPOSE_SAM_MODEL,
+        "compute_device": "cpu",
+        "scope": "current_fov",
+        "pixel_size_um": float(pixel_size_um),
+    }
+
+
+def merge_fov_segmentation(
+    *,
+    preview: dict,
+    image_shape: tuple[int, int],
+    existing_masks: np.ndarray | None,
+    existing_cell_data: pd.DataFrame | None,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """Accept a preview by replacing cells intersecting its rectangular FOV."""
+    height, width = map(int, image_shape)
+    y0, x0 = int(preview["y0"]), int(preview["x0"])
+    local_masks = np.asarray(preview["masks"], dtype=np.uint32)
+    y1, x1 = y0 + local_masks.shape[0], x0 + local_masks.shape[1]
+    if y0 < 0 or x0 < 0 or y1 > height or x1 > width:
+        raise ValueError("The segmentation preview lies outside the source image.")
+    if existing_masks is None:
+        merged_masks = np.zeros((height, width), dtype=np.uint32)
+    else:
+        if tuple(existing_masks.shape) != (height, width):
+            raise ValueError("The existing segmentation dimensions do not match the image.")
+        merged_masks = np.array(existing_masks, dtype=np.uint32, copy=True)
+
+    replaced_labels = np.unique(merged_masks[y0:y1, x0:x1])
+    replaced_labels = replaced_labels[replaced_labels > 0]
+    for label in replaced_labels:
+        merged_masks[merged_masks == label] = 0
+
+    maximum_label = int(merged_masks.max(initial=0))
+    relabelled = np.zeros_like(local_masks, dtype=np.uint32)
+    local_labels = np.unique(local_masks)
+    local_labels = local_labels[local_labels > 0]
+    label_mapping = {
+        int(label): maximum_label + index
+        for index, label in enumerate(local_labels, start=1)
+    }
+    for old_label, new_label in label_mapping.items():
+        relabelled[local_masks == old_label] = new_label
+    merged_masks[y0:y1, x0:x1] = relabelled
+
+    new_cells = preview["cell_data"].copy()
+    if "Cell ID" in new_cells:
+        new_cells["Cell ID"] = (
+            pd.to_numeric(new_cells["Cell ID"], errors="raise")
+            .astype(int)
+            .map(label_mapping)
+            .astype(np.int64)
+        )
+    if existing_cell_data is None:
+        merged_cells = new_cells
+    else:
+        retained = existing_cell_data.copy()
+        identifier_column = next(
+            (
+                column for column in retained.columns
+                if str(column).strip().lower().replace("_", " ").replace("-", " ")
+                in {"cell id", "object id", "mask id", "label id"}
+            ),
+            None,
+        )
+        if identifier_column is not None and replaced_labels.size:
+            ids = pd.to_numeric(retained[identifier_column], errors="coerce")
+            retained = retained.loc[~ids.isin(replaced_labels)].copy()
+        elif "Centroid X px" in retained and "Centroid Y px" in retained:
+            xs = pd.to_numeric(retained["Centroid X px"], errors="coerce")
+            ys = pd.to_numeric(retained["Centroid Y px"], errors="coerce")
+            retained = retained.loc[
+                ~((xs >= x0) & (xs < x1) & (ys >= y0) & (ys < y1))
+            ].copy()
+        elif "Centroid X µm" in retained and "Centroid Y µm" in retained:
+            scale = float(preview.get("pixel_size_um", DEFAULT_PIXEL_SIZE_UM))
+            xs = pd.to_numeric(retained["Centroid X µm"], errors="coerce") / scale
+            ys = pd.to_numeric(retained["Centroid Y µm"], errors="coerce") / scale
+            retained = retained.loc[
+                ~((xs >= x0) & (xs < x1) & (ys >= y0) & (ys < y1))
+            ].copy()
+        merged_cells = pd.concat([retained, new_cells], ignore_index=True, sort=False)
+    if "Cell ID" in merged_cells:
+        merged_cells = merged_cells.sort_values("Cell ID").reset_index(drop=True)
+    return merged_masks, merged_cells
+
+
 def _temporary_path(target: Path) -> Path:
     descriptor, name = tempfile.mkstemp(
         dir=target.parent,
@@ -471,6 +638,8 @@ def segment_image(
         "marker_names": selected,
         "nuclear_channel_name": nuclear_name,
         "model_name": CELLPOSE_SAM_MODEL,
+        "compute_device": "cuda",
+        "scope": "whole_image",
     }
 
 
@@ -492,7 +661,7 @@ def segment_project_images(
         progress_callback(
             f"Loading Cellpose-SAM model {CELLPOSE_SAM_MODEL}..."
         )
-    model = create_cellpose_sam_model()
+    model = create_cellpose_sam_model(gpu=True)
     results = []
     for index, image in enumerate(images, start=1):
         if progress_callback is not None:
@@ -522,10 +691,12 @@ __all__ = [
     "export_segmentation_outputs",
     "is_dapi_channel",
     "measure_segmented_cells",
+    "merge_fov_segmentation",
     "membrane_marker_names",
     "output_paths_for_image",
     "save_segmentation_outputs",
     "segmentation_export_paths",
     "segment_image",
+    "segment_fov_preview",
     "segment_project_images",
 ]
