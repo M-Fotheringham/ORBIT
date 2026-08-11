@@ -118,140 +118,101 @@ ORBIT was designed to read [CellPose](https://github.com/mouseland/cellpose) seg
 
 ## User guide
 
-### 1. Projects and images
+# User Guide
 
-#### 1.1 Add images
+## 1. Loading
 
-1. Click **Add Image**.
-2. Choose **TIFF / QPTIFF** or **OME-Zarr directory**.
-3. Select the image file or OME-Zarr directory.
-4. Repeat to add more images. Use the arrows or dropdown in **Loaded Images** to change the active image.
-5. If existing segmentation is available, select the corresponding image, click **Load Segmentation**, then select its cell-data table and label-mask TIFF.
+### 1.a Adding images to a project
 
-Loading a new segmentation for an image clears that image's existing annotations and phenotype predictions.
+1. Click 'Add Image'
+2. Select a TIFF/QPTIFF image or OME-Zarr directory containing the fluorescence data
+3. Optionally click 'Load Segmentation' to select an existing cell-data TSV and segmentation-mask TIFF. Segmentation is not required when adding an image.
 
-#### 1.2 Open or save a project
+### 1.b Opening a pre-existing project
 
-- **File > New Project** clears the current session after confirmation.
-- **File > Open...** opens an `.orbit.json` project.
-- **File > Save** updates the current project file.
-- **File > Save As...** writes a new `.orbit.json` project.
+1. File > Open...
+2. Select the .orbit.json file corresponding to your project
 
-A project records absolute paths to its images, cell tables, and masks, together with training annotations, selected markers, FOV positions, overlay visibility, threshold settings, and the active tool. It does not embed the source data or a trained model. Keep the referenced files in place, and use **File > Export Model...** separately if the classifier must be reused.
+### 1.c Importing a pre-existing phenotyping model
 
-#### 1.3 Import a phenotype model
+1. File > Import Model...
+2. Select the .orbitmodel file corresponding to your model
 
-1. Load images and segmentation whose cell tables contain the same feature columns used by the model.
-2. Choose **File > Import Model...**.
-3. Select an `.orbitmodel` file.
-4. Choose **Phenotyping > Random Forest** and click **Apply to Loaded Images**.
+## 2. Navigating
 
-### 2. Navigate and display images
+### 2.a Generating fields of view (FOV)
 
-#### 2.1 Generate a field of view
+1. Click 'Generate FOV'. This will produce a random 512x512 px field of view
+2. To generate another random field, click 'Generate FOV' again
 
-- **Generate FOV** creates a random 512 × 512-pixel field containing at least 1% DAPI-positive pixels.
-- If no qualifying field is found after repeated attempts, check that a valid DAPI channel is present and contains measurable nuclear signal.
+### 2.b Changing the displayed marker channel and colour
 
-#### 2.2 Change marker channel and colour
+1. Use the marker dropdown list to select a channel
+2. Use the colour dropdown list to select a pseudo colour for the marker
 
-Use the marker dropdown to select the displayed fluorescence channel and the colour dropdown to choose its pseudocolour. The selected fluorescence channel is also the channel used by Threshold Slider and Automated phenotyping.
+### 2.c Toggling DAPI and segmentation overlays
 
-#### 2.3 Toggle overlays
+The DAPI stain and the segmentation can be toggled on/off.
 
-- **DAPI** shows or hides the nuclear channel.
-- **Segmentation** shows or hides cell boundaries when a mask is loaded.
-- **Overview** shows or hides the low-power whole-image navigator in the upper-left corner.
+### 2.d Cycling through images
 
-The overview displays the current FOV as a red rectangle. Click anywhere in it to centre the FOV on that part of the source image.
+Change the image displayed using the carousel arrows or by selecting an image from the dropdown list.
 
-#### 2.4 Move between images
+### 2.e Segmenting with CellPoseSAM
 
-Use the carousel arrows or the **Loaded Images** dropdown at the bottom of the window. Training annotations are stored per image and pooled across the loaded project when a random forest is trained.
+1. Select Segmenting > CellPoseSAM and choose one or more membrane-guiding markers. Selected channels are normalized and merged, and DAPI is supplied as nuclear guidance when available.
+2. Click 'Preview Current FOV (CPU)' to segment only the displayed field without modifying project data. Review the overlay, then click 'Accept Preview' or 'Discard'.
+3. On systems with a CUDA-compatible GPU, 'Segment All Images (GPU)' replaces the segmentation and cell-level measurements for every loaded image.
+4. Click 'Export Segmentation' to save generated cell-data TSV and mask TIFF files.
 
-### 3. Segment with CellPoseSAM
+## 3. Phenotyping
 
-1. Add all images to the project.
-2. Choose **Segmenting > CellPoseSAM**.
-3. Confirm that the status light says **CUDA-compatible GPU detected**. If it does not, the marker list and segmentation actions remain disabled.
-4. Select one or more membrane-guiding markers shared by the loaded images. ORBIT robustly normalizes and merges the selected fluorescence channels into one membrane input. DAPI is supplied separately as the nuclear channel when available.
-5. Click **Segment**.
+### 3.a Adding and removing phenotype training labels
 
-ORBIT runs the `cpsam_v2` CellPoseSAM model on every loaded image, generates a labelled cell mask, and calculates morphology plus per-channel fluorescence measurements for every cell. Generated segmentation replaces any segmentation, training annotations, and predictions currently associated with those images.
+1. Provide a name for the phenotype algorithm being trained
+2. Click on a cell to label it positive or negative for your desired phenotype. You can remove the cell from training by clicking it and selecting 'Do not train'.
 
-The generated files are written beside each source image as:
+### 3.b Training machine-learning phenotyping model
 
-- `<image>_orbit_cellpose_cells.tsv`
-- `<image>_orbit_cellpose_masks.tif`
+Choose 'Select Features...' to control which shared numeric cell measurements are used. Once positive and negative labels have been selected, click 'Train Model' to train a random forest classifier. Use the 'Probability positive' slider (default 50%) to adjust the positive-call decision threshold.
 
-To copy all CellPoseSAM outputs to another location, click **Export Segmentation** at the bottom of the panel and select a destination directory.
+### 3.c Quality-checking model performance and training labels
 
-### 4. Phenotype cells
+1. Cycle through labeled cells using the arrows in the 'Phenotype Training' box. This will centre the image on trained cells.
+2. Once a model has been trained, click 'Apply to Loaded Images' to see the performance of the model on untrained cells.
 
-All phenotyping modes require cell data and a segmentation mask for every loaded image. Name the phenotype before training or exporting it.
+### 3.d Threshold-slider phenotyping
 
-#### 4.1 Automated (default)
+Select Phenotyping > Threshold Slider to set a fluorescence-intensity threshold and the percentage of positive pixels required to call a cell positive. The fluorescence histogram displays `log2(1 + mean intensity)` across all cells in the current image; the second histogram displays positive-pixel percentages. Compartment checkboxes and the inward-buffer slider control which cell pixels form the denominator.
 
-1. Select the fluorescence marker that represents the phenotype and generate an FOV.
-2. Choose **Phenotyping > Automated** if it is not already active.
-3. Enter a phenotype name and click **Auto Phenotype**.
-4. Review the modelled calls on every loaded image.
+### 3.e Automated phenotyping
 
-Automated phenotyping starts from a 66% fluorescence-intensity threshold and a 15% positive-pixel cutoff. It deterministically selects 25 positive and 25 negative examples, performs two low-confidence refinement rounds that add five cells to each class per round, trains a final 35-positive/35-negative random forest, and applies it to all loaded images. The fixed random seed makes the automatic selections repeatable for the same ordered input data.
+Select Phenotyping > Automated and click 'Auto Phenotype' to reproducibly generate training labels, train a random forest, and apply it to all loaded images. Feature selection and the positive-probability threshold can be adjusted before training. Click 'Edit' to review labels and threshold settings, then 'Re-Phenotype' to apply changes.
 
-Click **Edit** to expose the threshold settings and the generated random-forest training labels. You can change thresholds, click cells to set **Positive**, **Negative**, or **Do not train**, use the arrows to review training cells, and click **Re-Phenotype** to retrain and reapply the model.
+## 4. Saving and Exporting
 
-#### 4.2 Random Forest
+### 4.a Saving a project
 
-1. Choose **Phenotyping > Random Forest**.
-2. Enter the phenotype name.
-3. Click segmented cells and label each one **Positive**, **Negative**, or **Do not train**.
-4. Use **Show Positive** and **Show Negative** to toggle the training markers.
-5. Use the positive and negative arrow controls to centre the FOV on each labelled cell.
+1. Click File > Save or Save As... to save a project. Asset paths are stored relative to the project file whenever possible, allowing the project folder to be moved as long as its internal file structure is preserved.
 
-Click **Train Model** after labelling at least one positive and one negative cell. ORBIT trains a 300-tree random forest from numeric measurement columns shared by every loaded cell table. Identifier, centroid, geometry, bounding-box, ROI, and existing label/classification columns are excluded from training.
+### 4.b Saving a phenotyping model
 
-Click **Apply to Loaded Images** to phenotype every cell. Toggle **Show Modelled Phenotypes** to hide or show model calls. Hover over a segmented cell for two seconds to display the model's positive-call probability above the cursor.
+1. Click File > Export Model... to save a phenotyping model.
 
-#### 4.3 Threshold Slider
+### 4.c Exporting phenotyping data
 
-1. Choose **Phenotyping > Threshold Slider** and select the fluorescence channel to evaluate.
-2. Use the first histogram and slider to inspect the whole current image's mean per-cell fluorescence distribution and set the pixel-intensity threshold. Pixels above the threshold are highlighted yellow; use **Threshold Mask: On/Off** to toggle this overlay.
-3. Use the second histogram and slider to inspect the whole current image's distribution of positive-pixel percentages and set the percentage required to call a cell positive.
-4. Choose the denominator compartment:
-   - **Nucleus** uses pixels deeper inside the membrane boundary than the selected inward distance.
-   - **Cytoplasm/Membrane** uses pixels within that distance of the boundary.
-   - selecting both uses all cell pixels.
-5. Adjust the inward boundary distance from 0 to 5 µm. The default is 2 µm. This is a geometric split of the cell mask, not an independently segmented nuclear mask.
-6. Click **Apply Threshold to All Cells**.
+1. Once a model has been trained and applied to loaded images, click 'Export Cell Phenotypes' to save every original cell-data column, phenotype labels, positive probabilities, image names, and relevant thresholds for all loaded images.
+2. ORBIT also writes a companion `.provenance.json` file recording the ORBIT version, method, model settings, selected features, source paths, and segmentation metadata.
 
-Use **Show Threshold Phenotypes** to toggle the resulting calls. Threshold results can be exported after every loaded image has been processed.
+## 5. Batch/headless model application
 
-### 5. Save and export results
+An exported model can be applied to every cell-data table referenced by a portable project without opening the GUI:
 
-#### 5.1 Save the project
+```bash
+uv run orbit-batch --model phenotype.orbitmodel --project project.orbit.json --output phenotypes.tsv
+```
 
-Choose **File > Save** or **File > Save As...**. Because `.orbit.json` files store paths rather than source data, moving or renaming a referenced image, cell table, mask, or OME-Zarr directory prevents that item from reopening until the original path is restored.
-
-#### 5.2 Export or import a random-forest model
-
-- **File > Export Model...** writes the trained classifier and its feature schema to an `.orbitmodel` file.
-- **File > Import Model...** loads that model into another project.
-
-The receiving images must have cell tables containing the feature columns stored in the model. Importing a model does not automatically apply it; click **Apply to Loaded Images** after import.
-
-#### 5.3 Export cell phenotypes
-
-After a model or threshold has been applied to every loaded image, click **Export Cell Phenotypes** and choose TSV or CSV output.
-
-The combined export contains:
-
-- every original column from every loaded cell-data table;
-- the source image name;
-- the named phenotype's `Positive` or `Negative` label; and
-- the label source (`Model`, `Threshold`, or `Manual Training`).
-
-If the source tables have different schemas, ORBIT exports the union of their columns and leaves unavailable values empty.
+Use `--probability-threshold 0.60` to override the decision threshold stored in the model. The batch export includes the complete input tables, phenotype labels, positive probabilities, and a companion provenance JSON file.
 
 ## Development
 
@@ -309,26 +270,6 @@ Confirm that the mask is two-dimensional and matches the image dimensions. The t
 
 Confirm that the nuclear channel name contains `DAPI`, that the channel is not blank, and that the image contains fields with at least 1% DAPI-positive pixels.
 
-## Repository layout
-
-```text
-ORBIT/
-├── docs/figs/                  # Logos and tutorial images
-├── src/orbit/
-│   ├── app.py                  # Qt application entry point
-│   ├── fov.py                  # DAPI-guided random FOV sampling
-│   ├── image.py                # TIFF/QPTIFF and OME-Zarr access
-│   ├── threshold.py            # Pixel/cell threshold statistics
-│   ├── gui/
-│   │   ├── fov_viewer.py       # Main window and user workflows
-│   │   └── napari_canvas.py    # Interactive image canvas
-│   └── models/
-│       ├── automated.py        # Deterministic automated label selection
-│       ├── cellpose_segmentation.py
-│       └── random_forest.py
-├── pyproject.toml
-└── uv.lock
-```
 
 ## Questions and bug reports
 
