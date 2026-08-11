@@ -151,7 +151,6 @@ A project records absolute paths to its images, cell tables, and masks, together
 #### 2.1 Generate a field of view
 
 - **Generate FOV** creates a random 512 × 512-pixel field containing at least 1% DAPI-positive pixels.
-- **Regenerate** samples another qualifying field.
 - If no qualifying field is found after repeated attempts, check that a valid DAPI channel is present and contains measurable nuclear signal.
 
 #### 2.2 Change marker channel and colour
