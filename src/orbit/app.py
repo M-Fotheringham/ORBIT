@@ -1,4 +1,4 @@
-# Keep ORBIT's bundled font, artwork, and loading video in Nuitka builds.
+# Keep ORBIT's bundled font, artwork, and loading animations in Nuitka builds.
 # nuitka-project: --include-package-data=orbit
 
 import ctypes
@@ -123,8 +123,8 @@ def main():
     import_worker.loaded.connect(startup_controller.show_main_window)
     import_worker.failed.connect(startup_controller.handle_startup_failure)
 
-    # Give the popup one event-loop turn to paint before imports begin.
-    QTimer.singleShot(50, import_thread.start)
+    # The popup has already painted its first frame; begin imports immediately.
+    QTimer.singleShot(0, import_thread.start)
 
     exit_code = app.exec()
     if import_thread.isRunning():

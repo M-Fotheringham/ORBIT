@@ -1,31 +1,29 @@
-"""Video loading popup displayed while ORBIT imports its main viewer."""
+"""Instant animated loading popup shown while ORBIT imports its viewer."""
 
 import secrets
 
-from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QColor, QPainter
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtCore import QSettings, QSize, Qt
+from PySide6.QtGui import QColor, QMovie, QPainter
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QLabel,
     QProgressBar,
     QVBoxLayout,
 )
 
-from orbit.resources import LOADING_VIDEO, asset_path
+from orbit.resources import LOADING_ANIMATIONS, asset_path
 
 
 class StartupVideoSplash(QDialog):
-    """Compact, frameless startup window with randomized video playback."""
+    """Compact startup window using a seek-free randomized animation."""
 
-    PLAYER_WIDTH = 600
-    PLAYER_HEIGHT = 338
-    END_MARGIN_MS = 5_000
+    PLAYER_WIDTH = 480
+    PLAYER_HEIGHT = 270
+    SETTINGS_KEY = "startup/last_loading_animation"
 
     def __init__(self, icon=None, parent=None):
         super().__init__(parent)
-        self._random_seek_complete = False
 
         self.setWindowTitle("Starting ORBIT")
         self.setWindowFlags(
@@ -44,15 +42,23 @@ class StartupVideoSplash(QDialog):
             "color: #173b3f; font-size: 15px; padding: 2px 0 1px 0;"
         )
 
-        self.video_widget = QVideoWidget(self)
-        self.video_widget.setFixedSize(
+        self.animation_label = QLabel(self)
+        self.animation_label.setFixedSize(
             self.PLAYER_WIDTH,
             self.PLAYER_HEIGHT,
         )
-        self.video_widget.setAspectRatioMode(Qt.KeepAspectRatio)
-        self.video_widget.setStyleSheet(
+        self.animation_label.setAlignment(Qt.AlignCenter)
+        self.animation_label.setStyleSheet(
             "background: #071013; border: 1px solid #70bfc2;"
         )
+
+        animation_name = self._choose_animation()
+        self.movie = QMovie(str(asset_path(animation_name)), parent=self)
+        self.movie.setCacheMode(QMovie.CacheMode.CacheNone)
+        self.movie.setScaledSize(
+            QSize(self.PLAYER_WIDTH, self.PLAYER_HEIGHT)
+        )
+        self.animation_label.setMovie(self.movie)
 
         self.progress = QProgressBar(self)
         self.progress.setRange(0, 0)
@@ -71,19 +77,24 @@ class StartupVideoSplash(QDialog):
         layout.setContentsMargins(18, 14, 18, 14)
         layout.setSpacing(8)
         layout.addWidget(title)
-        layout.addWidget(self.video_widget, alignment=Qt.AlignCenter)
+        layout.addWidget(self.animation_label, alignment=Qt.AlignCenter)
         layout.addWidget(self.progress)
 
-        self.audio_output = QAudioOutput(self)
-        self.audio_output.setMuted(True)
-        self.player = QMediaPlayer(self)
-        self.player.setAudioOutput(self.audio_output)
-        self.player.setVideoOutput(self.video_widget)
-        self.player.setLoops(QMediaPlayer.Loops.Infinite)
-        self.player.durationChanged.connect(self._seek_to_random_start)
-        self.player.setSource(QUrl.fromLocalFile(str(asset_path(LOADING_VIDEO))))
-
         self.adjustSize()
+
+    @classmethod
+    def _choose_animation(cls):
+        """Choose a clip other than the one used on the previous launch."""
+        settings = QSettings("M-Fotheringham", "ORBIT")
+        last_index = settings.value(cls.SETTINGS_KEY, -1, type=int)
+        available = [
+            index
+            for index in range(len(LOADING_ANIMATIONS))
+            if index != last_index
+        ]
+        index = secrets.choice(available or [0])
+        settings.setValue(cls.SETTINGS_KEY, index)
+        return LOADING_ANIMATIONS[index]
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -95,26 +106,18 @@ class StartupVideoSplash(QDialog):
     def start(self):
         available = self.screen().availableGeometry()
         self.move(available.center() - self.rect().center())
+        # Decode and display the first frame before any heavier imports start.
+        self.movie.jumpToFrame(0)
         self.show()
         self.raise_()
         self.activateWindow()
-        self.player.play()
+        QApplication.processEvents()
+        self.movie.start()
+        QApplication.processEvents()
 
     def finish(self):
-        self.player.stop()
+        self.movie.stop()
         self.close()
-
-    def _seek_to_random_start(self, duration_ms):
-        if self._random_seek_complete or duration_ms <= 0:
-            return
-
-        latest_start = max(duration_ms - self.END_MARGIN_MS, 0)
-        position_ms = (
-            secrets.randbelow(latest_start + 1) if latest_start else 0
-        )
-        self._random_seek_complete = True
-        self.player.setPosition(position_ms)
-        self.player.play()
 
 
 __all__ = ["StartupVideoSplash"]

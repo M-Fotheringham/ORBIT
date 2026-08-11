@@ -8,7 +8,9 @@ from PySide6.QtGui import QFont, QFontDatabase
 ASSET_DIRECTORY = Path(__file__).resolve().parent / "assets"
 COSMIC_ALIEN_FONT = "ca.ttf"
 ALIEN_ASSISTANT_IMAGE = "burt_transparent.png"
-LOADING_VIDEO = "nhl_hits.mp4"
+LOADING_ANIMATIONS = tuple(
+    f"nhl_hits_{index:02d}.gif" for index in range(1, 7)
+)
 
 
 def asset_path(filename: str) -> Path:
