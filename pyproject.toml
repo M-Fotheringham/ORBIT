@@ -26,6 +26,7 @@ dependencies = [
 
 [project.scripts]
 orbit = "orbit.app:main"
+orbit-batch = "orbit.batch:main"
 
 [dependency-groups]
 build = [

@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QWidget, QPushButton, QLabel, QFileDialog, QVBoxLayout, QHBoxLayout,
     QComboBox, QCheckBox, QProgressBar, QSizePolicy, QLineEdit, QGroupBox,
     QFormLayout, QMessageBox, QMenuBar, QSlider, QStackedWidget, QScrollArea,
-    QToolTip,
+    QToolTip, QDialog, QDialogButtonBox, QListWidget, QListWidgetItem,
 )
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QAction, QActionGroup,
@@ -26,6 +26,7 @@ from orbit.fov import DEFAULT_MINIMUM_DAPI_FRACTION, RandomFOVGenerator
 from orbit.gui.alien_assistant import AlienAssistantWidget
 from orbit.gui.napari_canvas import NapariImageCanvas
 from orbit.models.random_forest import (
+    DEFAULT_POSITIVE_PROBABILITY_THRESHOLD,
     MODEL_FORMAT,
     MODEL_VERSION,
     RANDOM_FOREST_ALGORITHM,
@@ -54,10 +55,20 @@ from orbit.models.cellpose_segmentation import (
     cuda_compatible_gpu_available,
     dapi_channel_name,
     export_segmentation_outputs,
+    merge_fov_segmentation,
     membrane_marker_names,
     output_paths_for_image,
     segmentation_export_paths,
+    save_segmentation_outputs,
+    segment_fov_preview,
     segment_project_images,
+)
+from orbit.project import (
+    export_provenance,
+    load_project_document,
+    portable_reference,
+    resolve_reference,
+    write_provenance,
 )
 from orbit.threshold import (
     cell_statistics_by_threshold,
@@ -85,6 +96,9 @@ MAXIMUM_INWARD_BUFFER_SLIDER_VALUE = int(
 )
 CELL_PROBABILITY_HOVER_DELAY_MS = 2000
 OVERVIEW_MAXIMUM_SIZE = 768
+DEFAULT_MODEL_PROBABILITY_PERCENT = int(
+    DEFAULT_POSITIVE_PROBABILITY_THRESHOLD * 100
+)
 
 TOOL_GUIDANCE = {
     "cellpose_sam": (
@@ -388,6 +402,37 @@ class CellposeSegmentationWorker(QRunnable):
             self.signals.error.emit(traceback.format_exc())
 
 
+class CellposeFOVPreviewWorker(QRunnable):
+    """Segment only the displayed field on CPU for review before acceptance."""
+
+    def __init__(self, image_index, image, marker_names, y0, x0, height, width):
+        super().__init__()
+        self.image_index = int(image_index)
+        self.image = image
+        self.marker_names = list(marker_names)
+        self.y0, self.x0 = int(y0), int(x0)
+        self.height, self.width = int(height), int(width)
+        self.signals = SegmentationWorkerSignals()
+
+    def run(self):
+        try:
+            result = segment_fov_preview(
+                self.image,
+                self.marker_names,
+                self.y0,
+                self.x0,
+                self.height,
+                self.width,
+                pixel_size_um=self.image.get_pixel_size_um(
+                    default=DEFAULT_PIXEL_SIZE_UM
+                ),
+            )
+            result["image_index"] = self.image_index
+            self.signals.finished.emit(result)
+        except Exception:
+            self.signals.error.emit(traceback.format_exc())
+
+
 class CudaDetectionWorker(QRunnable):
     """Detect CUDA without delaying construction of the main window."""
 
@@ -545,6 +590,7 @@ class AutomatedPhenotypeWorker(QRunnable):
         manual_training,
         excluded_rows,
         random_seed,
+        decision_threshold=DEFAULT_POSITIVE_PROBABILITY_THRESHOLD,
     ):
         super().__init__()
         self.image_states = image_states
@@ -558,6 +604,7 @@ class AutomatedPhenotypeWorker(QRunnable):
         self.manual_training = manual_training
         self.excluded_rows = excluded_rows
         self.random_seed = random_seed
+        self.decision_threshold = float(decision_threshold)
         self.signals = ThresholdWorkerSignals()
 
     def run(self):
@@ -724,7 +771,8 @@ class AutomatedPhenotypeWorker(QRunnable):
                     pd.to_numeric, errors="coerce"
                 )
                 calls, probabilities = model_calls_and_positive_probabilities(
-                    initial_pipeline, measurements
+                    initial_pipeline, measurements,
+                    positive_probability_threshold=self.decision_threshold,
                 )
                 initial_calls.append(calls)
                 initial_positive_probabilities.append(probabilities)
@@ -775,7 +823,8 @@ class AutomatedPhenotypeWorker(QRunnable):
                     pd.to_numeric, errors="coerce"
                 )
                 calls, probabilities = model_calls_and_positive_probabilities(
-                    second_pipeline, measurements
+                    second_pipeline, measurements,
+                    positive_probability_threshold=self.decision_threshold,
                 )
                 second_calls.append(calls)
                 second_positive_probabilities.append(probabilities)
@@ -823,6 +872,8 @@ class AutomatedPhenotypeWorker(QRunnable):
                 "feature_columns": usable_features,
                 "algorithm": RANDOM_FOREST_ALGORITHM,
                 "training_samples": len(targets),
+                "decision_threshold": self.decision_threshold,
+                "feature_selection": "user",
                 "pipeline": pipeline,
                 "automated": {
                     "channel_name": self.channel_name,
@@ -865,7 +916,8 @@ class AutomatedPhenotypeWorker(QRunnable):
                 )
                 prediction, positive_probability = (
                     model_calls_and_positive_probabilities(
-                        pipeline, measurements
+                        pipeline, measurements,
+                        positive_probability_threshold=self.decision_threshold,
                     )
                 )
                 centroids = state["centroid_cache"]
@@ -923,9 +975,12 @@ class OrbitFOVViewer(QWidget):
         self.model_bundle = None
         self.active_tool = "automated"
         self.cellpose_worker = None
+        self.cellpose_preview_worker = None
+        self.cellpose_preview = None
         self.cuda_detection_worker = None
         self.cuda_gpu_available = None
         self.segmenting_selected_markers = set()
+        self.selected_feature_columns = []
         self.released_generated_segmentations = {}
         self.automated_worker = None
         self.automated_edit_mode = False
@@ -1103,8 +1158,19 @@ class OrbitFOVViewer(QWidget):
         self.model_status_label.setWordWrap(True)
         self.train_model_button = QPushButton("Train Model")
         self.train_model_button.clicked.connect(self.train_model)
+        self.feature_selection_button = QPushButton("Select Features…")
+        self.feature_selection_button.clicked.connect(self.select_model_features)
+        self.feature_selection_summary = QLabel("Features: all shared numeric columns")
+        self.feature_selection_summary.setWordWrap(True)
         self.apply_model_button = QPushButton("Apply to Loaded Images")
         self.apply_model_button.clicked.connect(self.apply_model)
+        self.model_probability_label = QLabel("Probability positive: ≥50%")
+        self.model_probability_slider = QSlider(Qt.Horizontal)
+        self.model_probability_slider.setRange(0, 100)
+        self.model_probability_slider.setValue(DEFAULT_MODEL_PROBABILITY_PERCENT)
+        self.model_probability_slider.valueChanged.connect(
+            self.model_probability_threshold_changed
+        )
         self.modelled_phenotypes_checkbox = QCheckBox(
             "Show Modelled Phenotypes"
         )
@@ -1131,8 +1197,12 @@ class OrbitFOVViewer(QWidget):
         model_panel.setMaximumWidth(300)
         model_layout = QVBoxLayout()
         model_layout.addWidget(self.model_status_label)
+        model_layout.addWidget(self.feature_selection_button)
+        model_layout.addWidget(self.feature_selection_summary)
         model_layout.addWidget(self.train_model_button)
         model_layout.addWidget(self.apply_model_button)
+        model_layout.addWidget(self.model_probability_label)
+        model_layout.addWidget(self.model_probability_slider)
         model_layout.addWidget(self.modelled_phenotypes_checkbox)
         model_layout.addWidget(self.model_positive_count_label)
         model_layout.addWidget(self.model_negative_count_label)
@@ -1168,12 +1238,12 @@ class OrbitFOVViewer(QWidget):
             self.threshold_slider_changed
         )
         self.threshold_intensity_histogram_label = QLabel(
-            "All-image mean fluorescence per cell"
+            "All-image log2(1 + mean fluorescence) per cell"
         )
         self.threshold_intensity_histogram_label.setWordWrap(True)
         self.threshold_intensity_histogram = CellHistogramWidget()
         self.threshold_intensity_histogram.setToolTip(
-            "Distribution of mean fluorescence intensity per segmented cell "
+            "Log2(1 + mean fluorescence intensity) per segmented cell "
             "for the selected channel and compartment across the entire "
             "current image. The orange line is the intensity threshold."
         )
@@ -1316,6 +1386,25 @@ class OrbitFOVViewer(QWidget):
         )
         self.automated_status_label = QLabel("Ready for automated phenotyping.")
         self.automated_status_label.setWordWrap(True)
+        self.automated_probability_label = QLabel("Probability positive: ≥50%")
+        self.automated_probability_slider = QSlider(Qt.Horizontal)
+        self.automated_probability_slider.setRange(0, 100)
+        self.automated_probability_slider.setValue(
+            DEFAULT_MODEL_PROBABILITY_PERCENT
+        )
+        self.automated_probability_slider.valueChanged.connect(
+            self.automated_probability_threshold_changed
+        )
+        self.automated_default_feature_selection_button = QPushButton(
+            "Select Features…"
+        )
+        self.automated_default_feature_selection_button.clicked.connect(
+            self.select_model_features
+        )
+        self.automated_default_feature_selection_summary = QLabel(
+            "Features: all shared numeric columns"
+        )
+        self.automated_default_feature_selection_summary.setWordWrap(True)
         self.automated_edit_button = QPushButton("Edit")
         self.automated_edit_button.clicked.connect(self.open_automated_edit)
         self.automated_modelled_checkbox = QCheckBox(
@@ -1334,6 +1423,14 @@ class OrbitFOVViewer(QWidget):
         automated_default_layout = QVBoxLayout()
         automated_default_layout.addWidget(self.auto_phenotype_button)
         automated_default_layout.addWidget(self.automated_status_label)
+        automated_default_layout.addWidget(
+            self.automated_default_feature_selection_button
+        )
+        automated_default_layout.addWidget(
+            self.automated_default_feature_selection_summary
+        )
+        automated_default_layout.addWidget(self.automated_probability_label)
+        automated_default_layout.addWidget(self.automated_probability_slider)
         automated_default_layout.addWidget(self.automated_edit_button)
         automated_default_layout.addWidget(self.automated_modelled_checkbox)
         automated_default_layout.addWidget(
@@ -1494,6 +1591,16 @@ class OrbitFOVViewer(QWidget):
             "Phenotype:", self.automated_phenotype_name
         )
         automated_training_layout.addLayout(automated_training_name_layout)
+        self.automated_feature_selection_button = QPushButton("Select Features…")
+        self.automated_feature_selection_button.clicked.connect(
+            self.select_model_features
+        )
+        self.automated_feature_selection_summary = QLabel(
+            "Features: all shared numeric columns"
+        )
+        self.automated_feature_selection_summary.setWordWrap(True)
+        automated_training_layout.addWidget(self.automated_feature_selection_button)
+        automated_training_layout.addWidget(self.automated_feature_selection_summary)
         automated_training_layout.addWidget(self.automated_positive_checkbox)
         automated_training_layout.addWidget(self.automated_negative_checkbox)
         automated_training_layout.addWidget(self.automated_positive_count_label)
@@ -1504,6 +1611,17 @@ class OrbitFOVViewer(QWidget):
 
         self.automated_edit_status_label = QLabel("Edit labels or thresholds.")
         self.automated_edit_status_label.setWordWrap(True)
+        self.automated_edit_probability_label = QLabel(
+            "Probability positive: ≥50%"
+        )
+        self.automated_edit_probability_slider = QSlider(Qt.Horizontal)
+        self.automated_edit_probability_slider.setRange(0, 100)
+        self.automated_edit_probability_slider.setValue(
+            DEFAULT_MODEL_PROBABILITY_PERCENT
+        )
+        self.automated_edit_probability_slider.valueChanged.connect(
+            self.automated_probability_threshold_changed
+        )
         self.automated_edit_modelled_checkbox = QCheckBox(
             "Show Modelled Phenotypes"
         )
@@ -1524,6 +1642,12 @@ class OrbitFOVViewer(QWidget):
         automated_edit_model_panel = QGroupBox("Random-Forest Model")
         automated_edit_model_layout = QVBoxLayout()
         automated_edit_model_layout.addWidget(self.automated_edit_status_label)
+        automated_edit_model_layout.addWidget(
+            self.automated_edit_probability_label
+        )
+        automated_edit_model_layout.addWidget(
+            self.automated_edit_probability_slider
+        )
         automated_edit_model_layout.addWidget(
             self.automated_edit_modelled_checkbox
         )
@@ -1579,7 +1703,26 @@ class OrbitFOVViewer(QWidget):
         self.segmenting_marker_scroll.setWidget(
             self.segmenting_marker_content
         )
-        self.segment_button = QPushButton("Segment")
+        self.preview_segment_button = QPushButton("Preview Current FOV (CPU)")
+        self.preview_segment_button.setToolTip(
+            "Segment only the displayed field on CPU and show the result without "
+            "changing project data."
+        )
+        self.preview_segment_button.clicked.connect(
+            self.start_cellpose_fov_preview
+        )
+        preview_decision_layout = QHBoxLayout()
+        self.accept_segment_preview_button = QPushButton("Accept Preview")
+        self.accept_segment_preview_button.clicked.connect(
+            self.accept_cellpose_fov_preview
+        )
+        self.discard_segment_preview_button = QPushButton("Discard")
+        self.discard_segment_preview_button.clicked.connect(
+            self.discard_cellpose_fov_preview
+        )
+        preview_decision_layout.addWidget(self.accept_segment_preview_button)
+        preview_decision_layout.addWidget(self.discard_segment_preview_button)
+        self.segment_button = QPushButton("Segment All Images (GPU)")
         self.segment_button.setToolTip(
             "Replace segmentation and cell-level measurements for every "
             "loaded image using the selected markers."
@@ -1607,6 +1750,8 @@ class OrbitFOVViewer(QWidget):
         segmenting_layout.addSpacing(6)
         segmenting_layout.addWidget(QLabel("Membrane-guiding markers:"))
         segmenting_layout.addWidget(self.segmenting_marker_scroll, stretch=1)
+        segmenting_layout.addWidget(self.preview_segment_button)
+        segmenting_layout.addLayout(preview_decision_layout)
         segmenting_layout.addWidget(self.segment_button)
         segmenting_layout.addWidget(self.segmenting_status_label)
         segmenting_layout.addStretch()
@@ -1995,8 +2140,8 @@ class OrbitFOVViewer(QWidget):
                 "color: #c62828; font-weight: bold;"
             )
             self.segmenting_status_label.setText(
-                "Segmentation options are disabled because Cellpose-SAM "
-                "requires a CUDA-compatible GPU."
+                "Whole-project segmentation is unavailable, but current-FOV "
+                "CPU preview and acceptance remain available."
             )
         self.update_segmentation_controls()
 
@@ -2090,11 +2235,13 @@ class OrbitFOVViewer(QWidget):
         self.update_segmentation_controls()
 
     def cellpose_marker_selection_changed(self, marker_name, checked):
+        self.cellpose_preview = None
         if checked:
             self.segmenting_selected_markers.add(marker_name)
         else:
             self.segmenting_selected_markers.discard(marker_name)
         self.update_segmentation_controls()
+        self.update_display()
 
     def update_segmentation_controls(self):
         if not hasattr(self, "segment_button"):
@@ -2108,6 +2255,27 @@ class OrbitFOVViewer(QWidget):
             and self.cellpose_worker is None
         )
         self.segment_button.setEnabled(ready)
+        preview_ready = (
+            bool(self.loaded_images)
+            and self.current_fov is not None
+            and bool(self.selected_cellpose_markers())
+            and not self.is_loading
+            and self.cellpose_worker is None
+            and self.cellpose_preview_worker is None
+        )
+        self.preview_segment_button.setEnabled(preview_ready)
+        preview_available = (
+            self.cellpose_preview is not None
+            and self.cellpose_preview.get("image_index") == self.current_image_index
+            and int(self.cellpose_preview.get("x0", -1)) == int(self.current_x0 or 0)
+            and int(self.cellpose_preview.get("y0", -1)) == int(self.current_y0 or 0)
+        )
+        self.accept_segment_preview_button.setEnabled(
+            preview_available and not self.is_loading
+        )
+        self.discard_segment_preview_button.setEnabled(
+            preview_available and not self.is_loading
+        )
         has_segmentation = any(
             state.get("cell_data") is not None
             and state.get("segmentation_masks") is not None
@@ -2119,11 +2287,159 @@ class OrbitFOVViewer(QWidget):
             and not self.is_loading
             and self.cellpose_worker is None
         )
-        self.segmenting_marker_scroll.setEnabled(
-            gpu_ready and not self.is_loading
-        )
+        marker_selection_ready = bool(self.loaded_images) and not self.is_loading
+        self.segmenting_marker_scroll.setEnabled(marker_selection_ready)
         for checkbox in self.segmenting_marker_checkboxes:
-            checkbox.setEnabled(gpu_ready and not self.is_loading)
+            checkbox.setEnabled(marker_selection_ready)
+
+    def start_cellpose_fov_preview(self):
+        marker_names = self.selected_cellpose_markers()
+        if self.current_fov is None or self.current_y0 is None:
+            QMessageBox.warning(
+                self, "Preview segmentation", "Generate a field of view first."
+            )
+            return
+        if not marker_names:
+            QMessageBox.warning(
+                self, "Preview segmentation", "Select at least one membrane marker."
+            )
+            return
+        self.cellpose_preview = None
+        height, width = self.current_fov.shape[:2]
+        worker = CellposeFOVPreviewWorker(
+            self.current_image_index,
+            self.img,
+            marker_names,
+            self.current_y0,
+            self.current_x0,
+            height,
+            width,
+        )
+        worker.signals.finished.connect(self.on_cellpose_fov_preview_finished)
+        worker.signals.error.connect(self.on_cellpose_fov_preview_error)
+        self.cellpose_preview_worker = worker
+        self.segmenting_status_label.setText(
+            "Segmenting the current FOV on CPU for preview…"
+        )
+        self.set_loading(True, "Previewing current-FOV segmentation on CPU…")
+        self.thread_pool.start(worker)
+
+    def on_cellpose_fov_preview_finished(self, preview):
+        self.cellpose_preview_worker = None
+        if (
+            preview.get("image_index") != self.current_image_index
+            or int(preview.get("x0", -1)) != int(self.current_x0)
+            or int(preview.get("y0", -1)) != int(self.current_y0)
+        ):
+            self.set_loading(False, "Segmentation preview discarded because the FOV changed.")
+            return
+        self.cellpose_preview = preview
+        self.segmentation_checkbox.setChecked(True)
+        self.segmentation_checkbox.setEnabled(True)
+        message = (
+            f"Preview: {preview['cell_count']:,} cells in the current FOV. "
+            "Accept to replace this region, or discard it."
+        )
+        self.segmenting_status_label.setText(message)
+        self.set_loading(False, message)
+        self.update_display()
+
+    def on_cellpose_fov_preview_error(self, error_message):
+        self.cellpose_preview_worker = None
+        self.cellpose_preview = None
+        self.segmenting_status_label.setText("Current-FOV CPU preview failed.")
+        self.set_loading(False, "Current-FOV CPU preview failed.")
+        QMessageBox.warning(self, "Could not preview segmentation", error_message)
+
+    def discard_cellpose_fov_preview(self):
+        self.cellpose_preview = None
+        self.segmenting_status_label.setText("Segmentation preview discarded.")
+        self.segmentation_checkbox.setEnabled(self.segmentation_masks is not None)
+        self.update_segmentation_controls()
+        self.update_display()
+
+    def accept_cellpose_fov_preview(self):
+        preview = self.cellpose_preview
+        if (
+            preview is None
+            or preview.get("image_index") != self.current_image_index
+            or int(preview.get("x0", -1)) != int(self.current_x0)
+            or int(preview.get("y0", -1)) != int(self.current_y0)
+        ):
+            return
+        released_handles = False
+        try:
+            _channels, image_height, image_width = self.img.get_shape()
+            merged_masks, merged_cells = merge_fov_segmentation(
+                preview=preview,
+                image_shape=(image_height, image_width),
+                existing_masks=self.segmentation_masks,
+                existing_cell_data=self.cell_data,
+            )
+            self._release_generated_mask_handles()
+            released_handles = True
+            cell_path, mask_path = save_segmentation_outputs(
+                self.image_path,
+                merged_masks,
+                merged_cells,
+                preview.get("marker_names", ()),
+                preview.get("nuclear_channel_name"),
+            )
+            self._restore_released_segmentations()
+            released_handles = False
+            cell_data, masks, cell_path, mask_path = self._read_segmentation(
+                cell_path, mask_path, self.img
+            )
+            state = self.loaded_images[self.current_image_index]
+            metadata = {
+                "marker_names": list(preview.get("marker_names", ())),
+                "nuclear_channel_name": preview.get("nuclear_channel_name"),
+                "model_name": preview.get("model_name", CELLPOSE_SAM_MODEL),
+                "scope": "accepted_current_fov_cpu",
+                "accepted_fov": {
+                    key: int(preview[key])
+                    for key in ("x0", "y0", "width", "height")
+                },
+                "compute_device": "cpu",
+            }
+            state.update({
+                "cell_data_path": cell_path,
+                "segmentation_mask_path": mask_path,
+                "cell_data": cell_data,
+                "segmentation_masks": masks,
+                "cellpose_metadata": metadata,
+                "annotations": {},
+                "centroid_cache": None,
+                "mask_label_row_cache": None,
+                "model_predictions": None,
+                "threshold_predictions": None,
+                "automated_exclusions": set(),
+            })
+            self.cell_data, self.segmentation_masks = cell_data, masks
+            self.cell_data_path, self.segmentation_mask_path = cell_path, mask_path
+            self.annotations = state["annotations"]
+            self.cellpose_preview = None
+            self.model_bundle = None
+            for other_state in self.loaded_images:
+                other_state["model_predictions"] = None
+            self.segmentation_checkbox.setChecked(True)
+            message = (
+                f"Accepted current-FOV CPU segmentation; the image now contains "
+                f"{len(cell_data):,} measured cells."
+            )
+            self.segmenting_status_label.setText(message)
+            self.status_label.setText(message)
+            self.update_annotation_counts()
+            self.update_model_prediction_counts()
+            self.update_threshold_prediction_counts()
+            self.update_segmentation_controls()
+            self.update_display()
+        except Exception:
+            if released_handles:
+                self._restore_released_segmentations()
+            QMessageBox.critical(
+                self, "Could not accept segmentation preview", traceback.format_exc()
+            )
 
     def export_cellpose_segmentation(self):
         """Export generated Cellpose tables and masks for all project images."""
@@ -2309,6 +2625,7 @@ class OrbitFOVViewer(QWidget):
             )
             return
 
+        self.cellpose_preview = None
         self._capture_current_image_state()
         self._release_generated_mask_handles()
         self.set_loading(
@@ -2370,6 +2687,10 @@ class OrbitFOVViewer(QWidget):
                         "model_name": result.get(
                             "model_name", CELLPOSE_SAM_MODEL
                         ),
+                        "compute_device": result.get(
+                            "compute_device", "cuda"
+                        ),
+                        "scope": result.get("scope", "whole_image"),
                     },
                     "annotations": {},
                     "centroid_cache": None,
@@ -2473,7 +2794,9 @@ class OrbitFOVViewer(QWidget):
 
     def _update_threshold_histogram_markers(self):
         self.threshold_intensity_histogram.set_marker(
-            self.threshold_intensity_value
+            None if self.threshold_intensity_value is None else np.log2(
+                1.0 + max(float(self.threshold_intensity_value), 0.0)
+            )
         )
         self.threshold_fraction_histogram.set_marker(
             self.threshold_percent_slider.value()
@@ -2584,12 +2907,17 @@ class OrbitFOVViewer(QWidget):
         denominator_pixels = np.asarray(result["denominator_pixels"])
         included = denominator_pixels > 0
         mean_intensities = np.asarray(result["mean_intensity"])[included]
+        log2_mean_intensities = np.log2(
+            1.0 + np.clip(mean_intensities.astype(float), 0.0, None)
+        )
         positive_percentages = (
             np.asarray(result["positive_fraction"])[included] * 100.0
         )
         self.threshold_intensity_histogram.set_data(
-            mean_intensities,
-            marker=self.threshold_intensity_value,
+            log2_mean_intensities,
+            marker=np.log2(
+                1.0 + max(float(self.threshold_intensity_value), 0.0)
+            ),
         )
         self.threshold_fraction_histogram.set_data(
             positive_percentages,
@@ -2598,7 +2926,7 @@ class OrbitFOVViewer(QWidget):
         )
         channel_name = result["channel_name"]
         self.threshold_intensity_histogram_label.setText(
-            f"All-image mean {channel_name} fluorescence per cell"
+            f"All-image log2(1 + mean {channel_name} fluorescence) per cell"
         )
         self.threshold_fraction_histogram_label.setText(
             "All-image positive-pixel percentages per cell"
@@ -2737,7 +3065,11 @@ class OrbitFOVViewer(QWidget):
             not loading and self.img is not None
         )
         self.segmentation_checkbox.setEnabled(
-            not loading and self.segmentation_masks is not None
+            not loading
+            and (
+                self.segmentation_masks is not None
+                or self.cellpose_preview is not None
+            )
         )
         self.update_training_navigation_controls()
         self.update_image_carousel_controls()
@@ -3700,10 +4032,141 @@ class OrbitFOVViewer(QWidget):
             if column in shared
         ]
 
+    def _training_feature_columns(self):
+        available = self._shared_numeric_features()
+        if not self.selected_feature_columns:
+            return available
+        selected = [
+            column for column in self.selected_feature_columns
+            if column in available
+        ]
+        if not selected:
+            raise ValueError(
+                "None of the selected features are shared by the loaded images."
+            )
+        return selected
+
+    def _update_feature_selection_summary(self):
+        if self.selected_feature_columns:
+            message = f"Features: {len(self.selected_feature_columns)} selected"
+        else:
+            message = "Features: all shared numeric columns"
+        for label_name in (
+            "feature_selection_summary",
+            "automated_feature_selection_summary",
+            "automated_default_feature_selection_summary",
+        ):
+            label = getattr(self, label_name, None)
+            if label is not None:
+                label.setText(message)
+
+    def select_model_features(self):
+        features = self._shared_numeric_features()
+        if not features:
+            QMessageBox.warning(
+                self, "Select features", "Load segmented cell data first."
+            )
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Random-forest features")
+        layout = QVBoxLayout(dialog)
+        guidance = QLabel(
+            "Choose the shared numeric columns used to train and apply the model."
+        )
+        guidance.setWordWrap(True)
+        layout.addWidget(guidance)
+        feature_list = QListWidget()
+        feature_list.setMinimumSize(420, 360)
+        checked = set(self.selected_feature_columns or features)
+        for feature in features:
+            item = QListWidgetItem(str(feature))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.Checked if feature in checked else Qt.Unchecked
+            )
+            feature_list.addItem(item)
+        layout.addWidget(feature_list)
+        controls = QHBoxLayout()
+        select_all = QPushButton("Select All")
+        clear_all = QPushButton("Clear")
+        select_all.clicked.connect(
+            lambda: [
+                feature_list.item(index).setCheckState(Qt.Checked)
+                for index in range(feature_list.count())
+            ]
+        )
+        clear_all.clicked.connect(
+            lambda: [
+                feature_list.item(index).setCheckState(Qt.Unchecked)
+                for index in range(feature_list.count())
+            ]
+        )
+        controls.addWidget(select_all)
+        controls.addWidget(clear_all)
+        controls.addStretch()
+        layout.addLayout(controls)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        selected = [
+            feature_list.item(index).text()
+            for index in range(feature_list.count())
+            if feature_list.item(index).checkState() == Qt.Checked
+        ]
+        if not selected:
+            QMessageBox.warning(
+                self, "Select features", "Select at least one feature."
+            )
+            return
+        self.selected_feature_columns = selected
+        self._update_feature_selection_summary()
+
+    def _set_probability_threshold_percent(self, value):
+        value = int(np.clip(value, 0, 100))
+        for slider_name in (
+            "model_probability_slider",
+            "automated_probability_slider",
+            "automated_edit_probability_slider",
+        ):
+            slider = getattr(self, slider_name, None)
+            if slider is not None and slider.value() != value:
+                slider.blockSignals(True)
+                slider.setValue(value)
+                slider.blockSignals(False)
+        label_text = f"Probability positive: ≥{value}%"
+        for label_name in (
+            "model_probability_label",
+            "automated_probability_label",
+            "automated_edit_probability_label",
+        ):
+            label = getattr(self, label_name, None)
+            if label is not None:
+                label.setText(label_text)
+        if self.model_bundle is not None:
+            self.model_bundle["decision_threshold"] = value / 100.0
+        for state in self.loaded_images:
+            predictions = state.get("model_predictions")
+            if predictions is not None and "positive_probability" in predictions:
+                predictions["positive"] = (
+                    np.asarray(predictions["positive_probability"], dtype=float)
+                    >= value / 100.0
+                )
+        self.update_model_prediction_counts()
+        self.update_display()
+
+    def model_probability_threshold_changed(self, value):
+        self._set_probability_threshold_percent(value)
+
+    def automated_probability_threshold_changed(self, value):
+        self._set_probability_threshold_percent(value)
+
     def train_model(self):
         self.cancel_cell_probability_hover()
         try:
-            features = self._shared_numeric_features()
+            features = self._training_feature_columns()
             if not features:
                 raise ValueError(
                     "No shared numeric measurement columns were found across "
@@ -3739,6 +4202,10 @@ class OrbitFOVViewer(QWidget):
                 "feature_columns": features,
                 "algorithm": RANDOM_FOREST_ALGORITHM,
                 "training_samples": len(targets),
+                "decision_threshold": (
+                    self.model_probability_slider.value() / 100.0
+                ),
+                "feature_selection": "user" if self.selected_feature_columns else "all_shared_numeric",
                 "pipeline": pipeline,
             }
             for state in self.loaded_images:
@@ -3784,7 +4251,10 @@ class OrbitFOVViewer(QWidget):
             for state, measurements, centroids in prepared:
                 prediction, positive_probability = (
                     model_calls_and_positive_probabilities(
-                        self.model_bundle["pipeline"], measurements
+                        self.model_bundle["pipeline"], measurements,
+                        positive_probability_threshold=(
+                            self.model_probability_slider.value() / 100.0
+                        ),
                     )
                 )
                 state["model_predictions"] = {
@@ -3875,6 +4345,10 @@ class OrbitFOVViewer(QWidget):
         self.train_model_button.setEnabled(
             has_both_labels and all_have_cell_data and not self.is_loading
         )
+        self.feature_selection_button.setEnabled(
+            all_have_cell_data and not self.is_loading
+        )
+        self.model_probability_slider.setEnabled(not self.is_loading)
         self.apply_model_button.setEnabled(
             self.model_bundle is not None
             and all_have_cell_data
@@ -4004,7 +4478,7 @@ class OrbitFOVViewer(QWidget):
         ):
             self._update_threshold_value(invalidate=True)
         try:
-            features = self._shared_numeric_features()
+            features = self._training_feature_columns()
             if not features:
                 raise ValueError(
                     "No shared numeric measurement columns were found across "
@@ -4060,6 +4534,9 @@ class OrbitFOVViewer(QWidget):
             manual_training=manual_training,
             excluded_rows=excluded_rows,
             random_seed=random_seed,
+            decision_threshold=(
+                self.automated_probability_slider.value() / 100.0
+            ),
         )
         worker.signals.finished.connect(self.on_automated_phenotyping_finished)
         worker.signals.error.connect(self.on_automated_phenotyping_error)
@@ -4178,8 +4655,14 @@ class OrbitFOVViewer(QWidget):
             self.automated_positive_checkbox,
             self.automated_negative_checkbox,
             self.automated_phenotype_name,
+            self.automated_feature_selection_button,
+            self.automated_edit_probability_slider,
         ):
             widget.setEnabled(editable)
+        self.automated_probability_slider.setEnabled(not self.is_loading)
+        self.automated_default_feature_selection_button.setEnabled(
+            all_have_segmentation and not self.is_loading
+        )
         self.automated_buffer_slider.setEnabled(
             editable
             and (
@@ -4438,7 +4921,10 @@ class OrbitFOVViewer(QWidget):
                 )
                 return
             prediction_key = "model_predictions"
-            prediction_source = "Model"
+            prediction_source = (
+                "Automated Random Forest"
+                if self.active_tool == "automated" else "Random Forest"
+            )
             features = list(self.model_bundle["feature_columns"])
             phenotype_name = (
                 self.phenotype_name.text().strip()
@@ -4501,8 +4987,25 @@ class OrbitFOVViewer(QWidget):
         source_column = self._unique_export_column(
             "Label Source", seen_columns
         )
+        seen_columns.add(source_column)
+        probability_column = self._unique_export_column(
+            f"{phenotype_name} Positive Probability", seen_columns
+        )
+        seen_columns.add(probability_column)
+        fraction_column = self._unique_export_column(
+            "Positive Pixel Fraction", seen_columns
+        )
+        seen_columns.add(fraction_column)
+        decision_column = self._unique_export_column(
+            "Positive Probability Threshold", seen_columns
+        )
+        seen_columns.add(decision_column)
+        provenance_method_column = self._unique_export_column(
+            "ORBIT Phenotyping Method", seen_columns
+        )
         temporary_path = Path(f"{path}.tmp")
         exported_rows = 0
+        provenance_images = []
 
         try:
             for image_index, state in enumerate(self.loaded_images):
@@ -4549,6 +5052,35 @@ class OrbitFOVViewer(QWidget):
                         label_sources[row_index] = "Manual Training"
                 export_data[label_column] = labels
                 export_data[source_column] = label_sources
+                export_data[probability_column] = (
+                    np.asarray(predictions["positive_probability"], dtype=float)
+                    if "positive_probability" in predictions
+                    else np.full(len(cell_data), np.nan)
+                )
+                threshold_predictions = (
+                    predictions if threshold_export
+                    else state.get("threshold_predictions")
+                )
+                export_data[fraction_column] = (
+                    np.asarray(
+                        threshold_predictions["positive_fraction"], dtype=float
+                    )
+                    if threshold_predictions is not None
+                    and "positive_fraction" in threshold_predictions
+                    else np.full(len(cell_data), np.nan)
+                )
+                decision_threshold = (
+                    None if threshold_export else float(
+                        self.model_bundle.get(
+                            "decision_threshold",
+                            self.model_probability_slider.value() / 100.0,
+                        )
+                    )
+                )
+                export_data[decision_column] = (
+                    np.nan if decision_threshold is None else decision_threshold
+                )
+                export_data[provenance_method_column] = prediction_source
 
                 export_data.to_csv(
                     temporary_path,
@@ -4558,10 +5090,49 @@ class OrbitFOVViewer(QWidget):
                     header=image_index == 0,
                 )
                 exported_rows += len(export_data)
+                provenance_images.append({
+                    "image_name": Path(state["image_path"]).name,
+                    "image_path": state["image_path"],
+                    "cell_data_path": state.get("cell_data_path"),
+                    "segmentation_mask_path": state.get(
+                        "segmentation_mask_path"
+                    ),
+                    "cell_count": len(cell_data),
+                    "segmentation": state.get("cellpose_metadata"),
+                })
 
             temporary_path.replace(Path(path))
+            threshold_settings = {}
+            if threshold_export:
+                first_prediction = self.loaded_images[0][prediction_key]
+                threshold_settings = {
+                    key: first_prediction.get(key)
+                    for key in (
+                        "channel_name", "intensity_threshold",
+                        "positive_pixel_fraction", "compartment",
+                        "inward_buffer_pixels",
+                    )
+                }
+            provenance = export_provenance(
+                method=prediction_source.lower().replace(" ", "_"),
+                phenotype_name=phenotype_name,
+                decision_threshold=(
+                    None if threshold_export else float(
+                        self.model_bundle.get(
+                            "decision_threshold",
+                            self.model_probability_slider.value() / 100.0,
+                        )
+                    )
+                ),
+                feature_columns=features,
+                images=provenance_images,
+                model_bundle=None if threshold_export else self.model_bundle,
+                settings=threshold_settings,
+            )
+            provenance_path = write_provenance(path, provenance)
             self.status_label.setText(
-                f"Exported {exported_rows:,} cells to {Path(path).resolve()}"
+                f"Exported {exported_rows:,} cells and provenance to "
+                f"{Path(path).resolve()} and {provenance_path.name}"
             )
         except Exception as error:
             try:
@@ -4611,6 +5182,13 @@ class OrbitFOVViewer(QWidget):
             ):
                 raise ValueError("The ORBIT model file is incomplete.")
             self.model_bundle = bundle
+            self.selected_feature_columns = list(bundle["feature_columns"])
+            self._update_feature_selection_summary()
+            self._set_probability_threshold_percent(int(round(
+                100 * float(bundle.get(
+                    "decision_threshold", DEFAULT_POSITIVE_PROBABILITY_THRESHOLD
+                ))
+            )))
             for state in self.loaded_images:
                 state["model_predictions"] = None
             if not self.phenotype_name.text().strip():
@@ -4655,10 +5233,17 @@ class OrbitFOVViewer(QWidget):
         self.annotations = {}
         self.model_bundle = None
         self.cellpose_worker = None
+        self.cellpose_preview_worker = None
+        self.cellpose_preview = None
         self.fov_worker = None
         self.overview_worker = None
         self.overview_request_id += 1
         self.segmenting_selected_markers = set()
+        self.selected_feature_columns = []
+        self._update_feature_selection_summary()
+        self._set_probability_threshold_percent(
+            DEFAULT_MODEL_PROBABILITY_PERCENT
+        )
         self.released_generated_segmentations = {}
         self.automated_edit_mode = False
         self.threshold_intensity_value = None
@@ -4695,7 +5280,7 @@ class OrbitFOVViewer(QWidget):
         self.threshold_mask_button.blockSignals(False)
         self.threshold_intensity_label.setText("Intensity threshold: —")
         self.threshold_intensity_histogram_label.setText(
-            "All-image mean fluorescence per cell"
+            "All-image log2(1 + mean fluorescence) per cell"
         )
         self.threshold_fraction_histogram_label.setText(
             "All-image positive-pixel percentages per cell"
@@ -4742,8 +5327,8 @@ class OrbitFOVViewer(QWidget):
         self.refresh_cellpose_marker_list()
         if self.cuda_gpu_available is False:
             self.segmenting_status_label.setText(
-                "Segmentation options are disabled because Cellpose-SAM "
-                "requires a CUDA-compatible GPU."
+                "Whole-project GPU segmentation is unavailable. Current-FOV "
+                "CPU preview remains available after an image and FOV are loaded."
             )
         else:
             self.segmenting_status_label.setText(
@@ -4761,17 +5346,24 @@ class OrbitFOVViewer(QWidget):
             "New project ready. Add a TIFF/QPTIFF or OME-Zarr image to begin.",
         )
 
-    def project_data(self):
+    def project_data(self, project_path=None):
         if not self.loaded_images:
             raise ValueError("Load an image before saving a project.")
         self._capture_current_image_state()
         images = []
         for state in self.loaded_images:
+            def project_reference(value):
+                return (
+                    portable_reference(value, project_path)
+                    if project_path is not None else value
+                )
             images.append({
                 "paths": {
-                    "image": state["image_path"],
-                    "cell_data": state["cell_data_path"],
-                    "segmentation_mask": state["segmentation_mask_path"],
+                    "image": project_reference(state["image_path"]),
+                    "cell_data": project_reference(state["cell_data_path"]),
+                    "segmentation_mask": project_reference(
+                        state["segmentation_mask_path"]
+                    ),
                 },
                 "annotations": list(state["annotations"].values()),
                 "automated_exclusions": sorted(
@@ -4793,13 +5385,18 @@ class OrbitFOVViewer(QWidget):
             })
         return {
             "format": "ORBIT phenotype training session",
-            "version": 4,
+            "version": 5,
+            "path_mode": "project_relative",
             "images": images,
             "current_image_index": self.current_image_index,
             "phenotype": {
                 "name": self.phenotype_name.text(),
                 "show_positive": self.positive_annotations_checkbox.isChecked(),
                 "show_negative": self.negative_annotations_checkbox.isChecked(),
+                "feature_columns": list(self.selected_feature_columns),
+                "positive_probability_percent": (
+                    self.model_probability_slider.value()
+                ),
             },
             "viewer": {
                 "fov_size": self.fov_size,
@@ -4859,7 +5456,7 @@ class OrbitFOVViewer(QWidget):
     def _write_project(self, path):
         try:
             with open(path, "w", encoding="utf-8") as project_file:
-                json.dump(self.project_data(), project_file, indent=2)
+                json.dump(self.project_data(project_path=path), project_file, indent=2)
             self.project_path = str(Path(path).resolve())
             self.status_label.setText(f"Saved project: {self.project_path}")
         except Exception:
@@ -4874,12 +5471,9 @@ class OrbitFOVViewer(QWidget):
 
         self.set_loading(True, "Opening project...")
         try:
-            with open(path, "r", encoding="utf-8") as project_file:
-                data = json.load(project_file)
-            if data.get("format") != "ORBIT phenotype training session":
-                raise ValueError("The selected file is not an ORBIT training session.")
+            data = load_project_document(path)
             version = data.get("version")
-            if version not in {1, 2, 3, 4}:
+            if version not in {1, 2, 3, 4, 5}:
                 raise ValueError(f"Unsupported ORBIT project version: {data.get('version')}")
             phenotype = data.get("phenotype", {})
             viewer = data.get("viewer", {})
@@ -4906,9 +5500,9 @@ class OrbitFOVViewer(QWidget):
                 if not paths.get("image"):
                     raise ValueError("A project image is missing its image path.")
                 state = self._create_image_state(
-                    paths["image"],
-                    paths.get("cell_data"),
-                    paths.get("segmentation_mask"),
+                    resolve_reference(paths["image"], path),
+                    resolve_reference(paths.get("cell_data"), path),
+                    resolve_reference(paths.get("segmentation_mask"), path),
                 )
                 state["annotations"] = {
                     str(annotation["cell_id"]): annotation
@@ -4957,6 +5551,18 @@ class OrbitFOVViewer(QWidget):
             self.model_status_label.setText("No model trained or loaded.")
             self.fov_size = int(viewer.get("fov_size", 512))
             self.phenotype_name.setText(phenotype.get("name", ""))
+            self.selected_feature_columns = [
+                str(column) for column in phenotype.get("feature_columns", [])
+            ]
+            self._update_feature_selection_summary()
+            self._set_probability_threshold_percent(
+                int(
+                    phenotype.get(
+                        "positive_probability_percent",
+                        DEFAULT_MODEL_PROBABILITY_PERCENT,
+                    )
+                )
+            )
             threshold_settings = viewer.get("threshold", {})
             self.threshold_intensity_slider.blockSignals(True)
             self.threshold_intensity_slider.setValue(
@@ -5095,6 +5701,12 @@ class OrbitFOVViewer(QWidget):
 
     def on_fov_loaded(self, result):
         self.fov_worker = None
+        if self.cellpose_preview is not None and (
+            self.cellpose_preview.get("image_index") != self.current_image_index
+            or int(self.cellpose_preview.get("x0", -1)) != int(result["x0"])
+            or int(self.cellpose_preview.get("y0", -1)) != int(result["y0"])
+        ):
+            self.cellpose_preview = None
         self.current_y0 = int(result["y0"])
         self.current_x0 = int(result["x0"])
         self.current_fov = result["marker_fov"]
@@ -5129,6 +5741,16 @@ class OrbitFOVViewer(QWidget):
         self.status_label.setText(error_message)
 
     def current_segmentation_boundary(self):
+        preview = self.cellpose_preview
+        if (
+            preview is not None
+            and preview.get("image_index") == self.current_image_index
+            and int(preview.get("x0", -1)) == int(self.current_x0)
+            and int(preview.get("y0", -1)) == int(self.current_y0)
+        ):
+            return find_boundaries(
+                np.asarray(preview["masks"]), connectivity=1, mode="inner"
+            )
         if self.segmentation_masks is None or self.current_y0 is None:
             return None
         y0, x0 = int(self.current_y0), int(self.current_x0)
