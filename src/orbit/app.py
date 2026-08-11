@@ -1,4 +1,4 @@
-# Keep ORBIT's bundled font, artwork, and loading animations in Nuitka builds.
+# Keep ORBIT's bundled font, artwork, and loading images in Nuitka builds.
 # nuitka-project: --include-package-data=orbit
 
 import ctypes
@@ -10,7 +10,7 @@ from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from orbit.gui.startup_splash import StartupVideoSplash
+from orbit.gui.startup_splash import StartupSplash
 from orbit.resources import install_cosmic_alien_font
 
 
@@ -33,7 +33,7 @@ def find_icon_path():
 
 
 class ViewerImportWorker(QObject):
-    """Import the heavyweight viewer while the startup video remains active."""
+    """Import the heavyweight viewer while the startup splash remains active."""
 
     loaded = Signal(object)
     failed = Signal(str)
@@ -108,7 +108,7 @@ def main():
         app.setWindowIcon(QIcon(str(icon_path)))
 
     icon = QIcon(str(icon_path)) if icon_path is not None else QIcon()
-    splash = StartupVideoSplash(icon=icon)
+    splash = StartupSplash(icon=icon)
     splash.start()
 
     import_thread = QThread()
@@ -123,7 +123,7 @@ def main():
     import_worker.loaded.connect(startup_controller.show_main_window)
     import_worker.failed.connect(startup_controller.handle_startup_failure)
 
-    # The popup has already painted its first frame; begin imports immediately.
+    # The popup has already painted its selected image; begin imports immediately.
     QTimer.singleShot(0, import_thread.start)
 
     exit_code = app.exec()

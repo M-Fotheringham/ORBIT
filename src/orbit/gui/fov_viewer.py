@@ -993,9 +993,6 @@ class OrbitFOVViewer(QWidget):
         self.generate_button = QPushButton("Generate FOV")
         self.generate_button.clicked.connect(self.generate_fov)
         self.generate_button.setEnabled(False)
-        self.regenerate_button = QPushButton("Regenerate")
-        self.regenerate_button.clicked.connect(self.generate_fov)
-        self.regenerate_button.setEnabled(False)
 
         self.channel_dropdown = QComboBox()
         self.channel_dropdown.currentIndexChanged.connect(self.on_channel_changed)
@@ -1631,7 +1628,7 @@ class OrbitFOVViewer(QWidget):
         toolbar = QHBoxLayout()
         for widget in (
             self.open_button, self.load_segmentation_button,
-            self.generate_button, self.regenerate_button,
+            self.generate_button,
         ):
             toolbar.addWidget(widget)
         toolbar.addSpacing(20)
@@ -2733,7 +2730,6 @@ class OrbitFOVViewer(QWidget):
         self.open_button.setEnabled(not loading)
         self.load_segmentation_button.setEnabled(not loading and self.img is not None)
         self.generate_button.setEnabled(not loading and self.img is not None)
-        self.regenerate_button.setEnabled(not loading and self.current_y0 is not None)
         self.channel_dropdown.setEnabled(not loading and self.img is not None)
         self.color_dropdown.setEnabled(not loading and self.img is not None)
         self.dapi_checkbox.setEnabled(not loading and self.img is not None)
@@ -5105,7 +5101,6 @@ class OrbitFOVViewer(QWidget):
         self.current_dapi_fov = result["dapi_fov"]
         self._capture_current_image_state()
         self.set_loading(False)
-        self.regenerate_button.setEnabled(True)
         threshold_edit = (
             self.active_tool == "automated" and self.automated_edit_mode
         )
