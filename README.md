@@ -116,7 +116,6 @@ ORBIT was designed to read [CellPose](https://github.com/mouseland/cellpose) seg
 6. Review calls, correct labels where appropriate, and apply the result to all loaded images.
 7. Save the project and export the model and/or cell phenotype table.
 
-## User guide
 
 # User Guide
 
