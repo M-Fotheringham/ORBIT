@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_dynamic_libs
 from PyInstaller.utils.hooks import collect_all
 from PyInstaller.utils.hooks import copy_metadata
 
@@ -7,9 +8,13 @@ datas = [('docs/figs/icon_logo.ico', 'docs/figs')]
 binaries = []
 hiddenimports = []
 datas += collect_data_files('orbit')
+datas += copy_metadata('torch')
+datas += copy_metadata('torchvision')
 datas += copy_metadata('cellpose')
 datas += copy_metadata('napari')
 datas += copy_metadata('npe2')
+binaries += collect_dynamic_libs('torch')
+binaries += collect_dynamic_libs('torchvision')
 tmp_ret = collect_all('cellpose')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('napari')
@@ -44,7 +49,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -59,7 +64,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='ORBIT',
 )
