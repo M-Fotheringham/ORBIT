@@ -52,6 +52,8 @@ from orbit.models.automated import (
 )
 from orbit.models.cellpose_segmentation import (
     CELLPOSE_SAM_MODEL,
+    DEFAULT_SEGMENTATION_FOV_OVERLAP,
+    DEFAULT_SEGMENTATION_FOV_SIZE,
     cuda_compatible_gpu_available,
     dapi_channel_name,
     export_segmentation_outputs,
@@ -375,18 +377,27 @@ class OverviewLoadWorker(QRunnable):
 
 class SegmentationWorkerSignals(QObject):
     finished = Signal(object)
-    progress = Signal(str)
+    progress = Signal(object)
     error = Signal(str)
 
 
 class CellposeSegmentationWorker(QRunnable):
     """Run Cellpose-SAM across all loaded images away from the UI thread."""
 
-    def __init__(self, images, marker_names, pixel_size_um):
+    def __init__(
+        self,
+        images,
+        marker_names,
+        pixel_size_um,
+        fov_size,
+        dapi_positive_only,
+    ):
         super().__init__()
         self.images = list(images)
         self.marker_names = list(marker_names)
         self.pixel_size_um = float(pixel_size_um)
+        self.fov_size = int(fov_size)
+        self.dapi_positive_only = bool(dapi_positive_only)
         self.signals = SegmentationWorkerSignals()
 
     def run(self):
@@ -396,6 +407,10 @@ class CellposeSegmentationWorker(QRunnable):
                 self.marker_names,
                 pixel_size_um=self.pixel_size_um,
                 progress_callback=self.signals.progress.emit,
+                fov_size=self.fov_size,
+                fov_overlap=DEFAULT_SEGMENTATION_FOV_OVERLAP,
+                dapi_positive_only=self.dapi_positive_only,
+                minimum_dapi_fraction=DEFAULT_MINIMUM_DAPI_FRACTION,
             )
             self.signals.finished.emit(results)
         except Exception:
@@ -1037,7 +1052,8 @@ class OrbitFOVViewer(QWidget):
         self.spinner = QProgressBar()
         self.spinner.setRange(0, 0)
         self.spinner.setTextVisible(False)
-        self.spinner.setMaximumHeight(8)
+        self.spinner.setMinimumHeight(18)
+        self.spinner.setMaximumHeight(20)
         self.spinner.hide()
 
         self.open_button = QPushButton("Add Image")
@@ -1690,6 +1706,15 @@ class OrbitFOVViewer(QWidget):
             "DAPI will be supplied as the nuclear channel when available."
         )
         self.segmenting_dapi_label.setWordWrap(True)
+        self.segment_dapi_positive_fovs_checkbox = QCheckBox(
+            "Only segment DAPI-positive FOVs"
+        )
+        self.segment_dapi_positive_fovs_checkbox.setChecked(True)
+        self.segment_dapi_positive_fovs_checkbox.setToolTip(
+            "Use the same DAPI field-selection rule as Generate FOV: retain "
+            f"tiles with at least {DEFAULT_MINIMUM_DAPI_FRACTION:.0%} "
+            "DAPI-positive pixels. Images without DAPI use all tiles."
+        )
         self.segmenting_marker_content = QWidget()
         self.segmenting_marker_layout = QVBoxLayout(
             self.segmenting_marker_content
@@ -1722,10 +1747,11 @@ class OrbitFOVViewer(QWidget):
         )
         preview_decision_layout.addWidget(self.accept_segment_preview_button)
         preview_decision_layout.addWidget(self.discard_segment_preview_button)
-        self.segment_button = QPushButton("Segment All Images (GPU)")
+        self.segment_button = QPushButton("Segment All Images (Tiled GPU)")
         self.segment_button.setToolTip(
             "Replace segmentation and cell-level measurements for every "
-            "loaded image using the selected markers."
+            "loaded image using 20%-overlapping FOVs and AstroPath-style "
+            "primary-region stitching."
         )
         self.segment_button.clicked.connect(self.start_cellpose_segmentation)
         self.segmenting_status_label = QLabel(
@@ -1747,6 +1773,7 @@ class OrbitFOVViewer(QWidget):
         segmenting_layout.addWidget(self.segmenting_gpu_status_label)
         segmenting_layout.addSpacing(6)
         segmenting_layout.addWidget(self.segmenting_dapi_label)
+        segmenting_layout.addWidget(self.segment_dapi_positive_fovs_checkbox)
         segmenting_layout.addSpacing(6)
         segmenting_layout.addWidget(QLabel("Membrane-guiding markers:"))
         segmenting_layout.addWidget(self.segmenting_marker_scroll, stretch=1)
@@ -2291,6 +2318,11 @@ class OrbitFOVViewer(QWidget):
         self.segmenting_marker_scroll.setEnabled(marker_selection_ready)
         for checkbox in self.segmenting_marker_checkboxes:
             checkbox.setEnabled(marker_selection_ready)
+        self.segment_dapi_positive_fovs_checkbox.setEnabled(
+            bool(self.loaded_images)
+            and not self.is_loading
+            and self.cellpose_worker is None
+        )
 
     def start_cellpose_fov_preview(self):
         marker_names = self.selected_cellpose_markers()
@@ -2632,13 +2664,19 @@ class OrbitFOVViewer(QWidget):
             True,
             f"Loading Cellpose-SAM model {CELLPOSE_SAM_MODEL}...",
         )
+        self._prepare_cellpose_progress()
         self.segmenting_status_label.setText(
-            "Segmentation is running. The model may be downloaded on first use."
+            "Planning 20%-overlapping FOVs. The model may be downloaded on "
+            "first use."
         )
         worker = CellposeSegmentationWorker(
             images=[state["img"] for state in self.loaded_images],
             marker_names=marker_names,
             pixel_size_um=DEFAULT_PIXEL_SIZE_UM,
+            fov_size=self.fov_size or DEFAULT_SEGMENTATION_FOV_SIZE,
+            dapi_positive_only=(
+                self.segment_dapi_positive_fovs_checkbox.isChecked()
+            ),
         )
         worker.signals.progress.connect(self.on_cellpose_segmentation_progress)
         worker.signals.finished.connect(self.on_cellpose_segmentation_finished)
@@ -2646,7 +2684,34 @@ class OrbitFOVViewer(QWidget):
         self.cellpose_worker = worker
         self.thread_pool.start(worker)
 
-    def on_cellpose_segmentation_progress(self, message):
+    def _prepare_cellpose_progress(self):
+        self.spinner.setRange(0, 0)
+        self.spinner.setTextVisible(True)
+        self.spinner.setFormat("Preparing tiled segmentation…")
+        self.spinner.show()
+
+    def _reset_cellpose_progress(self):
+        self.spinner.setRange(0, 0)
+        self.spinner.setValue(0)
+        self.spinner.setTextVisible(False)
+        self.spinner.setFormat("%p%")
+
+    def on_cellpose_segmentation_progress(self, progress):
+        if isinstance(progress, dict):
+            message = str(progress.get("message", "Segmenting…"))
+            current = progress.get("current")
+            total = progress.get("total")
+            if current is not None and total is not None and int(total) > 0:
+                self.spinner.setRange(0, int(total))
+                self.spinner.setValue(min(int(current), int(total)))
+                self.spinner.setFormat(f"{message} — %p%")
+            else:
+                self.spinner.setRange(0, 0)
+                self.spinner.setFormat(message)
+        else:
+            message = str(progress)
+            self.spinner.setRange(0, 0)
+            self.spinner.setFormat(message)
         self.status_label.setText(message)
         self.segmenting_status_label.setText(message)
 
@@ -2690,7 +2755,24 @@ class OrbitFOVViewer(QWidget):
                         "compute_device": result.get(
                             "compute_device", "cuda"
                         ),
-                        "scope": result.get("scope", "whole_image"),
+                        "scope": result.get("scope", "tiled_whole_image"),
+                        "fov_size": result.get("fov_size"),
+                        "fov_overlap": result.get("fov_overlap"),
+                        "candidate_fov_count": result.get(
+                            "candidate_fov_count"
+                        ),
+                        "selected_fov_count": result.get(
+                            "selected_fov_count"
+                        ),
+                        "dapi_positive_only": result.get(
+                            "dapi_positive_only"
+                        ),
+                        "minimum_dapi_fraction": result.get(
+                            "minimum_dapi_fraction"
+                        ),
+                        "stitching_method": result.get(
+                            "stitching_method"
+                        ),
                     },
                     "annotations": {},
                     "centroid_cache": None,
@@ -2725,6 +2807,7 @@ class OrbitFOVViewer(QWidget):
             )
             self.segmenting_status_label.setText(message)
             self.cellpose_worker = None
+            self._reset_cellpose_progress()
             self.set_loading(False, message)
             self.update_display()
         except Exception:
@@ -2734,6 +2817,7 @@ class OrbitFOVViewer(QWidget):
         self._restore_released_segmentations()
         self.cellpose_worker = None
         self.segmenting_status_label.setText("Cellpose-SAM segmentation failed.")
+        self._reset_cellpose_progress()
         self.set_loading(False, "Cellpose-SAM segmentation failed.")
         self.update_display()
         QMessageBox.warning(
@@ -5409,6 +5493,10 @@ class OrbitFOVViewer(QWidget):
                     "tool": "cellpose_sam",
                     "markers": self.selected_cellpose_markers(),
                     "model": CELLPOSE_SAM_MODEL,
+                    "dapi_positive_fovs": (
+                        self.segment_dapi_positive_fovs_checkbox.isChecked()
+                    ),
+                    "fov_overlap": DEFAULT_SEGMENTATION_FOV_OVERLAP,
                 },
                 "threshold": {
                     "intensity_slider": self.threshold_intensity_slider.value(),
@@ -5544,6 +5632,9 @@ class OrbitFOVViewer(QWidget):
                 str(marker)
                 for marker in segmenting_settings.get("markers", [])
             }
+            self.segment_dapi_positive_fovs_checkbox.setChecked(
+                bool(segmenting_settings.get("dapi_positive_fovs", True))
+            )
             self.refresh_cellpose_marker_list()
             self.model_bundle = None
             self.threshold_intensity_value = None

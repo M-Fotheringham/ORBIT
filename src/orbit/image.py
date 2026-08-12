@@ -1,8 +1,8 @@
 """Image backends used by ORBIT.
 
-TIFF images retain the original eager behaviour. OME-Zarr images are exposed as
-chunked Dask arrays so a field of view reads only the chunks that intersect the
-requested region.
+OME-Zarr images are exposed as chunked Dask arrays. TIFF pyramids are also
+opened through tifffile's Zarr adapter when available so tiled whole-slide
+operations read only the requested field instead of materializing a channel.
 """
 
 from __future__ import annotations
@@ -49,6 +49,8 @@ class QPTiffImage:
         self.tif = None
         self.series = None
         self._tiff_levels = []
+        self._tiff_zarr_levels = []
+        self._tiff_zarr_stores = []
         self._levels = []
         self._axes: tuple[str, ...] = ()
         self._metadata: dict[str, Any] = {}
@@ -93,6 +95,30 @@ class QPTiffImage:
         self.dtype = self.series.dtype
         self._axes = ("c", "y", "x")
         self.channel_names = self._get_tiff_channel_names()
+        self._open_tiff_zarr_levels()
+
+    def _open_tiff_zarr_levels(self):
+        """Expose TIFF pyramid levels as sliceable arrays for FOV-sized I/O."""
+        try:
+            import zarr
+        except ImportError:
+            return
+
+        stores = []
+        arrays = []
+        try:
+            for level in self._tiff_levels:
+                store = level.aszarr()
+                stores.append(store)
+                arrays.append(zarr.open(store, mode="r"))
+        except Exception:
+            for store in stores:
+                close = getattr(store, "close", None)
+                if callable(close):
+                    close()
+            return
+        self._tiff_zarr_stores = stores
+        self._tiff_zarr_levels = arrays
 
     def _highest_resolution_tiff_series(self):
         """Use the full-resolution level of TIFF series 0.
@@ -230,7 +256,11 @@ class QPTiffImage:
         self._validate_channel(channel)
         if self.is_ome_zarr:
             return self._levels[level][channel]
-        return self.series.asarray(key=channel)
+        if not 0 <= int(level) < len(self._tiff_levels):
+            raise IndexError(f"TIFF pyramid level {level} is not available.")
+        if self._tiff_zarr_levels:
+            return self._tiff_zarr_levels[level][channel]
+        return self._tiff_levels[level].asarray(key=channel)
 
     def get_region(
         self,
@@ -260,6 +290,8 @@ class QPTiffImage:
         self._validate_channel(channel)
         if self.is_ome_zarr:
             return [level[channel] for level in self._levels]
+        if self._tiff_zarr_levels:
+            return [level[channel] for level in self._tiff_zarr_levels]
         return [self.get_channel(channel)]
 
     def get_overview(self, channel: int = 0, max_size: int = 512) -> np.ndarray:
@@ -322,6 +354,12 @@ class QPTiffImage:
         return self.pixel_size_um if self.pixel_size_um is not None else default
 
     def close(self):
+        for store in self._tiff_zarr_stores:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        self._tiff_zarr_stores = []
+        self._tiff_zarr_levels = []
         if self.tif is not None:
             self.tif.close()
 

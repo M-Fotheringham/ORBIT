@@ -39,7 +39,7 @@ class RandomFOVGenerator:
             x0 = int(rng.integers(0, maximum_x0 + 1))
             return y0, x0
 
-        threshold = self._dapi_threshold(dapi_channel)
+        threshold = self.dapi_threshold(dapi_channel)
         best_fraction = 0.0
         for _attempt in range(int(maximum_attempts)):
             y0 = int(rng.integers(0, maximum_y0 + 1))
@@ -65,7 +65,8 @@ class RandomFOVGenerator:
             f"{minimum_dapi_fraction:.2%} is required."
         )
 
-    def _dapi_threshold(self, dapi_channel: int) -> float:
+    def dapi_threshold(self, dapi_channel: int) -> float:
+        """Return the overview-derived DAPI threshold used for FOV selection."""
         dapi_channel = int(dapi_channel)
         if dapi_channel in self._dapi_threshold_cache:
             return self._dapi_threshold_cache[dapi_channel]
@@ -98,6 +99,10 @@ class RandomFOVGenerator:
         threshold = background + 0.20 * (bright - background)
         self._dapi_threshold_cache[dapi_channel] = threshold
         return threshold
+
+    def _dapi_threshold(self, dapi_channel: int) -> float:
+        """Backward-compatible alias for the former private helper."""
+        return self.dapi_threshold(dapi_channel)
 
     @staticmethod
     def dapi_positive_fraction(dapi_fov: np.ndarray, threshold: float) -> float:
