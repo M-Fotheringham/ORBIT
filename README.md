@@ -161,8 +161,9 @@ Change the image displayed using the carousel arrows or by selecting an image fr
 
 1. Select Segmenting > CellPoseSAM and choose one or more membrane-guiding markers. Selected channels are normalized and merged, and DAPI is supplied as nuclear guidance when available.
 2. Click 'Preview Current FOV (CPU)' to segment only the displayed field without modifying project data. Review the overlay, then click 'Accept Preview' or 'Discard'.
-3. On systems with a CUDA-compatible GPU, 'Segment All Images (GPU)' replaces the segmentation and cell-level measurements for every loaded image.
-4. Click 'Export Segmentation' to save generated cell-data TSV and mask TIFF files.
+3. Leave 'Only segment DAPI-positive FOVs' checked to apply the same nuclear-content rule used by random FOV generation, or clear it to cover every tile. Images without a DAPI channel use every tile.
+4. On systems with a CUDA-compatible GPU, 'Segment All Images (Tiled GPU)' divides each image into FOVs with 20% overlap, segments each FOV, and stitches a whole-image label mask using [AstroPath](https://github.com/AstroPathJHU/AstroPathPipeline)-style non-overlapping primary regions. The progress bar below the image reports FOV selection and segmentation progress.
+5. Click 'Export Segmentation' to save generated cell-data TSV and mask TIFF files. Whole-image output is streamed to disk while stitching, which avoids holding a second complete label mask in memory; the final TIFF can still be large.
 
 ## 3. Phenotyping
 
