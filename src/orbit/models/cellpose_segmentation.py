@@ -12,6 +12,16 @@ import pandas as pd
 import tifffile
 from skimage.measure import regionprops_table
 
+from orbit.fov import DEFAULT_MINIMUM_DAPI_FRACTION
+from orbit.models.tiled_segmentation import (
+    AstroPathMaskStitcher,
+    DEFAULT_SEGMENTATION_FOV_OVERLAP,
+    DEFAULT_SEGMENTATION_FOV_SIZE,
+    SegmentationFOV,
+    select_dapi_positive_fovs,
+    tiled_segmentation_fovs,
+)
+
 CELLPOSE_SAM_MODEL = "cpsam_v2"
 DEFAULT_PIXEL_SIZE_UM = 0.5064
 
@@ -188,21 +198,26 @@ def create_cellpose_sam_model(gpu: bool = True):
 
 
 class _RegionImage:
-    """Small in-memory image adapter used for current-FOV CPU segmentation."""
+    """Lazy image adapter that reads only the requested FOV for each channel."""
 
     def __init__(self, source, y0: int, x0: int, height: int, width: int):
         self.path = source.path
+        self._source = source
+        self._y0, self._x0 = int(y0), int(x0)
+        self._height, self._width = int(height), int(width)
         self._names = [str(name) for name in source.get_channel_names()]
-        self._channels = [
-            source.get_region(index, y0, x0, height, width)
-            for index in range(len(self._names))
-        ]
 
     def get_channel_names(self):
         return list(self._names)
 
     def get_channel(self, index: int):
-        return self._channels[int(index)]
+        return self._source.get_region(
+            int(index),
+            self._y0,
+            self._x0,
+            self._height,
+            self._width,
+        )
 
 
 def _safe_channel_labels(channel_names: Iterable[str]) -> list[str]:
@@ -605,41 +620,135 @@ def segment_image(
     selected_marker_names: Iterable[str],
     model,
     pixel_size_um: float = DEFAULT_PIXEL_SIZE_UM,
+    *,
+    fovs: Iterable[SegmentationFOV] | None = None,
+    fov_size: int = DEFAULT_SEGMENTATION_FOV_SIZE,
+    fov_overlap: float = DEFAULT_SEGMENTATION_FOV_OVERLAP,
+    dapi_positive_only: bool = True,
+    minimum_dapi_fraction: float = DEFAULT_MINIMUM_DAPI_FRACTION,
+    progress_callback: Callable[[dict], None] | None = None,
+    progress_offset: int = 0,
+    progress_total: int | None = None,
 ) -> dict:
-    """Segment one loaded image and replace its generated ORBIT outputs."""
+    """Segment one image as overlapping FOVs and stitch it on disk."""
     selected = list(dict.fromkeys(str(name) for name in selected_marker_names))
-    model_input, nuclear_name = build_cellpose_input(image, selected)
-    masks, _flows, _styles = model.eval(
-        model_input,
-        channel_axis=-1,
-        normalize=True,
-        diameter=None,
-        batch_size=8,
-        tile_overlap=0.1,
+    channel_names = [str(name) for name in image.get_channel_names()]
+    nuclear_name = dapi_channel_name(channel_names)
+    if fovs is None:
+        candidates = tiled_segmentation_fovs(
+            image.get_shape()[-2:],
+            fov_size=fov_size,
+            overlap=fov_overlap,
+        )
+        if dapi_positive_only and nuclear_name is not None:
+            fovs = select_dapi_positive_fovs(
+                image,
+                candidates,
+                channel_names.index(nuclear_name),
+                minimum_dapi_fraction=minimum_dapi_fraction,
+            )
+        else:
+            fovs = candidates
+        candidate_count = len(candidates)
+    else:
+        fovs = list(fovs)
+        candidate_count = len(
+            tiled_segmentation_fovs(
+                image.get_shape()[-2:],
+                fov_size=fov_size,
+                overlap=fov_overlap,
+            )
+        )
+    fovs = list(fovs)
+    if not fovs:
+        raise ValueError(
+            f"No DAPI-positive segmentation FOVs were found in "
+            f"{Path(image.path).name}."
+        )
+
+    cell_path, mask_path = output_paths_for_image(image.path)
+    stitcher = AstroPathMaskStitcher(
+        image_shape=image.get_shape()[-2:],
+        cell_path=cell_path,
+        mask_path=mask_path,
+        model_name=CELLPOSE_SAM_MODEL,
+        marker_names=selected,
+        nuclear_channel_name=nuclear_name,
     )
-    masks = np.asarray(masks, dtype=np.uint32)
-    cell_data = measure_segmented_cells(
-        masks,
-        image,
-        pixel_size_um=pixel_size_um,
-    )
-    cell_path, mask_path = save_segmentation_outputs(
-        image.path,
-        masks,
-        cell_data,
-        selected,
-        nuclear_name,
-    )
+    finalized = False
+    try:
+        for current, fov in enumerate(fovs, start=1):
+            region_image = _RegionImage(
+                image,
+                fov.y0,
+                fov.x0,
+                fov.height,
+                fov.width,
+            )
+            model_input, _nuclear_name = build_cellpose_input(
+                region_image,
+                selected,
+            )
+            masks, _flows, _styles = model.eval(
+                model_input,
+                channel_axis=-1,
+                normalize=True,
+                diameter=None,
+                batch_size=8,
+                tile_overlap=0.1,
+            )
+            masks = np.asarray(masks, dtype=np.uint32)
+            if np.any(masks > 0):
+                cells = measure_segmented_cells(
+                    masks,
+                    region_image,
+                    pixel_size_um=pixel_size_um,
+                )
+                stitcher.add_fov(
+                    fov,
+                    masks,
+                    cells,
+                    pixel_size_um=pixel_size_um,
+                )
+            if progress_callback is not None:
+                global_current = int(progress_offset) + current
+                progress_callback({
+                    "phase": "segmenting",
+                    "current": global_current,
+                    "total": int(progress_total or len(fovs)),
+                    "message": (
+                        f"Segmenting and stitching {Path(image.path).name}: FOV "
+                        f"{current:,}/{len(fovs):,}"
+                    ),
+                })
+        if progress_callback is not None:
+            progress_callback({
+                "phase": "finalizing",
+                "message": f"Finalizing {Path(image.path).name} outputs...",
+            })
+        cell_path, mask_path, cell_count = stitcher.finalize()
+        finalized = True
+    finally:
+        if not finalized:
+            stitcher.abort()
+
     return {
         "image_path": str(Path(image.path).resolve()),
         "cell_data_path": str(cell_path),
         "segmentation_mask_path": str(mask_path),
-        "cell_count": len(cell_data),
+        "cell_count": int(cell_count),
         "marker_names": selected,
         "nuclear_channel_name": nuclear_name,
         "model_name": CELLPOSE_SAM_MODEL,
         "compute_device": "cuda",
-        "scope": "whole_image",
+        "scope": "tiled_whole_image",
+        "fov_size": int(fov_size),
+        "fov_overlap": float(fov_overlap),
+        "candidate_fov_count": int(candidate_count),
+        "selected_fov_count": len(fovs),
+        "dapi_positive_only": bool(dapi_positive_only),
+        "minimum_dapi_fraction": float(minimum_dapi_fraction),
+        "stitching_method": "AstroPath-style primary regions",
     }
 
 
@@ -647,9 +756,14 @@ def segment_project_images(
     images: Iterable,
     selected_marker_names: Iterable[str],
     pixel_size_um: float = DEFAULT_PIXEL_SIZE_UM,
-    progress_callback: Callable[[str], None] | None = None,
+    progress_callback: Callable[[dict], None] | None = None,
+    *,
+    fov_size: int = DEFAULT_SEGMENTATION_FOV_SIZE,
+    fov_overlap: float = DEFAULT_SEGMENTATION_FOV_OVERLAP,
+    dapi_positive_only: bool = True,
+    minimum_dapi_fraction: float = DEFAULT_MINIMUM_DAPI_FRACTION,
 ) -> list[dict]:
-    """Run one shared Cellpose-SAM model over every image in a project."""
+    """Tile, optionally DAPI-filter, segment, and stitch every project image."""
     images = list(images)
     selected = list(dict.fromkeys(str(name) for name in selected_marker_names))
     if not images:
@@ -657,17 +771,74 @@ def segment_project_images(
     if not selected:
         raise ValueError("Select at least one membrane marker before segmenting.")
 
-    if progress_callback is not None:
-        progress_callback(
-            f"Loading Cellpose-SAM model {CELLPOSE_SAM_MODEL}..."
+    candidates_by_image = [
+        tiled_segmentation_fovs(
+            image.get_shape()[-2:],
+            fov_size=fov_size,
+            overlap=fov_overlap,
         )
+        for image in images
+    ]
+    total_candidates = sum(map(len, candidates_by_image))
+    scanned_candidates = 0
+    selected_by_image = []
+    for image, candidates in zip(images, candidates_by_image):
+        channel_names = [str(name) for name in image.get_channel_names()]
+        nuclear_name = dapi_channel_name(channel_names)
+        if dapi_positive_only and nuclear_name is not None:
+            offset = scanned_candidates
+
+            def report_selection(current, _total, _fov, positive_fraction):
+                if progress_callback is not None:
+                    progress_callback({
+                        "phase": "selecting_fovs",
+                        "current": offset + current,
+                        "total": total_candidates,
+                        "message": (
+                            "Selecting DAPI-positive FOVs: "
+                            f"{offset + current:,}/{total_candidates:,} "
+                            f"({positive_fraction:.1%} DAPI pixels)"
+                        ),
+                    })
+
+            selected = select_dapi_positive_fovs(
+                image,
+                candidates,
+                channel_names.index(nuclear_name),
+                minimum_dapi_fraction=minimum_dapi_fraction,
+                progress_callback=report_selection,
+            )
+        else:
+            selected = list(candidates)
+            if progress_callback is not None:
+                progress_callback({
+                    "phase": "selecting_fovs",
+                    "current": scanned_candidates + len(candidates),
+                    "total": total_candidates,
+                    "message": (
+                        f"Using all {len(candidates):,} FOVs for "
+                        f"{Path(image.path).name}"
+                        + (" (no DAPI channel found)" if nuclear_name is None else "")
+                    ),
+                })
+        selected_by_image.append(selected)
+        scanned_candidates += len(candidates)
+
+    total_selected = sum(map(len, selected_by_image))
+    if total_selected == 0:
+        raise ValueError(
+            "No FOV met the minimum DAPI-positive pixel requirement. Disable "
+            "DAPI-positive FOV selection or lower the selection requirement."
+        )
+    if progress_callback is not None:
+        progress_callback({
+            "phase": "loading_model",
+            "message": f"Loading Cellpose-SAM model {CELLPOSE_SAM_MODEL}...",
+        })
     model = create_cellpose_sam_model(gpu=True)
     results = []
-    for index, image in enumerate(images, start=1):
-        if progress_callback is not None:
-            progress_callback(
-                f"Segmenting {Path(image.path).name} ({index}/{len(images)})..."
-            )
+    segmented_fovs = 0
+    for image, selected_fovs in zip(images, selected_by_image):
         results.append(
             segment_image(
                 image,
@@ -676,14 +847,25 @@ def segment_project_images(
                 pixel_size_um=image.get_pixel_size_um(
                     default=pixel_size_um
                 ),
+                fovs=selected_fovs,
+                fov_size=fov_size,
+                fov_overlap=fov_overlap,
+                dapi_positive_only=dapi_positive_only,
+                minimum_dapi_fraction=minimum_dapi_fraction,
+                progress_callback=progress_callback,
+                progress_offset=segmented_fovs,
+                progress_total=total_selected,
             )
         )
+        segmented_fovs += len(selected_fovs)
     return results
 
 
 __all__ = [
     "CELLPOSE_SAM_MODEL",
     "DEFAULT_PIXEL_SIZE_UM",
+    "DEFAULT_SEGMENTATION_FOV_OVERLAP",
+    "DEFAULT_SEGMENTATION_FOV_SIZE",
     "build_cellpose_input",
     "create_cellpose_sam_model",
     "cuda_compatible_gpu_available",
