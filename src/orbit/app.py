@@ -6,7 +6,7 @@ import sys
 import traceback
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QTimer, Slot
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -32,24 +32,16 @@ def find_icon_path():
     return next((path for path in candidates if path.is_file()), None)
 
 
-class ViewerImportWorker(QObject):
-    """Import the heavyweight viewer while the startup splash remains active."""
-
-    loaded = Signal(object)
-    failed = Signal(str)
-
-    @Slot()
-    def run(self):
-        try:
-            from orbit.gui.fov_viewer import OrbitFOVViewer
-        except Exception:
-            self.failed.emit(traceback.format_exc())
-            return
-        self.loaded.emit(OrbitFOVViewer)
-
-
 class StartupController(QObject):
-    """Finish startup on Qt's GUI thread after the viewer import completes."""
+    """Import and construct the viewer on Qt's GUI thread.
+
+    Importing the viewer also imports Napari and VisPy. Those packages may
+    initialize Qt and OpenGL state at import time, so doing that work in a
+    background ``QThread`` can violate Qt's thread-affinity rules and terminate
+    the Windows process with a native segmentation fault. A zero-delay timer
+    lets the still-image splash paint first, then performs all GUI-related
+    initialization on the application thread.
+    """
 
     def __init__(self, application, splash, icon_path, icon):
         super().__init__(application)
@@ -59,6 +51,15 @@ class StartupController(QObject):
         self.icon = icon
         self.window = None
         self.failure = None
+
+    @Slot()
+    def load_main_window(self):
+        try:
+            from orbit.gui.fov_viewer import OrbitFOVViewer
+        except Exception:
+            self.handle_startup_failure(traceback.format_exc())
+            return
+        self.show_main_window(OrbitFOVViewer)
 
     @Slot(object)
     def show_main_window(self, viewer_class):
@@ -111,26 +112,13 @@ def main():
     splash = StartupSplash(icon=icon)
     splash.start()
 
-    import_thread = QThread()
-    import_worker = ViewerImportWorker()
-    import_worker.moveToThread(import_thread)
-    import_thread.started.connect(import_worker.run)
-    import_worker.loaded.connect(import_thread.quit)
-    import_worker.failed.connect(import_thread.quit)
-    import_thread.finished.connect(import_worker.deleteLater)
-
     startup_controller = StartupController(app, splash, icon_path, icon)
-    import_worker.loaded.connect(startup_controller.show_main_window)
-    import_worker.failed.connect(startup_controller.handle_startup_failure)
 
-    # The popup has already painted its selected image; begin imports immediately.
-    QTimer.singleShot(0, import_thread.start)
+    # The popup has already painted its selected image. Defer one event-loop
+    # turn, but keep Napari/VisPy imports on the Qt application thread.
+    QTimer.singleShot(0, startup_controller.load_main_window)
 
-    exit_code = app.exec()
-    if import_thread.isRunning():
-        import_thread.quit()
-        import_thread.wait()
-    return exit_code
+    return app.exec()
 
 
 if __name__ == "__main__":
