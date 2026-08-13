@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
+from contextlib import contextmanager
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
@@ -24,6 +26,34 @@ from orbit.models.tiled_segmentation import (
 
 CELLPOSE_SAM_MODEL = "cpsam_v2"
 DEFAULT_PIXEL_SIZE_UM = 0.5064
+
+
+@contextmanager
+def _writable_cellpose_streams():
+    """Supply writable streams when a windowed executable has no console.
+
+    PyInstaller sets ``sys.stdout`` and ``sys.stderr`` to ``None`` for ORBIT's
+    ``console=False`` build. Cellpose uses tqdm while downloading a model that
+    is not yet cached, and tqdm requires a stream with ``write`` and ``flush``.
+    Source and console builds keep their original streams unchanged.
+    """
+    replacements = []
+    try:
+        for stream_name in ("stdout", "stderr"):
+            original = getattr(sys, stream_name, None)
+            if (
+                callable(getattr(original, "write", None))
+                and callable(getattr(original, "flush", None))
+            ):
+                continue
+            replacement = open(os.devnull, "w", encoding="utf-8")
+            setattr(sys, stream_name, replacement)
+            replacements.append((stream_name, original, replacement))
+        yield
+    finally:
+        for stream_name, original, replacement in reversed(replacements):
+            setattr(sys, stream_name, original)
+            replacement.close()
 
 
 def is_dapi_channel(channel_name: str) -> bool:
@@ -191,10 +221,14 @@ def create_cellpose_sam_model(gpu: bool = True):
             "'python -m pip install -e .' and try again."
         ) from error
 
-    return models.CellposeModel(
-        gpu=bool(gpu),
-        pretrained_model=CELLPOSE_SAM_MODEL,
-    )
+    # A first run downloads the model and creates a tqdm progress bar. The
+    # context prevents tqdm from crashing in ORBIT's windowed executable while
+    # leaving normal terminal output untouched for ``uv run orbit``.
+    with _writable_cellpose_streams():
+        return models.CellposeModel(
+            gpu=bool(gpu),
+            pretrained_model=CELLPOSE_SAM_MODEL,
+        )
 
 
 class _RegionImage:
