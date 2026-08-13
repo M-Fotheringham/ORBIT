@@ -23,6 +23,11 @@ from PySide6.QtCore import (
 
 from orbit.image import QPTiffImage
 from orbit.fov import DEFAULT_MINIMUM_DAPI_FRACTION, RandomFOVGenerator
+from orbit.coordinates import (
+    centroid_columns,
+    centroid_pixel_coordinates,
+    coordinates_are_microns,
+)
 from orbit.gui.alien_assistant import AlienAssistantWidget
 from orbit.gui.napari_canvas import NapariImageCanvas
 from orbit.models.random_forest import (
@@ -4119,59 +4124,40 @@ class OrbitFOVViewer(QWidget):
 
     @staticmethod
     def _centroid_columns(cell_data):
-        def find_axis(axis):
-            exact = [
-                f"Centroid {axis.upper()} µm",
-                f"Centroid {axis.upper()} μm",
-                f"Centroid {axis.upper()} um",
-                f"Centroid {axis.upper()} px",
-                f"Centroid {axis.upper()}",
-            ]
-            for candidate in exact:
-                if candidate in cell_data.columns:
-                    return candidate
-            for column in cell_data.columns:
-                normalized = str(column).lower().replace("_", " ").replace("-", " ")
-                has_centroid = "centroid" in normalized or "center" in normalized
-                has_axis = f" {axis} " in f" {normalized} " or normalized.endswith(axis)
-                if has_centroid and has_axis:
-                    return column
-            return None
-
-        x_column, y_column = find_axis("x"), find_axis("y")
-        if x_column is None or y_column is None:
-            raise ValueError(
-                "Cell data must contain X and Y centroid columns to display "
-                "model predictions."
-            )
-        return x_column, y_column
+        return centroid_columns(cell_data)
 
     @staticmethod
     def _coordinates_are_microns(column):
-        name = str(column).lower()
-        return any(unit in name for unit in ("µm", "μm", " um", "micron"))
+        return coordinates_are_microns(column)
 
     def _cell_centroid_cache(self, state):
         if state.get("centroid_cache") is not None:
             return state["centroid_cache"]
-        x_column, y_column = self._centroid_columns(state["cell_data"])
-        x = pd.to_numeric(state["cell_data"][x_column], errors="coerce").to_numpy(
-            dtype=float
+        pixel_size_um = state["img"].get_pixel_size_um(
+            default=DEFAULT_PIXEL_SIZE_UM
         )
-        y = pd.to_numeric(state["cell_data"][y_column], errors="coerce").to_numpy(
-            dtype=float
+        state["centroid_cache"] = centroid_pixel_coordinates(
+            state["cell_data"],
+            pixel_size_um=pixel_size_um,
         )
-        if self._coordinates_are_microns(x_column):
-            x = x / DEFAULT_PIXEL_SIZE_UM
-        if self._coordinates_are_microns(y_column):
-            y = y / DEFAULT_PIXEL_SIZE_UM
-        state["centroid_cache"] = {
-            "x": x,
-            "y": y,
-            "x_column": x_column,
-            "y_column": y_column,
-        }
         return state["centroid_cache"]
+
+    def _refresh_annotation_centroids(self, state):
+        """Migrate saved annotations to the image's native pixel coordinates."""
+        if state.get("cell_data") is None:
+            return
+        centroids = self._cell_centroid_cache(state)
+        for annotation in state.get("annotations", {}).values():
+            row_index = self._find_cell_row_index(state, annotation)
+            if row_index is None:
+                continue
+            x = float(centroids["x"][row_index])
+            y = float(centroids["y"][row_index])
+            if not (np.isfinite(x) and np.isfinite(y)):
+                continue
+            annotation["row_index"] = int(row_index)
+            annotation["centroid_x"] = x
+            annotation["centroid_y"] = y
 
     def _find_cell_row_index(self, state, annotation):
         row_index = annotation.get("row_index")
@@ -5722,6 +5708,12 @@ class OrbitFOVViewer(QWidget):
                     for annotation in entry.get("annotations", [])
                     if annotation.get("label") in {"positive", "negative"}
                 }
+                try:
+                    self._refresh_annotation_centroids(state)
+                except (TypeError, ValueError):
+                    # Keep older projects loadable when their external cell
+                    # tables lack usable centroid columns.
+                    pass
                 cell_count = (
                     0 if state["cell_data"] is None
                     else len(state["cell_data"])
