@@ -61,9 +61,24 @@ def is_dapi_channel(channel_name: str) -> bool:
     return "dapi" in str(channel_name).strip().lower()
 
 
-def membrane_marker_names(channel_names: Iterable[str]) -> list[str]:
-    """Return channels that can be selected as membrane guides."""
-    return [str(name) for name in channel_names if not is_dapi_channel(name)]
+def membrane_marker_names(
+    channel_names: Iterable[str],
+    nuclear_channel_name: str | None = None,
+) -> list[str]:
+    """Return channels that can be selected as membrane guides.
+
+    DAPI is never offered as a membrane marker. A manually selected nuclear
+    channel is also excluded, which supports TIFFs whose channels have generic
+    labels such as ``Channel 0``.
+    """
+    nuclear_name = (
+        None if nuclear_channel_name is None else str(nuclear_channel_name)
+    )
+    return [
+        str(name)
+        for name in channel_names
+        if not is_dapi_channel(name) and str(name) != nuclear_name
+    ]
 
 
 def dapi_channel_name(channel_names: Iterable[str]) -> str | None:
@@ -72,6 +87,23 @@ def dapi_channel_name(channel_names: Iterable[str]) -> str | None:
         (str(name) for name in channel_names if is_dapi_channel(name)),
         None,
     )
+
+
+def resolve_nuclear_channel_name(
+    channel_names: Iterable[str],
+    nuclear_channel_name: str | None = None,
+) -> str | None:
+    """Resolve an explicit nuclear channel, defaulting to DAPI when present."""
+    names = [str(name) for name in channel_names]
+    if nuclear_channel_name is None:
+        return dapi_channel_name(names)
+    requested = str(nuclear_channel_name)
+    if requested not in names:
+        raise ValueError(
+            f"Selected nuclear channel '{requested}' is not present. Available "
+            "channels: " + ", ".join(names)
+        )
+    return requested
 
 
 def cuda_compatible_gpu_available() -> bool:
@@ -145,17 +177,27 @@ def _normalized_channel(channel: np.ndarray) -> np.ndarray:
 def build_cellpose_input(
     image,
     selected_marker_names: Iterable[str],
+    nuclear_channel_name: str | None = None,
 ) -> tuple[np.ndarray, str | None]:
-    """Build a Y-X-C Cellpose input from merged markers and optional DAPI."""
+    """Build a Y-X-C Cellpose input from membrane and nuclear channels."""
     channel_names = [str(name) for name in image.get_channel_names()]
     channel_indices = {name: index for index, name in enumerate(channel_names)}
     selected = list(dict.fromkeys(str(name) for name in selected_marker_names))
+    nuclear_name = resolve_nuclear_channel_name(
+        channel_names,
+        nuclear_channel_name,
+    )
     if not selected:
         raise ValueError("Select at least one membrane marker before segmenting.")
+    if nuclear_name is not None and nuclear_name in selected:
+        raise ValueError(
+            f"'{nuclear_name}' is selected as the nuclear channel and cannot "
+            "also be used as a membrane marker."
+        )
     if any(is_dapi_channel(name) for name in selected):
         raise ValueError(
-            "DAPI is supplied automatically as the nuclear channel and cannot "
-            "be selected as a membrane marker."
+            "DAPI cannot be selected as a membrane marker. Choose it as the "
+            "nuclear channel instead."
         )
 
     missing = [name for name in selected if name not in channel_indices]
@@ -187,14 +229,14 @@ def build_cellpose_input(
     merged *= np.float32(255.0)
     model_input[..., 0] = merged
 
-    nuclear_name = dapi_channel_name(channel_names)
     if nuclear_name is not None:
         nuclear = _normalized_channel(
             image.get_channel(channel_indices[nuclear_name])
         )
         if nuclear.shape != merged.shape:
             raise ValueError(
-                f"DAPI has dimensions {nuclear.shape}, expected "
+                f"Nuclear channel '{nuclear_name}' has dimensions "
+                f"{nuclear.shape}, expected "
                 f"{merged.shape}."
             )
         nuclear *= np.float32(255.0)
@@ -436,11 +478,17 @@ def segment_fov_preview(
     width: int,
     pixel_size_um: float = DEFAULT_PIXEL_SIZE_UM,
     model=None,
+    *,
+    nuclear_channel_name: str | None = None,
 ) -> dict:
     """Segment only the displayed FOV on CPU without changing project data."""
     selected = list(dict.fromkeys(str(name) for name in selected_marker_names))
     region_image = _RegionImage(image, int(y0), int(x0), int(height), int(width))
-    model_input, nuclear_name = build_cellpose_input(region_image, selected)
+    model_input, nuclear_name = build_cellpose_input(
+        region_image,
+        selected,
+        nuclear_channel_name=nuclear_channel_name,
+    )
     if model is None:
         model = create_cellpose_sam_model(gpu=False)
     masks, _flows, _styles = model.eval(
@@ -655,6 +703,7 @@ def segment_image(
     model,
     pixel_size_um: float = DEFAULT_PIXEL_SIZE_UM,
     *,
+    nuclear_channel_name: str | None = None,
     fovs: Iterable[SegmentationFOV] | None = None,
     fov_size: int = DEFAULT_SEGMENTATION_FOV_SIZE,
     fov_overlap: float = DEFAULT_SEGMENTATION_FOV_OVERLAP,
@@ -667,7 +716,10 @@ def segment_image(
     """Segment one image as overlapping FOVs and stitch it on disk."""
     selected = list(dict.fromkeys(str(name) for name in selected_marker_names))
     channel_names = [str(name) for name in image.get_channel_names()]
-    nuclear_name = dapi_channel_name(channel_names)
+    nuclear_name = resolve_nuclear_channel_name(
+        channel_names,
+        nuclear_channel_name,
+    )
     if fovs is None:
         candidates = tiled_segmentation_fovs(
             image.get_shape()[-2:],
@@ -696,7 +748,7 @@ def segment_image(
     fovs = list(fovs)
     if not fovs:
         raise ValueError(
-            f"No DAPI-positive segmentation FOVs were found in "
+            f"No nuclear-positive segmentation FOVs were found in "
             f"{Path(image.path).name}."
         )
 
@@ -722,6 +774,7 @@ def segment_image(
             model_input, _nuclear_name = build_cellpose_input(
                 region_image,
                 selected,
+                nuclear_channel_name=nuclear_name,
             )
             masks, _flows, _styles = model.eval(
                 model_input,
@@ -781,6 +834,7 @@ def segment_image(
         "candidate_fov_count": int(candidate_count),
         "selected_fov_count": len(fovs),
         "dapi_positive_only": bool(dapi_positive_only),
+        "nuclear_positive_only": bool(dapi_positive_only),
         "minimum_dapi_fraction": float(minimum_dapi_fraction),
         "stitching_method": "AstroPath-style primary regions",
     }
@@ -792,12 +846,13 @@ def segment_project_images(
     pixel_size_um: float = DEFAULT_PIXEL_SIZE_UM,
     progress_callback: Callable[[dict], None] | None = None,
     *,
+    nuclear_channel_name: str | None = None,
     fov_size: int = DEFAULT_SEGMENTATION_FOV_SIZE,
     fov_overlap: float = DEFAULT_SEGMENTATION_FOV_OVERLAP,
     dapi_positive_only: bool = True,
     minimum_dapi_fraction: float = DEFAULT_MINIMUM_DAPI_FRACTION,
 ) -> list[dict]:
-    """Tile, optionally DAPI-filter, segment, and stitch every project image."""
+    """Tile, optionally nuclear-filter, segment, and stitch project images."""
     images = list(images)
     selected_markers = list(
         dict.fromkeys(str(name) for name in selected_marker_names)
@@ -820,7 +875,10 @@ def segment_project_images(
     selected_by_image = []
     for image, candidates in zip(images, candidates_by_image):
         channel_names = [str(name) for name in image.get_channel_names()]
-        nuclear_name = dapi_channel_name(channel_names)
+        nuclear_name = resolve_nuclear_channel_name(
+            channel_names,
+            nuclear_channel_name,
+        )
         if dapi_positive_only and nuclear_name is not None:
             offset = scanned_candidates
 
@@ -831,9 +889,9 @@ def segment_project_images(
                         "current": offset + current,
                         "total": total_candidates,
                         "message": (
-                            "Selecting DAPI-positive FOVs: "
+                            f"Selecting {nuclear_name}-positive FOVs: "
                             f"{offset + current:,}/{total_candidates:,} "
-                            f"({positive_fraction:.1%} DAPI pixels)"
+                            f"({positive_fraction:.1%} positive pixels)"
                         ),
                     })
 
@@ -854,7 +912,7 @@ def segment_project_images(
                     "message": (
                         f"Using all {len(candidates):,} FOVs for "
                         f"{Path(image.path).name}"
-                        + (" (no DAPI channel found)" if nuclear_name is None else "")
+                        + (" (no nuclear channel selected)" if nuclear_name is None else "")
                     ),
                 })
         selected_by_image.append(selected_fovs)
@@ -863,8 +921,9 @@ def segment_project_images(
     total_selected = sum(map(len, selected_by_image))
     if total_selected == 0:
         raise ValueError(
-            "No FOV met the minimum DAPI-positive pixel requirement. Disable "
-            "DAPI-positive FOV selection or lower the selection requirement."
+            "No FOV met the minimum nuclear-positive pixel requirement. "
+            "Disable nuclear-positive FOV selection or lower the selection "
+            "requirement."
         )
     if progress_callback is not None:
         progress_callback({
@@ -883,6 +942,7 @@ def segment_project_images(
                 pixel_size_um=image.get_pixel_size_um(
                     default=pixel_size_um
                 ),
+                nuclear_channel_name=nuclear_channel_name,
                 fovs=selected_fovs,
                 fov_size=fov_size,
                 fov_overlap=fov_overlap,
@@ -913,6 +973,7 @@ __all__ = [
     "membrane_marker_names",
     "output_paths_for_image",
     "save_segmentation_outputs",
+    "resolve_nuclear_channel_name",
     "segmentation_export_paths",
     "segment_image",
     "segment_fov_preview",

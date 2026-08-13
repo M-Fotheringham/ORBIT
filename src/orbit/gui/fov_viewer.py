@@ -55,7 +55,6 @@ from orbit.models.cellpose_segmentation import (
     DEFAULT_SEGMENTATION_FOV_OVERLAP,
     DEFAULT_SEGMENTATION_FOV_SIZE,
     cuda_compatible_gpu_available,
-    dapi_channel_name,
     export_segmentation_outputs,
     merge_fov_segmentation,
     membrane_marker_names,
@@ -388,6 +387,7 @@ class CellposeSegmentationWorker(QRunnable):
         self,
         images,
         marker_names,
+        nuclear_channel_name,
         pixel_size_um,
         fov_size,
         dapi_positive_only,
@@ -395,6 +395,11 @@ class CellposeSegmentationWorker(QRunnable):
         super().__init__()
         self.images = list(images)
         self.marker_names = list(marker_names)
+        self.nuclear_channel_name = (
+            None
+            if nuclear_channel_name is None
+            else str(nuclear_channel_name)
+        )
         self.pixel_size_um = float(pixel_size_um)
         self.fov_size = int(fov_size)
         self.dapi_positive_only = bool(dapi_positive_only)
@@ -407,6 +412,7 @@ class CellposeSegmentationWorker(QRunnable):
                 self.marker_names,
                 pixel_size_um=self.pixel_size_um,
                 progress_callback=self.signals.progress.emit,
+                nuclear_channel_name=self.nuclear_channel_name,
                 fov_size=self.fov_size,
                 fov_overlap=DEFAULT_SEGMENTATION_FOV_OVERLAP,
                 dapi_positive_only=self.dapi_positive_only,
@@ -420,11 +426,26 @@ class CellposeSegmentationWorker(QRunnable):
 class CellposeFOVPreviewWorker(QRunnable):
     """Segment only the displayed field on CPU for review before acceptance."""
 
-    def __init__(self, image_index, image, marker_names, y0, x0, height, width):
+    def __init__(
+        self,
+        image_index,
+        image,
+        marker_names,
+        nuclear_channel_name,
+        y0,
+        x0,
+        height,
+        width,
+    ):
         super().__init__()
         self.image_index = int(image_index)
         self.image = image
         self.marker_names = list(marker_names)
+        self.nuclear_channel_name = (
+            None
+            if nuclear_channel_name is None
+            else str(nuclear_channel_name)
+        )
         self.y0, self.x0 = int(y0), int(x0)
         self.height, self.width = int(height), int(width)
         self.signals = SegmentationWorkerSignals()
@@ -441,6 +462,7 @@ class CellposeFOVPreviewWorker(QRunnable):
                 pixel_size_um=self.image.get_pixel_size_um(
                     default=DEFAULT_PIXEL_SIZE_UM
                 ),
+                nuclear_channel_name=self.nuclear_channel_name,
             )
             result["image_index"] = self.image_index
             self.signals.finished.emit(result)
@@ -995,6 +1017,7 @@ class OrbitFOVViewer(QWidget):
         self.cuda_detection_worker = None
         self.cuda_gpu_available = None
         self.segmenting_selected_markers = set()
+        self.segmenting_selected_nuclear_channel = None
         self.selected_feature_columns = []
         self.released_generated_segmentations = {}
         self.automated_worker = None
@@ -1703,17 +1726,26 @@ class OrbitFOVViewer(QWidget):
             "color: #b26a00; font-weight: bold;"
         )
         self.segmenting_dapi_label = QLabel(
-            "DAPI will be supplied as the nuclear channel when available."
+            "DAPI is selected automatically when present; otherwise choose "
+            "the appropriate channel."
         )
         self.segmenting_dapi_label.setWordWrap(True)
+        self.segmenting_nuclear_channel_dropdown = QComboBox()
+        self.segmenting_nuclear_channel_dropdown.setToolTip(
+            "Channel supplied to Cellpose-SAM as nuclear guidance. The "
+            "selected channel cannot also be used as a membrane marker."
+        )
+        self.segmenting_nuclear_channel_dropdown.currentIndexChanged.connect(
+            self.cellpose_nuclear_channel_changed
+        )
         self.segment_dapi_positive_fovs_checkbox = QCheckBox(
-            "Only segment DAPI-positive FOVs"
+            "Only segment nuclear-positive FOVs"
         )
         self.segment_dapi_positive_fovs_checkbox.setChecked(True)
         self.segment_dapi_positive_fovs_checkbox.setToolTip(
-            "Use the same DAPI field-selection rule as Generate FOV: retain "
-            f"tiles with at least {DEFAULT_MINIMUM_DAPI_FRACTION:.0%} "
-            "DAPI-positive pixels. Images without DAPI use all tiles."
+            "Retain tiles in which at least "
+            f"{DEFAULT_MINIMUM_DAPI_FRACTION:.0%} of pixels are positive in "
+            "the selected nuclear channel."
         )
         self.segmenting_marker_content = QWidget()
         self.segmenting_marker_layout = QVBoxLayout(
@@ -1773,6 +1805,8 @@ class OrbitFOVViewer(QWidget):
         segmenting_layout.addWidget(self.segmenting_gpu_status_label)
         segmenting_layout.addSpacing(6)
         segmenting_layout.addWidget(self.segmenting_dapi_label)
+        segmenting_layout.addWidget(QLabel("Nuclear channel:"))
+        segmenting_layout.addWidget(self.segmenting_nuclear_channel_dropdown)
         segmenting_layout.addWidget(self.segment_dapi_positive_fovs_checkbox)
         segmenting_layout.addSpacing(6)
         segmenting_layout.addWidget(QLabel("Membrane-guiding markers:"))
@@ -2175,19 +2209,40 @@ class OrbitFOVViewer(QWidget):
     def on_cuda_detection_error(self, _error_message):
         self.on_cuda_detection_finished(False)
 
-    def _shared_membrane_markers(self):
-        """Return membrane-marker names available in every loaded image."""
+    def _shared_channel_names(self):
+        """Return channel names available in every loaded image."""
         if not self.loaded_images:
             return []
-        first_names = membrane_marker_names(
-            self.loaded_images[0]["img"].get_channel_names()
-        )
+        first_names = [
+            str(name)
+            for name in self.loaded_images[0]["img"].get_channel_names()
+        ]
         shared = set(first_names)
         for state in self.loaded_images[1:]:
             shared.intersection_update(
-                membrane_marker_names(state["img"].get_channel_names())
+                str(name) for name in state["img"].get_channel_names()
             )
         return [name for name in first_names if name in shared]
+
+    def _shared_membrane_markers(self):
+        """Return shared membrane markers excluding the nuclear channel."""
+        return membrane_marker_names(
+            self._shared_channel_names(),
+            nuclear_channel_name=self.selected_cellpose_nuclear_channel(),
+        )
+
+    def selected_cellpose_nuclear_channel(self):
+        if not hasattr(self, "segmenting_nuclear_channel_dropdown"):
+            return None
+        index = self.segmenting_nuclear_channel_dropdown.currentIndex()
+        if index < 0:
+            return None
+        value = self.segmenting_nuclear_channel_dropdown.itemData(index)
+        return str(
+            value
+            if value is not None
+            else self.segmenting_nuclear_channel_dropdown.itemText(index)
+        )
 
     def selected_cellpose_markers(self):
         return [
@@ -2197,9 +2252,44 @@ class OrbitFOVViewer(QWidget):
         ]
 
     def refresh_cellpose_marker_list(self):
-        """Rebuild the scrollable list from channels shared by the project."""
+        """Rebuild shared nuclear and membrane channel controls."""
         if not hasattr(self, "segmenting_marker_layout"):
             return
+
+        shared_channels = self._shared_channel_names()
+        requested_nuclear = self.segmenting_selected_nuclear_channel
+        current_nuclear = self.selected_cellpose_nuclear_channel()
+        if (
+            requested_nuclear not in shared_channels
+            and current_nuclear in shared_channels
+        ):
+            requested_nuclear = current_nuclear
+        if requested_nuclear not in shared_channels:
+            requested_nuclear = next(
+                (
+                    name for name in shared_channels
+                    if "dapi" in name.strip().lower()
+                ),
+                shared_channels[0] if shared_channels else None,
+            )
+
+        self.segmenting_nuclear_channel_dropdown.blockSignals(True)
+        self.segmenting_nuclear_channel_dropdown.clear()
+        for channel_name in shared_channels:
+            self.segmenting_nuclear_channel_dropdown.addItem(
+                channel_name,
+                channel_name,
+            )
+        if requested_nuclear is not None:
+            nuclear_index = self.segmenting_nuclear_channel_dropdown.findData(
+                requested_nuclear
+            )
+            self.segmenting_nuclear_channel_dropdown.setCurrentIndex(
+                nuclear_index
+            )
+        self.segmenting_nuclear_channel_dropdown.blockSignals(False)
+        self.segmenting_selected_nuclear_channel = requested_nuclear
+
         selected = set(self.segmenting_selected_markers)
         selected.update(self.selected_cellpose_markers())
         while self.segmenting_marker_layout.count():
@@ -2227,39 +2317,39 @@ class OrbitFOVViewer(QWidget):
             message = (
                 "Load an image to list markers."
                 if not self.loaded_images
-                else "No non-DAPI marker is shared by every loaded image."
+                else "No membrane marker is shared by every loaded image."
             )
             placeholder = QLabel(message)
             placeholder.setWordWrap(True)
             self.segmenting_marker_layout.addWidget(placeholder)
             self.segmenting_marker_layout.addStretch()
 
-        nuclear_names = [
-            dapi_channel_name(state["img"].get_channel_names())
-            for state in self.loaded_images
-        ]
-        if not nuclear_names:
+        if requested_nuclear is not None:
             dapi_message = (
-                "DAPI will be supplied as the nuclear channel when available."
+                f"Using {requested_nuclear} for nuclear guidance. DAPI is "
+                "selected automatically when available."
             )
-        elif all(name is not None for name in nuclear_names):
-            unique_names = list(dict.fromkeys(nuclear_names))
-            if len(unique_names) == 1:
-                dapi_message = f"Nuclear channel: {unique_names[0]}"
-            else:
-                dapi_message = "DAPI nuclear channels will be used by name."
-        elif any(name is not None for name in nuclear_names):
-            dapi_message = (
-                "DAPI will be used where available; some images have no DAPI "
-                "channel."
-            )
+        elif self.loaded_images:
+            dapi_message = "No channel is shared by every loaded image."
         else:
             dapi_message = (
-                "No DAPI channel was found; segmentation will use membrane "
-                "guidance only."
+                "DAPI is selected automatically when present; otherwise "
+                "choose the appropriate channel."
             )
         self.segmenting_dapi_label.setText(dapi_message)
         self.update_segmentation_controls()
+
+    def cellpose_nuclear_channel_changed(self, _index):
+        nuclear_name = self.selected_cellpose_nuclear_channel()
+        if nuclear_name is None:
+            return
+        self.cellpose_preview = None
+        self.segmenting_selected_nuclear_channel = nuclear_name
+        self.refresh_cellpose_marker_list()
+        self.segmenting_status_label.setText(
+            f"Nuclear channel set to {nuclear_name}."
+        )
+        self.update_display()
 
     def cellpose_marker_selection_changed(self, marker_name, checked):
         self.cellpose_preview = None
@@ -2277,6 +2367,7 @@ class OrbitFOVViewer(QWidget):
         ready = (
             gpu_ready
             and bool(self.loaded_images)
+            and self.selected_cellpose_nuclear_channel() is not None
             and bool(self.selected_cellpose_markers())
             and not self.is_loading
             and self.cellpose_worker is None
@@ -2285,6 +2376,7 @@ class OrbitFOVViewer(QWidget):
         preview_ready = (
             bool(self.loaded_images)
             and self.current_fov is not None
+            and self.selected_cellpose_nuclear_channel() is not None
             and bool(self.selected_cellpose_markers())
             and not self.is_loading
             and self.cellpose_worker is None
@@ -2316,16 +2408,21 @@ class OrbitFOVViewer(QWidget):
         )
         marker_selection_ready = bool(self.loaded_images) and not self.is_loading
         self.segmenting_marker_scroll.setEnabled(marker_selection_ready)
+        self.segmenting_nuclear_channel_dropdown.setEnabled(
+            marker_selection_ready and self.cellpose_worker is None
+        )
         for checkbox in self.segmenting_marker_checkboxes:
             checkbox.setEnabled(marker_selection_ready)
         self.segment_dapi_positive_fovs_checkbox.setEnabled(
             bool(self.loaded_images)
+            and self.selected_cellpose_nuclear_channel() is not None
             and not self.is_loading
             and self.cellpose_worker is None
         )
 
     def start_cellpose_fov_preview(self):
         marker_names = self.selected_cellpose_markers()
+        nuclear_channel_name = self.selected_cellpose_nuclear_channel()
         if self.current_fov is None or self.current_y0 is None:
             QMessageBox.warning(
                 self, "Preview segmentation", "Generate a field of view first."
@@ -2336,12 +2433,20 @@ class OrbitFOVViewer(QWidget):
                 self, "Preview segmentation", "Select at least one membrane marker."
             )
             return
+        if nuclear_channel_name is None:
+            QMessageBox.warning(
+                self,
+                "Preview segmentation",
+                "Select a nuclear channel before segmenting.",
+            )
+            return
         self.cellpose_preview = None
         height, width = self.current_fov.shape[:2]
         worker = CellposeFOVPreviewWorker(
             self.current_image_index,
             self.img,
             marker_names,
+            nuclear_channel_name,
             self.current_y0,
             self.current_x0,
             height,
@@ -2635,6 +2740,7 @@ class OrbitFOVViewer(QWidget):
 
     def start_cellpose_segmentation(self):
         marker_names = self.selected_cellpose_markers()
+        nuclear_channel_name = self.selected_cellpose_nuclear_channel()
         if self.cuda_gpu_available is not True:
             QMessageBox.warning(
                 self,
@@ -2656,6 +2762,13 @@ class OrbitFOVViewer(QWidget):
                 "Select at least one membrane-guiding marker.",
             )
             return
+        if nuclear_channel_name is None:
+            QMessageBox.warning(
+                self,
+                "CellPoseSAM segmentation",
+                "Select a nuclear channel before segmenting.",
+            )
+            return
 
         self.cellpose_preview = None
         self._capture_current_image_state()
@@ -2672,6 +2785,7 @@ class OrbitFOVViewer(QWidget):
         worker = CellposeSegmentationWorker(
             images=[state["img"] for state in self.loaded_images],
             marker_names=marker_names,
+            nuclear_channel_name=nuclear_channel_name,
             pixel_size_um=DEFAULT_PIXEL_SIZE_UM,
             fov_size=self.fov_size or DEFAULT_SEGMENTATION_FOV_SIZE,
             dapi_positive_only=(
@@ -2766,6 +2880,10 @@ class OrbitFOVViewer(QWidget):
                         ),
                         "dapi_positive_only": result.get(
                             "dapi_positive_only"
+                        ),
+                        "nuclear_positive_only": result.get(
+                            "nuclear_positive_only",
+                            result.get("dapi_positive_only"),
                         ),
                         "minimum_dapi_fraction": result.get(
                             "minimum_dapi_fraction"
@@ -5323,6 +5441,7 @@ class OrbitFOVViewer(QWidget):
         self.overview_worker = None
         self.overview_request_id += 1
         self.segmenting_selected_markers = set()
+        self.segmenting_selected_nuclear_channel = None
         self.selected_feature_columns = []
         self._update_feature_selection_summary()
         self._set_probability_threshold_percent(
@@ -5492,7 +5611,13 @@ class OrbitFOVViewer(QWidget):
                 "segmenting": {
                     "tool": "cellpose_sam",
                     "markers": self.selected_cellpose_markers(),
+                    "nuclear_channel_name": (
+                        self.selected_cellpose_nuclear_channel()
+                    ),
                     "model": CELLPOSE_SAM_MODEL,
+                    "nuclear_positive_fovs": (
+                        self.segment_dapi_positive_fovs_checkbox.isChecked()
+                    ),
                     "dapi_positive_fovs": (
                         self.segment_dapi_positive_fovs_checkbox.isChecked()
                     ),
@@ -5632,8 +5757,21 @@ class OrbitFOVViewer(QWidget):
                 str(marker)
                 for marker in segmenting_settings.get("markers", [])
             }
+            selected_nuclear = segmenting_settings.get(
+                "nuclear_channel_name"
+            )
+            self.segmenting_selected_nuclear_channel = (
+                None
+                if selected_nuclear is None
+                else str(selected_nuclear)
+            )
             self.segment_dapi_positive_fovs_checkbox.setChecked(
-                bool(segmenting_settings.get("dapi_positive_fovs", True))
+                bool(
+                    segmenting_settings.get(
+                        "nuclear_positive_fovs",
+                        segmenting_settings.get("dapi_positive_fovs", True),
+                    )
+                )
             )
             self.refresh_cellpose_marker_list()
             self.model_bundle = None
