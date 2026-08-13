@@ -799,10 +799,12 @@ def segment_project_images(
 ) -> list[dict]:
     """Tile, optionally DAPI-filter, segment, and stitch every project image."""
     images = list(images)
-    selected = list(dict.fromkeys(str(name) for name in selected_marker_names))
+    selected_markers = list(
+        dict.fromkeys(str(name) for name in selected_marker_names)
+    )
     if not images:
         raise ValueError("Load at least one image before segmenting.")
-    if not selected:
+    if not selected_markers:
         raise ValueError("Select at least one membrane marker before segmenting.")
 
     candidates_by_image = [
@@ -835,7 +837,7 @@ def segment_project_images(
                         ),
                     })
 
-            selected = select_dapi_positive_fovs(
+            selected_fovs = select_dapi_positive_fovs(
                 image,
                 candidates,
                 channel_names.index(nuclear_name),
@@ -843,7 +845,7 @@ def segment_project_images(
                 progress_callback=report_selection,
             )
         else:
-            selected = list(candidates)
+            selected_fovs = list(candidates)
             if progress_callback is not None:
                 progress_callback({
                     "phase": "selecting_fovs",
@@ -855,7 +857,7 @@ def segment_project_images(
                         + (" (no DAPI channel found)" if nuclear_name is None else "")
                     ),
                 })
-        selected_by_image.append(selected)
+        selected_by_image.append(selected_fovs)
         scanned_candidates += len(candidates)
 
     total_selected = sum(map(len, selected_by_image))
@@ -876,7 +878,7 @@ def segment_project_images(
         results.append(
             segment_image(
                 image,
-                selected,
+                selected_markers,
                 model,
                 pixel_size_um=image.get_pixel_size_um(
                     default=pixel_size_um
