@@ -15,6 +15,14 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import tifffile as tiff
 
+try:
+    from PIL import Image as PillowImage
+except ImportError:  # tifffile remains the primary TIFF reader.
+    PillowImage = None
+
+
+TIFF_COMPRESSION_LZW = 5
+
 
 def _axis_name(axis: Any) -> str:
     """Return a normalized NGFF axis name."""
@@ -31,6 +39,36 @@ def _compute(array):
     if callable(compute):
         array = compute()
     return np.asarray(array)
+
+
+def _imagecodecs_lzw_available() -> bool:
+    """Return whether imagecodecs can actually call its LZW decoder.
+
+    Frozen applications can import the top-level ``imagecodecs`` package while
+    omitting its compiled codec extension. In that state ``lzw_decode`` is a
+    delayed stub that raises only when pixel data are read.
+    """
+    try:
+        import imagecodecs
+    except ImportError:
+        return False
+
+    codec = getattr(imagecodecs, "LZW", None)
+    available = getattr(codec, "available", None)
+    if available is not None and not bool(available):
+        return False
+
+    try:
+        decoder = getattr(imagecodecs, "lzw_decode")
+        decoder(b"")
+    except Exception as error:
+        message = str(error).lower()
+        return not (
+            isinstance(error, (ImportError, AttributeError))
+            or type(error).__name__ == "DelayedImportError"
+            or "could not import name" in message
+        )
+    return True
 
 
 class QPTiffImage:
@@ -51,6 +89,7 @@ class QPTiffImage:
         self._tiff_levels = []
         self._tiff_zarr_levels = []
         self._tiff_zarr_stores = []
+        self._use_pillow_tiff_reader = False
         self._levels = []
         self._axes: tuple[str, ...] = ()
         self._metadata: dict[str, Any] = {}
@@ -95,7 +134,84 @@ class QPTiffImage:
         self.dtype = self.series.dtype
         self._axes = ("c", "y", "x")
         self.channel_names = self._get_tiff_channel_names()
-        self._open_tiff_zarr_levels()
+        self._use_pillow_tiff_reader = self._needs_pillow_tiff_reader()
+        if not self._use_pillow_tiff_reader:
+            self._open_tiff_zarr_levels()
+
+    def _needs_pillow_tiff_reader(self) -> bool:
+        """Use Pillow only when an LZW TIFF lacks a working imagecodecs decoder."""
+        if PillowImage is None:
+            return False
+        uses_lzw = any(
+            int(page.compression) == TIFF_COMPRESSION_LZW
+            for level in self._tiff_levels
+            for page in level.pages
+        )
+        return uses_lzw and not _imagecodecs_lzw_available()
+
+    def _pillow_frame_index(self, page) -> int:
+        """Map a tifffile page in the selected series to Pillow's frame index."""
+        target_offset = getattr(page, "offset", None)
+        if target_offset is not None:
+            for frame_index, candidate in enumerate(self.tif.pages):
+                if getattr(candidate, "offset", None) == target_offset:
+                    return frame_index
+
+        page_index = getattr(page, "index", None)
+        if isinstance(page_index, int) and 0 <= page_index < len(self.tif.pages):
+            return page_index
+        raise RuntimeError(
+            "Pillow could not map this TIFF pyramid page to a readable frame."
+        )
+
+    def _read_tiff_channel_with_pillow(
+        self,
+        channel: int,
+        level: int = 0,
+        region: tuple[int, int, int, int] | None = None,
+    ) -> np.ndarray:
+        """Decode one TIFF channel with Pillow, including 32-bit float LZW TIFFs."""
+        if PillowImage is None:
+            raise RuntimeError("Pillow is not installed for TIFF fallback decoding.")
+        if not 0 <= int(level) < len(self._tiff_levels):
+            raise IndexError(f"TIFF pyramid level {level} is not available.")
+
+        pages = list(self._tiff_levels[int(level)].pages)
+        if not pages:
+            raise RuntimeError("The selected TIFF level does not contain image pages.")
+
+        sample_index = None
+        if len(pages) > int(channel):
+            page = pages[int(channel)]
+        elif len(pages) == 1:
+            page = pages[0]
+            sample_index = int(channel)
+        else:
+            raise IndexError(
+                f"TIFF channel {channel} could not be mapped to an image page."
+            )
+
+        frame_index = self._pillow_frame_index(page)
+        with PillowImage.open(self.path) as image:
+            image.seek(frame_index)
+            if region is not None:
+                y0, x0, height, width = region
+                image = image.crop((x0, y0, x0 + width, y0 + height))
+            values = np.array(image, copy=True)
+
+        if sample_index is not None and values.ndim == 3:
+            if values.shape[-1] > sample_index:
+                values = values[..., sample_index]
+            elif values.shape[0] > sample_index:
+                values = values[sample_index]
+
+        values = np.squeeze(values)
+        if values.ndim != 2:
+            raise ValueError(
+                "Pillow TIFF fallback expected a two-dimensional channel; "
+                f"got {values.shape}."
+            )
+        return values
 
     def _open_tiff_zarr_levels(self):
         """Expose TIFF pyramid levels as sliceable arrays for FOV-sized I/O."""
@@ -258,9 +374,17 @@ class QPTiffImage:
             return self._levels[level][channel]
         if not 0 <= int(level) < len(self._tiff_levels):
             raise IndexError(f"TIFF pyramid level {level} is not available.")
-        if self._tiff_zarr_levels:
-            return self._tiff_zarr_levels[level][channel]
-        return self._tiff_levels[level].asarray(key=channel)
+        if self._use_pillow_tiff_reader:
+            return self._read_tiff_channel_with_pillow(channel, level=level)
+        try:
+            if self._tiff_zarr_levels:
+                return self._tiff_zarr_levels[level][channel]
+            return self._tiff_levels[level].asarray(key=channel)
+        except Exception as original_error:
+            try:
+                return self._read_tiff_channel_with_pillow(channel, level=level)
+            except Exception:
+                raise original_error
 
     def get_region(
         self,
@@ -277,19 +401,47 @@ class QPTiffImage:
         height, width = int(height), int(width)
         if min(y0, x0, height, width) < 0 or height == 0 or width == 0:
             raise ValueError("Image-region coordinates and dimensions must be positive.")
-        channel_data = self.get_channel(channel, level=level)
-        if y0 + height > channel_data.shape[0] or x0 + width > channel_data.shape[1]:
+        if self.is_ome_zarr:
+            level_shape = self._levels[level].shape
+        else:
+            if not 0 <= int(level) < len(self._tiff_levels):
+                raise IndexError(f"TIFF pyramid level {level} is not available.")
+            level_shape = self._tiff_levels[level].shape
+        image_height, image_width = map(int, level_shape[-2:])
+        if y0 + height > image_height or x0 + width > image_width:
             raise ValueError(
                 f"Requested region x={x0}:{x0 + width}, y={y0}:{y0 + height} "
-                f"exceeds image dimensions {channel_data.shape[::-1]}."
+                f"exceeds image dimensions {(image_width, image_height)}."
             )
-        return _compute(channel_data[y0 : y0 + height, x0 : x0 + width])
+        if not self.is_ome_zarr and self._use_pillow_tiff_reader:
+            return self._read_tiff_channel_with_pillow(
+                channel,
+                level=level,
+                region=(y0, x0, height, width),
+            )
+
+        channel_data = self.get_channel(channel, level=level)
+        try:
+            return _compute(channel_data[y0 : y0 + height, x0 : x0 + width])
+        except Exception as original_error:
+            if self.is_ome_zarr:
+                raise
+            try:
+                return self._read_tiff_channel_with_pillow(
+                    channel,
+                    level=level,
+                    region=(y0, x0, height, width),
+                )
+            except Exception:
+                raise original_error
 
     def get_multiscale_channel(self, channel: int = 0) -> list:
         """Return a lazy OME-Zarr pyramid for direct use by Napari."""
         self._validate_channel(channel)
         if self.is_ome_zarr:
             return [level[channel] for level in self._levels]
+        if self._use_pillow_tiff_reader:
+            return [self._read_tiff_channel_with_pillow(channel, level=0)]
         if self._tiff_zarr_levels:
             return [level[channel] for level in self._tiff_zarr_levels]
         return [self.get_channel(channel)]
@@ -312,7 +464,22 @@ class QPTiffImage:
         else:
             levels = self._tiff_levels or [self.series]
             level_index = self._overview_level_index(levels, max_size)
-            overview = _compute(levels[level_index].asarray(key=channel))
+            if self._use_pillow_tiff_reader:
+                overview = self._read_tiff_channel_with_pillow(
+                    channel,
+                    level=level_index,
+                )
+            else:
+                try:
+                    overview = _compute(levels[level_index].asarray(key=channel))
+                except Exception as original_error:
+                    try:
+                        overview = self._read_tiff_channel_with_pillow(
+                            channel,
+                            level=level_index,
+                        )
+                    except Exception:
+                        raise original_error
 
         overview = np.squeeze(overview)
         if overview.ndim != 2:
