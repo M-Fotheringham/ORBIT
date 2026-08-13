@@ -22,6 +22,7 @@ _CELLPOSE_EXPORTS = {
     "build_cellpose_input",
     "dapi_channel_name",
     "membrane_marker_names",
+    "segment_project_image_paths",
     "segment_project_images",
 }
 
@@ -47,6 +48,7 @@ __all__ = [
     "membrane_marker_names",
     "model_calls_and_positive_probabilities",
     "random_seed_for_stage",
+    "segment_project_image_paths",
     "segment_project_images",
     "select_automated_refinement_indices",
     "select_automated_training_indices",

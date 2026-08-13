@@ -1,6 +1,6 @@
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 import numpy as np
 
@@ -67,6 +67,42 @@ class ProjectSegmentationSelectionTests(unittest.TestCase):
         self.assertEqual(segment_image.call_args.args[1], ["CD8"])
         self.assertIs(segment_image.call_args.args[2], model)
         self.assertEqual(segment_image.call_args.kwargs["fovs"], [candidate_fov])
+
+    def test_reports_when_model_has_finished_loading(self):
+        image = _ProjectImage(["DAPI", "CD8"])
+        candidate_fov = object()
+        progress = []
+
+        with (
+            patch.object(
+                cellpose_segmentation,
+                "tiled_segmentation_fovs",
+                return_value=[candidate_fov],
+            ),
+            patch.object(
+                cellpose_segmentation,
+                "select_dapi_positive_fovs",
+                return_value=[candidate_fov],
+            ),
+            patch.object(
+                cellpose_segmentation,
+                "create_cellpose_sam_model",
+                return_value=object(),
+            ),
+            patch.object(
+                cellpose_segmentation,
+                "segment_image",
+                return_value={"segmented": True},
+            ),
+        ):
+            cellpose_segmentation.segment_project_images(
+                [image],
+                ["CD8"],
+                progress_callback=progress.append,
+            )
+
+        phases = [update["phase"] for update in progress]
+        self.assertLess(phases.index("loading_model"), phases.index("model_loaded"))
 
     def test_generic_marker_names_survive_all_fov_selection(self):
         image = _ProjectImage(["Channel 0", "Channel 1"])
@@ -183,6 +219,58 @@ class ProjectSegmentationSelectionTests(unittest.TestCase):
                 ["Channel 0"],
                 nuclear_channel_name="Channel 0",
             )
+
+
+class ProjectSegmentationReaderOwnershipTests(unittest.TestCase):
+    def test_image_paths_are_opened_and_closed_in_the_worker(self):
+        first = Mock()
+        second = Mock()
+        expected = [{"segmented": True}]
+
+        with (
+            patch(
+                "orbit.image.QPTiffImage",
+                side_effect=[first, second],
+            ) as image_class,
+            patch.object(
+                cellpose_segmentation,
+                "segment_project_images",
+                return_value=expected,
+            ) as segment_images,
+        ):
+            result = cellpose_segmentation.segment_project_image_paths(
+                ["first.tif", "second.ome.zarr"],
+                ["CD8"],
+                nuclear_channel_name="DAPI",
+            )
+
+        self.assertIs(result, expected)
+        image_class.assert_has_calls([
+            call(Path("first.tif").resolve()),
+            call(Path("second.ome.zarr").resolve()),
+        ])
+        self.assertEqual(segment_images.call_args.args[:2], ([first, second], ["CD8"]))
+        second.close.assert_called_once_with()
+        first.close.assert_called_once_with()
+
+    def test_worker_owned_readers_close_after_a_segmentation_error(self):
+        image = Mock()
+
+        with (
+            patch("orbit.image.QPTiffImage", return_value=image),
+            patch.object(
+                cellpose_segmentation,
+                "segment_project_images",
+                side_effect=RuntimeError("segmentation failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "segmentation failed"),
+        ):
+            cellpose_segmentation.segment_project_image_paths(
+                ["project.tif"],
+                ["CD8"],
+            )
+
+        image.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

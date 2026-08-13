@@ -62,7 +62,7 @@ from orbit.models.cellpose_segmentation import (
     segmentation_export_paths,
     save_segmentation_outputs,
     segment_fov_preview,
-    segment_project_images,
+    segment_project_image_paths,
 )
 from orbit.project import (
     export_provenance,
@@ -385,7 +385,7 @@ class CellposeSegmentationWorker(QRunnable):
 
     def __init__(
         self,
-        images,
+        image_paths,
         marker_names,
         nuclear_channel_name,
         pixel_size_um,
@@ -393,7 +393,7 @@ class CellposeSegmentationWorker(QRunnable):
         dapi_positive_only,
     ):
         super().__init__()
-        self.images = list(images)
+        self.image_paths = [str(path) for path in image_paths]
         self.marker_names = list(marker_names)
         self.nuclear_channel_name = (
             None
@@ -407,8 +407,8 @@ class CellposeSegmentationWorker(QRunnable):
 
     def run(self):
         try:
-            results = segment_project_images(
-                self.images,
+            results = segment_project_image_paths(
+                self.image_paths,
                 self.marker_names,
                 pixel_size_um=self.pixel_size_um,
                 progress_callback=self.signals.progress.emit,
@@ -2783,7 +2783,7 @@ class OrbitFOVViewer(QWidget):
             "first use."
         )
         worker = CellposeSegmentationWorker(
-            images=[state["img"] for state in self.loaded_images],
+            image_paths=[state["image_path"] for state in self.loaded_images],
             marker_names=marker_names,
             nuclear_channel_name=nuclear_channel_name,
             pixel_size_um=DEFAULT_PIXEL_SIZE_UM,
