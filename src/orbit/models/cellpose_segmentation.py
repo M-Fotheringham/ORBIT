@@ -25,7 +25,53 @@ from orbit.models.tiled_segmentation import (
 )
 
 CELLPOSE_SAM_MODEL = "cpsam_v2"
+CELLPOSE_SAM_MODEL_SIZE_BYTES = 1_233_586_851
+CELLPOSE_MODEL_DIRECTORY = "cellpose_models"
+ORBIT_CELLPOSE_MODEL_ENV = "ORBIT_CPSAM_V2_PATH"
 DEFAULT_PIXEL_SIZE_UM = 0.5064
+
+
+def bundled_cellpose_sam_model_path() -> Path | None:
+    """Return ORBIT's verified build-time model, when one is available.
+
+    Installed builds load the model directly from the application directory;
+    they never need to write to Cellpose's per-user cache. A staged source-tree
+    model is also recognized, which makes ``uv run orbit`` use the same bytes
+    after running ``scripts/stage_cellpose_model.py``.
+    """
+    override = os.environ.get(ORBIT_CELLPOSE_MODEL_ENV)
+    candidates = []
+    if override:
+        candidates.append(Path(override).expanduser())
+
+    pyinstaller_root = getattr(sys, "_MEIPASS", None)
+    if pyinstaller_root:
+        candidates.append(
+            Path(pyinstaller_root) / CELLPOSE_MODEL_DIRECTORY / CELLPOSE_SAM_MODEL
+        )
+    candidates.append(
+        Path(sys.executable).resolve().parent
+        / CELLPOSE_MODEL_DIRECTORY
+        / CELLPOSE_SAM_MODEL
+    )
+    candidates.append(
+        Path(__file__).resolve().parents[3]
+        / "build"
+        / CELLPOSE_MODEL_DIRECTORY
+        / CELLPOSE_SAM_MODEL
+    )
+
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+            if (
+                resolved.is_file()
+                and resolved.stat().st_size == CELLPOSE_SAM_MODEL_SIZE_BYTES
+            ):
+                return resolved
+        except OSError:
+            continue
+    return None
 
 
 @contextmanager
@@ -263,13 +309,25 @@ def create_cellpose_sam_model(gpu: bool = True):
             "'python -m pip install -e .' and try again."
         ) from error
 
-    # A first run downloads the model and creates a tqdm progress bar. The
-    # context prevents tqdm from crashing in ORBIT's windowed executable while
-    # leaving normal terminal output untouched for ``uv run orbit``.
+    model_path = bundled_cellpose_sam_model_path()
+    frozen_build = bool(
+        getattr(sys, "frozen", False) or "__compiled__" in globals()
+    )
+    if model_path is None and frozen_build:
+        raise RuntimeError(
+            "This ORBIT installation does not contain its bundled cpsam_v2 "
+            "model. Reinstall ORBIT using the complete installer."
+        )
+
+    # Source checkouts retain Cellpose's normal cache/download fallback when no
+    # staged model exists. Standalone builds always pass the installed path and
+    # therefore never download from the segmentation worker.
     with _writable_cellpose_streams():
         return models.CellposeModel(
             gpu=bool(gpu),
-            pretrained_model=CELLPOSE_SAM_MODEL,
+            pretrained_model=(
+                str(model_path) if model_path is not None else CELLPOSE_SAM_MODEL
+            ),
         )
 
 
@@ -1018,6 +1076,7 @@ __all__ = [
     "DEFAULT_SEGMENTATION_FOV_OVERLAP",
     "DEFAULT_SEGMENTATION_FOV_SIZE",
     "build_cellpose_input",
+    "bundled_cellpose_sam_model_path",
     "create_cellpose_sam_model",
     "cuda_compatible_gpu_available",
     "dapi_channel_name",

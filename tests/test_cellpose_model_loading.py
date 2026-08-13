@@ -1,11 +1,17 @@
 import io
+import os
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from orbit.models.cellpose_segmentation import (
     CELLPOSE_SAM_MODEL,
+    CELLPOSE_SAM_MODEL_SIZE_BYTES,
+    ORBIT_CELLPOSE_MODEL_ENV,
+    bundled_cellpose_sam_model_path,
     create_cellpose_sam_model,
 )
 
@@ -46,6 +52,58 @@ class CellposeModelLoadingTests(unittest.TestCase):
             })
             self.assertIsNone(sys.stdout)
             self.assertIsNone(sys.stderr)
+
+    def test_installed_model_path_bypasses_cellpose_download(self):
+        modules = _fake_cellpose_modules(_StreamWritingCellposeModel)
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = Path(directory) / CELLPOSE_SAM_MODEL
+            with model_path.open("wb") as stream:
+                stream.truncate(CELLPOSE_SAM_MODEL_SIZE_BYTES)
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {ORBIT_CELLPOSE_MODEL_ENV: str(model_path)},
+                    clear=False,
+                ),
+                patch.dict(sys.modules, modules),
+            ):
+                model = create_cellpose_sam_model(gpu=False)
+
+        self.assertEqual(model.kwargs, {
+            "gpu": False,
+            "pretrained_model": str(model_path.resolve()),
+        })
+
+    def test_invalid_bundled_model_is_not_selected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = Path(directory) / CELLPOSE_SAM_MODEL
+            model_path.write_bytes(b"incomplete")
+            with patch.dict(
+                os.environ,
+                {ORBIT_CELLPOSE_MODEL_ENV: str(model_path)},
+                clear=False,
+            ):
+                self.assertIsNone(bundled_cellpose_sam_model_path())
+
+    def test_incomplete_standalone_install_does_not_download(self):
+        modules = _fake_cellpose_modules(_StreamWritingCellposeModel)
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(
+                sys,
+                "frozen",
+                True,
+                create=True,
+            ),
+            patch(
+                "orbit.models.cellpose_segmentation."
+                "bundled_cellpose_sam_model_path",
+                return_value=None,
+            ),
+            self.assertRaisesRegex(RuntimeError, "complete installer"),
+        ):
+            create_cellpose_sam_model(gpu=False)
 
     def test_model_loading_preserves_real_console_streams(self):
         modules = _fake_cellpose_modules(_StreamWritingCellposeModel)
