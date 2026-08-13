@@ -931,6 +931,14 @@ def segment_project_images(
             "message": f"Loading Cellpose-SAM model {CELLPOSE_SAM_MODEL}...",
         })
     model = create_cellpose_sam_model(gpu=True)
+    if progress_callback is not None:
+        progress_callback({
+            "phase": "model_loaded",
+            "message": (
+                f"Cellpose-SAM model {CELLPOSE_SAM_MODEL} loaded; starting "
+                "tiled segmentation..."
+            ),
+        })
     results = []
     segmented_fovs = 0
     for image, selected_fovs in zip(images, selected_by_image):
@@ -957,6 +965,53 @@ def segment_project_images(
     return results
 
 
+def segment_project_image_paths(
+    image_paths: Iterable[str | Path],
+    selected_marker_names: Iterable[str],
+    pixel_size_um: float = DEFAULT_PIXEL_SIZE_UM,
+    progress_callback: Callable[[dict], None] | None = None,
+    *,
+    nuclear_channel_name: str | None = None,
+    fov_size: int = DEFAULT_SEGMENTATION_FOV_SIZE,
+    fov_overlap: float = DEFAULT_SEGMENTATION_FOV_OVERLAP,
+    dapi_positive_only: bool = True,
+    minimum_dapi_fraction: float = DEFAULT_MINIMUM_DAPI_FRACTION,
+) -> list[dict]:
+    """Open, segment, and close images in the calling worker thread.
+
+    The viewer keeps image readers alive for Napari. Reusing those same TIFF
+    readers in a background worker lets the viewer and segmentation code access
+    a single ``tifffile`` Zarr store and its native decoder concurrently. On
+    Windows that can terminate the process without a Python exception. Opening
+    independent readers here gives the segmentation worker sole ownership of
+    its TIFF handles while retaining the existing OME-Zarr behaviour.
+    """
+    from orbit.image import QPTiffImage
+
+    paths = [Path(path).expanduser().resolve() for path in image_paths]
+    if not paths:
+        raise ValueError("Load at least one image before segmenting.")
+
+    images = []
+    try:
+        for path in paths:
+            images.append(QPTiffImage(path))
+        return segment_project_images(
+            images,
+            selected_marker_names,
+            pixel_size_um=pixel_size_um,
+            progress_callback=progress_callback,
+            nuclear_channel_name=nuclear_channel_name,
+            fov_size=fov_size,
+            fov_overlap=fov_overlap,
+            dapi_positive_only=dapi_positive_only,
+            minimum_dapi_fraction=minimum_dapi_fraction,
+        )
+    finally:
+        for image in reversed(images):
+            image.close()
+
+
 __all__ = [
     "CELLPOSE_SAM_MODEL",
     "DEFAULT_PIXEL_SIZE_UM",
@@ -977,5 +1032,6 @@ __all__ = [
     "segmentation_export_paths",
     "segment_image",
     "segment_fov_preview",
+    "segment_project_image_paths",
     "segment_project_images",
 ]

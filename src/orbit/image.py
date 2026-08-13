@@ -124,19 +124,64 @@ class QPTiffImage:
 
     def _open_tiff(self):
         self.tif = tiff.TiffFile(self.path)
-        self.series = self._highest_resolution_tiff_series()
-        self.shape = tuple(int(value) for value in self.series.shape)
-        if len(self.shape) != 3:
-            raise ValueError(
-                "ORBIT currently expects TIFF images in C-Y-X order; "
-                f"got shape {self.shape}."
-            )
-        self.dtype = self.series.dtype
-        self._axes = ("c", "y", "x")
-        self.channel_names = self._get_tiff_channel_names()
-        self._use_pillow_tiff_reader = self._needs_pillow_tiff_reader()
-        if not self._use_pillow_tiff_reader:
-            self._open_tiff_zarr_levels()
+        try:
+            self.series = self._highest_resolution_tiff_series()
+            self._validate_tiff_data_bounds()
+            self.shape = tuple(int(value) for value in self.series.shape)
+            if len(self.shape) != 3:
+                raise ValueError(
+                    "ORBIT currently expects TIFF images in C-Y-X order; "
+                    f"got shape {self.shape}."
+                )
+            self.dtype = self.series.dtype
+            self._axes = ("c", "y", "x")
+            self.channel_names = self._get_tiff_channel_names()
+            self._use_pillow_tiff_reader = self._needs_pillow_tiff_reader()
+            if not self._use_pillow_tiff_reader:
+                self._open_tiff_zarr_levels()
+        except Exception:
+            self.close()
+            raise
+
+    def _validate_tiff_data_bounds(self):
+        """Reject truncated TIFFs before a native codec reads invalid strips.
+
+        Some native TIFF decoders terminate the process instead of raising a
+        Python exception when a strip offset points beyond the end of a
+        truncated file. TIFF metadata provide the compressed strip/tile byte
+        ranges, so ORBIT can detect that condition safely before displaying or
+        segmenting the image.
+        """
+        for level_index, level in enumerate(self._tiff_levels):
+            for page_index, page in enumerate(level.pages):
+                offsets = tuple(map(int, getattr(page, "dataoffsets", ())))
+                bytecounts = tuple(map(int, getattr(page, "databytecounts", ())))
+                if len(offsets) != len(bytecounts):
+                    raise ValueError(
+                        f"TIFF pixel-data metadata are corrupt in {self.path.name}: "
+                        f"page {page_index} has {len(offsets)} offsets but "
+                        f"{len(bytecounts)} byte counts. Re-copy or re-export "
+                        "the image from its original source."
+                    )
+
+                parent = getattr(page, "parent", None)
+                filehandle = getattr(parent, "filehandle", None)
+                if filehandle is None:
+                    filehandle = self.tif.filehandle
+                file_size = int(filehandle.size)
+                file_path = Path(filehandle.path)
+                for segment_index, (offset, bytecount) in enumerate(
+                    zip(offsets, bytecounts)
+                ):
+                    if offset < 0 or bytecount < 0 or offset + bytecount > file_size:
+                        required_size = offset + bytecount
+                        raise ValueError(
+                            f"TIFF pixel data are truncated in {file_path.name}: "
+                            f"level {level_index}, page {page_index}, segment "
+                            f"{segment_index} ends at byte {required_size:,}, but "
+                            f"the file contains only {file_size:,} bytes. Re-copy "
+                            "or re-export the complete TIFF before segmenting it."
+                        )
 
     def _needs_pillow_tiff_reader(self) -> bool:
         """Use Pillow only when an LZW TIFF lacks a working imagecodecs decoder."""
