@@ -39,6 +39,63 @@ def resolve_reference(path: str | Path | None, project_path: str | Path) -> str 
     return str(reference.resolve())
 
 
+def relocated_reference(
+    missing_path: str | Path,
+    relocation_roots: dict[Path, Path],
+) -> str | None:
+    """Resolve a missing asset through previously selected directory moves."""
+    missing = Path(missing_path).expanduser().resolve()
+    roots = sorted(
+        (
+            (
+                Path(old_root).expanduser().resolve(),
+                Path(new_root).expanduser().resolve(),
+            )
+            for old_root, new_root in relocation_roots.items()
+        ),
+        key=lambda pair: len(pair[0].parts),
+        reverse=True,
+    )
+    for old_root, new_root in roots:
+        try:
+            relative = missing.relative_to(old_root)
+        except ValueError:
+            continue
+        candidate = new_root / relative
+        if candidate.exists():
+            return str(candidate.resolve())
+    return None
+
+
+def remember_relocation(
+    missing_path: str | Path,
+    selected_path: str | Path,
+    relocation_roots: dict[Path, Path],
+) -> None:
+    """Remember compatible parent moves so sibling assets can be found.
+
+    The exact containing directory is always recorded. Matching trailing
+    directory names are then walked upward, allowing a selected path such as
+    ``new/study/images/slide.tif`` to also relocate assets stored under
+    ``old/study/segmentations`` without recursively searching the filesystem.
+    """
+    old_parent = Path(missing_path).expanduser().resolve().parent
+    new_parent = Path(selected_path).expanduser().resolve().parent
+    relocation_roots[old_parent] = new_parent
+
+    while (
+        old_parent.name
+        and new_parent.name
+        and old_parent.name.casefold() == new_parent.name.casefold()
+    ):
+        relocation_roots[old_parent] = new_parent
+        next_old = old_parent.parent
+        next_new = new_parent.parent
+        if next_old == old_parent or next_new == new_parent:
+            break
+        old_parent, new_parent = next_old, next_new
+
+
 def load_project_document(project_path: str | Path) -> dict[str, Any]:
     with Path(project_path).open("r", encoding="utf-8") as stream:
         document = json.load(stream)
@@ -94,6 +151,8 @@ __all__ = [
     "load_project_document",
     "orbit_version",
     "portable_reference",
+    "relocated_reference",
+    "remember_relocation",
     "resolve_reference",
     "write_provenance",
 ]
