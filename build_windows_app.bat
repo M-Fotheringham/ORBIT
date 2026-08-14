@@ -12,11 +12,6 @@ uv sync --locked --group build
 if errorlevel 1 goto :failed
 
 echo.
-echo Staging the verified cpsam_v2 model for the installer...
-uv run python scripts\stage_cellpose_model.py
-if errorlevel 1 goto :failed
-
-echo.
 echo Building the standalone ORBIT application...
 uv run --group build pyinstaller --clean --noconfirm ORBIT.spec
 if errorlevel 1 goto :failed
@@ -25,15 +20,17 @@ if not exist "%ROOT%\dist\ORBIT\ORBIT.exe" (
     echo ERROR: PyInstaller finished, but dist\ORBIT\ORBIT.exe was not found.
     goto :failed
 )
-if not exist "%ROOT%\dist\ORBIT\cellpose_models\cpsam_v2" (
-    echo ERROR: ORBIT.exe was built without the bundled cpsam_v2 model.
+if exist "%ROOT%\dist\ORBIT\cellpose_models\cpsam_v2" (
+    echo ERROR: The application build still contains cpsam_v2.
+    echo Remove the old dist directory and build again.
     goto :failed
 )
 
 echo.
 echo Build completed successfully:
 echo   %ROOT%\dist\ORBIT\ORBIT.exe
-echo The complete dist\ORBIT directory must be included by the installer.
+echo The application build excludes cpsam_v2 as intended.
+echo Compile installer\orbit_installer_setup.iss to create the installer.
 popd
 exit /b 0
 

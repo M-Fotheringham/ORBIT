@@ -101,7 +101,7 @@ class CellposeModelLoadingTests(unittest.TestCase):
                 "bundled_cellpose_sam_model_path",
                 return_value=None,
             ),
-            self.assertRaisesRegex(RuntimeError, "complete installer"),
+            self.assertRaisesRegex(RuntimeError, "connected to the internet"),
         ):
             create_cellpose_sam_model(gpu=False)
 
