@@ -444,14 +444,15 @@ def _segmentation_compartment_masks(
     membrane_width_um = float(membrane_width_um)
     if not np.isfinite(pixel_size_um) or pixel_size_um <= 0:
         raise ValueError("The pixel size must be a finite positive number.")
-    if not np.isfinite(membrane_width_um) or membrane_width_um <= 0:
+    if not np.isfinite(membrane_width_um) or membrane_width_um < 0:
         raise ValueError(
-            "The membrane-compartment width must be a finite positive number."
+            "The membrane-compartment width must be a finite non-negative "
+            "number."
         )
 
     inward_buffer_pixels = max(
         int(round(membrane_width_um / pixel_size_um)),
-        1,
+        0,
     )
     nucleus_pixels = compartment_mask_for_rows(
         masks,
@@ -634,6 +635,7 @@ def segment_fov_preview(
     model=None,
     *,
     nuclear_channel_name: str | None = None,
+    membrane_width_um: float = DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM,
 ) -> dict:
     """Segment only the displayed FOV on CPU without changing project data."""
     selected = list(dict.fromkeys(str(name) for name in selected_marker_names))
@@ -655,7 +657,10 @@ def segment_fov_preview(
     )
     masks = np.asarray(masks, dtype=np.uint32)
     cell_data = measure_segmented_cells(
-        masks, region_image, pixel_size_um=pixel_size_um
+        masks,
+        region_image,
+        pixel_size_um=pixel_size_um,
+        membrane_width_um=membrane_width_um,
     )
     cell_data = _offset_fov_measurements(
         cell_data, y0=int(y0), x0=int(x0), pixel_size_um=pixel_size_um
@@ -675,6 +680,7 @@ def segment_fov_preview(
         "compute_device": "cpu",
         "scope": "current_fov",
         "pixel_size_um": float(pixel_size_um),
+        "membrane_width_um": float(membrane_width_um),
     }
 
 
@@ -858,6 +864,7 @@ def segment_image(
     pixel_size_um: float = DEFAULT_PIXEL_SIZE_UM,
     *,
     nuclear_channel_name: str | None = None,
+    membrane_width_um: float = DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM,
     fovs: Iterable[SegmentationFOV] | None = None,
     fov_size: int = DEFAULT_SEGMENTATION_FOV_SIZE,
     fov_overlap: float = DEFAULT_SEGMENTATION_FOV_OVERLAP,
@@ -944,6 +951,7 @@ def segment_image(
                     masks,
                     region_image,
                     pixel_size_um=pixel_size_um,
+                    membrane_width_um=membrane_width_um,
                 )
                 stitcher.add_fov(
                     fov,
@@ -980,6 +988,7 @@ def segment_image(
         "cell_count": int(cell_count),
         "marker_names": selected,
         "nuclear_channel_name": nuclear_name,
+        "membrane_width_um": float(membrane_width_um),
         "model_name": CELLPOSE_SAM_MODEL,
         "compute_device": "cuda",
         "scope": "tiled_whole_image",
@@ -1001,6 +1010,7 @@ def segment_project_images(
     progress_callback: Callable[[dict], None] | None = None,
     *,
     nuclear_channel_name: str | None = None,
+    membrane_width_um: float = DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM,
     fov_size: int = DEFAULT_SEGMENTATION_FOV_SIZE,
     fov_overlap: float = DEFAULT_SEGMENTATION_FOV_OVERLAP,
     dapi_positive_only: bool = True,
@@ -1105,6 +1115,7 @@ def segment_project_images(
                     default=pixel_size_um
                 ),
                 nuclear_channel_name=nuclear_channel_name,
+                membrane_width_um=membrane_width_um,
                 fovs=selected_fovs,
                 fov_size=fov_size,
                 fov_overlap=fov_overlap,
@@ -1126,6 +1137,7 @@ def segment_project_image_paths(
     progress_callback: Callable[[dict], None] | None = None,
     *,
     nuclear_channel_name: str | None = None,
+    membrane_width_um: float = DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM,
     fov_size: int = DEFAULT_SEGMENTATION_FOV_SIZE,
     fov_overlap: float = DEFAULT_SEGMENTATION_FOV_OVERLAP,
     dapi_positive_only: bool = True,
@@ -1156,6 +1168,7 @@ def segment_project_image_paths(
             pixel_size_um=pixel_size_um,
             progress_callback=progress_callback,
             nuclear_channel_name=nuclear_channel_name,
+            membrane_width_um=membrane_width_um,
             fov_size=fov_size,
             fov_overlap=fov_overlap,
             dapi_positive_only=dapi_positive_only,

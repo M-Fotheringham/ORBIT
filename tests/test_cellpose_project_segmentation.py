@@ -61,12 +61,17 @@ class ProjectSegmentationSelectionTests(unittest.TestCase):
                 [image],
                 ["CD8"],
                 dapi_positive_only=True,
+                membrane_width_um=3.2,
             )
 
         self.assertEqual(result, [{"segmented": True}])
         self.assertEqual(segment_image.call_args.args[1], ["CD8"])
         self.assertIs(segment_image.call_args.args[2], model)
         self.assertEqual(segment_image.call_args.kwargs["fovs"], [candidate_fov])
+        self.assertEqual(
+            segment_image.call_args.kwargs["membrane_width_um"],
+            3.2,
+        )
 
     def test_reports_when_model_has_finished_loading(self):
         image = _ProjectImage(["DAPI", "CD8"])
@@ -242,6 +247,7 @@ class ProjectSegmentationReaderOwnershipTests(unittest.TestCase):
                 ["first.tif", "second.ome.zarr"],
                 ["CD8"],
                 nuclear_channel_name="DAPI",
+                membrane_width_um=1.7,
             )
 
         self.assertIs(result, expected)
@@ -250,6 +256,10 @@ class ProjectSegmentationReaderOwnershipTests(unittest.TestCase):
             call(Path("second.ome.zarr").resolve()),
         ])
         self.assertEqual(segment_images.call_args.args[:2], ([first, second], ["CD8"]))
+        self.assertEqual(
+            segment_images.call_args.kwargs["membrane_width_um"],
+            1.7,
+        )
         second.close.assert_called_once_with()
         first.close.assert_called_once_with()
 

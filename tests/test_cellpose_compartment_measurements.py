@@ -78,6 +78,26 @@ class CellposeCompartmentMeasurementTests(unittest.TestCase):
         self.assertEqual(cell["DAPI: Membrane Mean"], 12.0)
         self.assertEqual(cell["DAPI: Cell Mean"], 12.0)
 
+    def test_zero_width_uses_only_the_cell_boundary_as_membrane(self):
+        masks = np.ones((5, 5), dtype=np.uint32)
+        channel = np.arange(25, dtype=np.float32).reshape(5, 5)
+        image = _MeasurementImage(["CD8"], [channel])
+
+        cells = measure_segmented_cells(
+            masks,
+            image,
+            pixel_size_um=1.0,
+            membrane_width_um=0.0,
+        )
+
+        cell = cells.iloc[0]
+        self.assertEqual(cell["Nucleus Area px"], 9)
+        self.assertEqual(cell["Membrane Area px"], 16)
+        self.assertEqual(
+            cell["Nucleus Area px"] + cell["Membrane Area px"],
+            cell["Area px"],
+        )
+
     def test_rejects_invalid_physical_scale(self):
         masks = np.ones((3, 3), dtype=np.uint32)
         image = _MeasurementImage(["CD8"], [np.ones((3, 3))])
@@ -85,7 +105,7 @@ class CellposeCompartmentMeasurementTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pixel size"):
             measure_segmented_cells(masks, image, pixel_size_um=0)
         with self.assertRaisesRegex(ValueError, "membrane-compartment width"):
-            measure_segmented_cells(masks, image, membrane_width_um=0)
+            measure_segmented_cells(masks, image, membrane_width_um=-0.1)
 
 
 if __name__ == "__main__":
