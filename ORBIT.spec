@@ -1,23 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
-from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_dynamic_libs
 from PyInstaller.utils.hooks import collect_all
 from PyInstaller.utils.hooks import copy_metadata
 
-repository_root = Path(globals().get('SPECPATH', '.')).resolve()
-cellpose_model = repository_root / 'build' / 'cellpose_models' / 'cpsam_v2'
-if not cellpose_model.is_file():
-    raise SystemExit(
-        'The staged cpsam_v2 model is missing. Run:\n'
-        '  uv run python scripts/stage_cellpose_model.py\n'
-        'then build ORBIT again.'
-    )
-
 datas = [
     ('docs/figs/icon_logo.ico', 'docs/figs'),
-    (str(cellpose_model), 'cellpose_models'),
     (
         'third_party/CELLPOSE_SAM_MODEL_NOTICE.txt',
         'licenses',

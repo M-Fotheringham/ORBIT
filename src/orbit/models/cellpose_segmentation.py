@@ -32,12 +32,13 @@ DEFAULT_PIXEL_SIZE_UM = 0.5064
 
 
 def bundled_cellpose_sam_model_path() -> Path | None:
-    """Return ORBIT's verified build-time model, when one is available.
+    """Return ORBIT's installed or explicitly supplied model, when available.
 
-    Installed builds load the model directly from the application directory;
-    they never need to write to Cellpose's per-user cache. A staged source-tree
-    model is also recognized, which makes ``uv run orbit`` use the same bytes
-    after running ``scripts/stage_cellpose_model.py``.
+    The Windows installer downloads and verifies the model into the application
+    directory. Standalone builds therefore never need to write to Cellpose's
+    per-user cache or download from a segmentation worker. An explicit
+    ``ORBIT_CPSAM_V2_PATH`` override and the legacy source-tree staging path are
+    retained for development and backwards compatibility.
     """
     override = os.environ.get(ORBIT_CELLPOSE_MODEL_ENV)
     candidates = []
@@ -315,13 +316,14 @@ def create_cellpose_sam_model(gpu: bool = True):
     )
     if model_path is None and frozen_build:
         raise RuntimeError(
-            "This ORBIT installation does not contain its bundled cpsam_v2 "
-            "model. Reinstall ORBIT using the complete installer."
+            "This ORBIT installation is missing its verified cpsam_v2 model. "
+            "Reinstall ORBIT while connected to the internet so Setup can "
+            "download and verify the model."
         )
 
     # Source checkouts retain Cellpose's normal cache/download fallback when no
-    # staged model exists. Standalone builds always pass the installed path and
-    # therefore never download from the segmentation worker.
+    # local model exists. Standalone builds always pass the installer-provided
+    # path and therefore never download from the segmentation worker.
     with _writable_cellpose_streams():
         return models.CellposeModel(
             gpu=bool(gpu),
