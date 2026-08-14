@@ -23,12 +23,14 @@ from orbit.models.tiled_segmentation import (
     select_dapi_positive_fovs,
     tiled_segmentation_fovs,
 )
+from orbit.threshold import compartment_mask_for_rows
 
 CELLPOSE_SAM_MODEL = "cpsam_v2"
 CELLPOSE_SAM_MODEL_SIZE_BYTES = 1_233_586_851
 CELLPOSE_MODEL_DIRECTORY = "cellpose_models"
 ORBIT_CELLPOSE_MODEL_ENV = "ORBIT_CPSAM_V2_PATH"
 DEFAULT_PIXEL_SIZE_UM = 0.5064
+DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM = 2.0
 
 
 def bundled_cellpose_sam_model_path() -> Path | None:
@@ -374,8 +376,16 @@ def _intensity_statistics_by_label(
     masks: np.ndarray,
     maximum_label: int,
     chunk_rows: int = 512,
+    selected_pixels: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Calculate finite-pixel intensity statistics without copying full masks."""
+    """Calculate finite-pixel intensity statistics for all or selected pixels."""
+    if selected_pixels is not None:
+        selected_pixels = np.asarray(selected_pixels, dtype=bool)
+        if selected_pixels.shape != masks.shape:
+            raise ValueError(
+                "The compartment selection and segmentation mask dimensions "
+                f"differ ({selected_pixels.shape} versus {masks.shape})."
+            )
     counts = np.zeros(maximum_label + 1, dtype=np.uint64)
     sums = np.zeros(maximum_label + 1, dtype=np.float64)
     squared_sums = np.zeros(maximum_label + 1, dtype=np.float64)
@@ -387,6 +397,8 @@ def _intensity_statistics_by_label(
         labels = np.asarray(masks[y0:y1]).reshape(-1)
         values = np.asarray(channel[y0:y1]).reshape(-1)
         valid = (labels > 0) & np.isfinite(values)
+        if selected_pixels is not None:
+            valid &= selected_pixels[y0:y1].reshape(-1)
         if not np.any(valid):
             continue
         labels = labels[valid].astype(np.int64, copy=False)
@@ -422,12 +434,64 @@ def _intensity_statistics_by_label(
     return means, deviations, minima, maxima
 
 
+def _segmentation_compartment_masks(
+    masks: np.ndarray,
+    pixel_size_um: float,
+    membrane_width_um: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Partition cell labels into an eroded nucleus and peripheral membrane."""
+    pixel_size_um = float(pixel_size_um)
+    membrane_width_um = float(membrane_width_um)
+    if not np.isfinite(pixel_size_um) or pixel_size_um <= 0:
+        raise ValueError("The pixel size must be a finite positive number.")
+    if not np.isfinite(membrane_width_um) or membrane_width_um < 0:
+        raise ValueError(
+            "The membrane-compartment width must be a finite non-negative "
+            "number."
+        )
+
+    inward_buffer_pixels = max(
+        int(round(membrane_width_um / pixel_size_um)),
+        0,
+    )
+    nucleus_pixels = compartment_mask_for_rows(
+        masks,
+        0,
+        masks.shape[0],
+        "nucleus",
+        inward_buffer_pixels,
+    )
+    cell_pixels = masks > 0
+    membrane_pixels = cell_pixels & ~nucleus_pixels
+    return nucleus_pixels, membrane_pixels
+
+
+def _compartment_pixel_counts(
+    masks: np.ndarray,
+    selected_pixels: np.ndarray,
+    maximum_label: int,
+) -> np.ndarray:
+    """Count selected pixels for each cell label."""
+    labels = np.asarray(masks)[selected_pixels]
+    return np.bincount(
+        labels.astype(np.int64, copy=False),
+        minlength=maximum_label + 1,
+    )
+
+
 def measure_segmented_cells(
     masks: np.ndarray,
     image,
     pixel_size_um: float = DEFAULT_PIXEL_SIZE_UM,
+    membrane_width_um: float = DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM,
 ) -> pd.DataFrame:
-    """Create morphology and all-channel fluorescence data for every cell."""
+    """Create morphology and compartment fluorescence data for every cell.
+
+    Cellpose-SAM returns one whole-cell label mask. ORBIT therefore defines the
+    membrane compartment as the outer ``membrane_width_um`` of each cell and
+    the nucleus compartment as the remaining eroded interior. Together these
+    two disjoint compartments cover the complete Cellpose cell mask.
+    """
     masks = np.asarray(masks)
     if masks.ndim != 2:
         raise ValueError(f"Cellpose returned a non-2D mask: {masks.shape}.")
@@ -492,19 +556,50 @@ def measure_segmented_cells(
 
     cell_ids = cells["Cell ID"].to_numpy(dtype=np.int64)
     maximum_label = int(masks.max())
+    nucleus_pixels, membrane_pixels = _segmentation_compartment_masks(
+        masks,
+        pixel_size_um=pixel_size_um,
+        membrane_width_um=membrane_width_um,
+    )
+    nucleus_counts = _compartment_pixel_counts(
+        masks,
+        nucleus_pixels,
+        maximum_label,
+    )
+    membrane_counts = _compartment_pixel_counts(
+        masks,
+        membrane_pixels,
+        maximum_label,
+    )
+    cells["Nucleus Area px"] = nucleus_counts[cell_ids]
+    cells["Nucleus Area µm²"] = (
+        cells["Nucleus Area px"] * float(pixel_size_um) ** 2
+    )
+    cells["Membrane Area px"] = membrane_counts[cell_ids]
+    cells["Membrane Area µm²"] = (
+        cells["Membrane Area px"] * float(pixel_size_um) ** 2
+    )
+
     channel_names = [str(name) for name in image.get_channel_names()]
     channel_labels = _safe_channel_labels(channel_names)
     for channel_index, channel_label in enumerate(channel_labels):
         channel = image.get_channel(channel_index)
-        means, deviations, minima, maxima = _intensity_statistics_by_label(
-            channel,
-            masks,
-            maximum_label,
-        )
-        cells[f"{channel_label}: Cell Mean"] = means[cell_ids]
-        cells[f"{channel_label}: Cell Std Dev"] = deviations[cell_ids]
-        cells[f"{channel_label}: Cell Min"] = minima[cell_ids]
-        cells[f"{channel_label}: Cell Max"] = maxima[cell_ids]
+        for compartment_name, selected_pixels in (
+            ("Cell", None),
+            ("Nucleus", nucleus_pixels),
+            ("Membrane", membrane_pixels),
+        ):
+            means, deviations, minima, maxima = _intensity_statistics_by_label(
+                channel,
+                masks,
+                maximum_label,
+                selected_pixels=selected_pixels,
+            )
+            prefix = f"{channel_label}: {compartment_name}"
+            cells[f"{prefix} Mean"] = means[cell_ids]
+            cells[f"{prefix} Std Dev"] = deviations[cell_ids]
+            cells[f"{prefix} Min"] = minima[cell_ids]
+            cells[f"{prefix} Max"] = maxima[cell_ids]
 
     return cells
 
@@ -540,6 +635,7 @@ def segment_fov_preview(
     model=None,
     *,
     nuclear_channel_name: str | None = None,
+    membrane_width_um: float = DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM,
 ) -> dict:
     """Segment only the displayed FOV on CPU without changing project data."""
     selected = list(dict.fromkeys(str(name) for name in selected_marker_names))
@@ -561,7 +657,10 @@ def segment_fov_preview(
     )
     masks = np.asarray(masks, dtype=np.uint32)
     cell_data = measure_segmented_cells(
-        masks, region_image, pixel_size_um=pixel_size_um
+        masks,
+        region_image,
+        pixel_size_um=pixel_size_um,
+        membrane_width_um=membrane_width_um,
     )
     cell_data = _offset_fov_measurements(
         cell_data, y0=int(y0), x0=int(x0), pixel_size_um=pixel_size_um
@@ -581,6 +680,7 @@ def segment_fov_preview(
         "compute_device": "cpu",
         "scope": "current_fov",
         "pixel_size_um": float(pixel_size_um),
+        "membrane_width_um": float(membrane_width_um),
     }
 
 
@@ -764,6 +864,7 @@ def segment_image(
     pixel_size_um: float = DEFAULT_PIXEL_SIZE_UM,
     *,
     nuclear_channel_name: str | None = None,
+    membrane_width_um: float = DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM,
     fovs: Iterable[SegmentationFOV] | None = None,
     fov_size: int = DEFAULT_SEGMENTATION_FOV_SIZE,
     fov_overlap: float = DEFAULT_SEGMENTATION_FOV_OVERLAP,
@@ -850,6 +951,7 @@ def segment_image(
                     masks,
                     region_image,
                     pixel_size_um=pixel_size_um,
+                    membrane_width_um=membrane_width_um,
                 )
                 stitcher.add_fov(
                     fov,
@@ -886,6 +988,7 @@ def segment_image(
         "cell_count": int(cell_count),
         "marker_names": selected,
         "nuclear_channel_name": nuclear_name,
+        "membrane_width_um": float(membrane_width_um),
         "model_name": CELLPOSE_SAM_MODEL,
         "compute_device": "cuda",
         "scope": "tiled_whole_image",
@@ -907,6 +1010,7 @@ def segment_project_images(
     progress_callback: Callable[[dict], None] | None = None,
     *,
     nuclear_channel_name: str | None = None,
+    membrane_width_um: float = DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM,
     fov_size: int = DEFAULT_SEGMENTATION_FOV_SIZE,
     fov_overlap: float = DEFAULT_SEGMENTATION_FOV_OVERLAP,
     dapi_positive_only: bool = True,
@@ -1011,6 +1115,7 @@ def segment_project_images(
                     default=pixel_size_um
                 ),
                 nuclear_channel_name=nuclear_channel_name,
+                membrane_width_um=membrane_width_um,
                 fovs=selected_fovs,
                 fov_size=fov_size,
                 fov_overlap=fov_overlap,
@@ -1032,6 +1137,7 @@ def segment_project_image_paths(
     progress_callback: Callable[[dict], None] | None = None,
     *,
     nuclear_channel_name: str | None = None,
+    membrane_width_um: float = DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM,
     fov_size: int = DEFAULT_SEGMENTATION_FOV_SIZE,
     fov_overlap: float = DEFAULT_SEGMENTATION_FOV_OVERLAP,
     dapi_positive_only: bool = True,
@@ -1062,6 +1168,7 @@ def segment_project_image_paths(
             pixel_size_um=pixel_size_um,
             progress_callback=progress_callback,
             nuclear_channel_name=nuclear_channel_name,
+            membrane_width_um=membrane_width_um,
             fov_size=fov_size,
             fov_overlap=fov_overlap,
             dapi_positive_only=dapi_positive_only,
@@ -1074,6 +1181,7 @@ def segment_project_image_paths(
 
 __all__ = [
     "CELLPOSE_SAM_MODEL",
+    "DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM",
     "DEFAULT_PIXEL_SIZE_UM",
     "DEFAULT_SEGMENTATION_FOV_OVERLAP",
     "DEFAULT_SEGMENTATION_FOV_SIZE",

@@ -57,6 +57,7 @@ from orbit.models.automated import (
 )
 from orbit.models.cellpose_segmentation import (
     CELLPOSE_SAM_MODEL,
+    DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM,
     DEFAULT_SEGMENTATION_FOV_OVERLAP,
     DEFAULT_SEGMENTATION_FOV_SIZE,
     cuda_compatible_gpu_available,
@@ -73,6 +74,8 @@ from orbit.project import (
     export_provenance,
     load_project_document,
     portable_reference,
+    relocated_reference,
+    remember_relocation,
     resolve_reference,
     write_provenance,
 )
@@ -97,6 +100,10 @@ MAXIMUM_INWARD_BUFFER_UM = 5.0
 DEFAULT_INWARD_BUFFER_SLIDER_VALUE = int(
     DEFAULT_INWARD_BUFFER_UM * THRESHOLD_BUFFER_SLIDER_STEPS_PER_UM
 )
+DEFAULT_CELLPOSE_MEMBRANE_WIDTH_SLIDER_VALUE = int(
+    DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM
+    * THRESHOLD_BUFFER_SLIDER_STEPS_PER_UM
+)
 MAXIMUM_INWARD_BUFFER_SLIDER_VALUE = int(
     MAXIMUM_INWARD_BUFFER_UM * THRESHOLD_BUFFER_SLIDER_STEPS_PER_UM
 )
@@ -108,8 +115,9 @@ DEFAULT_MODEL_PROBABILITY_PERCENT = int(
 
 TOOL_GUIDANCE = {
     "cellpose_sam": (
-        "Select shared membrane markers and click Segment. ORBIT merges the "
-        "selected channels, with DAPI supplied for nuclei when available."
+        "Select shared membrane markers, set the membrane measurement width, "
+        "and click Segment. ORBIT merges the selected channels, with DAPI "
+        "supplied for nuclei when available."
     ),
     "random_forest": (
         "Click segmented cells to label positive and negative examples. "
@@ -125,6 +133,10 @@ TOOL_GUIDANCE = {
         "examples; use Edit to review or refine them."
     ),
 }
+
+
+class _ProjectOpenCancelled(Exception):
+    """Stop a transactional project load without replacing current state."""
 
 
 def buffer_microns_from_slider(value):
@@ -151,6 +163,11 @@ def buffer_distance_label(slider_value):
     microns = buffer_microns_from_slider(slider_value)
     pixels = buffer_pixels_from_slider(slider_value)
     return f"Inward boundary distance: {microns:.1f} µm ({pixels} px)"
+
+
+def cellpose_membrane_width_label(slider_value):
+    microns = buffer_microns_from_slider(slider_value)
+    return f"Membrane measurement width: {microns:.1f} µm"
 
 
 class CellHistogramWidget(QWidget):
@@ -396,6 +413,7 @@ class CellposeSegmentationWorker(QRunnable):
         pixel_size_um,
         fov_size,
         dapi_positive_only,
+        membrane_width_um=DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM,
     ):
         super().__init__()
         self.image_paths = [str(path) for path in image_paths]
@@ -405,6 +423,7 @@ class CellposeSegmentationWorker(QRunnable):
             if nuclear_channel_name is None
             else str(nuclear_channel_name)
         )
+        self.membrane_width_um = float(membrane_width_um)
         self.pixel_size_um = float(pixel_size_um)
         self.fov_size = int(fov_size)
         self.dapi_positive_only = bool(dapi_positive_only)
@@ -418,6 +437,7 @@ class CellposeSegmentationWorker(QRunnable):
                 pixel_size_um=self.pixel_size_um,
                 progress_callback=self.signals.progress.emit,
                 nuclear_channel_name=self.nuclear_channel_name,
+                membrane_width_um=self.membrane_width_um,
                 fov_size=self.fov_size,
                 fov_overlap=DEFAULT_SEGMENTATION_FOV_OVERLAP,
                 dapi_positive_only=self.dapi_positive_only,
@@ -441,6 +461,7 @@ class CellposeFOVPreviewWorker(QRunnable):
         x0,
         height,
         width,
+        membrane_width_um=DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM,
     ):
         super().__init__()
         self.image_index = int(image_index)
@@ -451,6 +472,7 @@ class CellposeFOVPreviewWorker(QRunnable):
             if nuclear_channel_name is None
             else str(nuclear_channel_name)
         )
+        self.membrane_width_um = float(membrane_width_um)
         self.y0, self.x0 = int(y0), int(x0)
         self.height, self.width = int(height), int(width)
         self.signals = SegmentationWorkerSignals()
@@ -468,6 +490,7 @@ class CellposeFOVPreviewWorker(QRunnable):
                     default=DEFAULT_PIXEL_SIZE_UM
                 ),
                 nuclear_channel_name=self.nuclear_channel_name,
+                membrane_width_um=self.membrane_width_um,
             )
             result["image_index"] = self.image_index
             self.signals.finished.emit(result)
@@ -1765,6 +1788,28 @@ class OrbitFOVViewer(QWidget):
         self.segmenting_marker_scroll.setWidget(
             self.segmenting_marker_content
         )
+        self.segmenting_membrane_width_label = QLabel(
+            cellpose_membrane_width_label(
+                DEFAULT_CELLPOSE_MEMBRANE_WIDTH_SLIDER_VALUE
+            )
+        )
+        self.segmenting_membrane_width_slider = QSlider(Qt.Horizontal)
+        self.segmenting_membrane_width_slider.setRange(
+            0, MAXIMUM_INWARD_BUFFER_SLIDER_VALUE
+        )
+        self.segmenting_membrane_width_slider.setSingleStep(1)
+        self.segmenting_membrane_width_slider.setPageStep(5)
+        self.segmenting_membrane_width_slider.setValue(
+            DEFAULT_CELLPOSE_MEMBRANE_WIDTH_SLIDER_VALUE
+        )
+        self.segmenting_membrane_width_slider.setToolTip(
+            "Width of the outer cell band used for per-channel membrane "
+            "measurements, from 0.0 to 5.0 µm in 0.1 µm steps. This "
+            "changes compartment measurements but not Cellpose cell masks."
+        )
+        self.segmenting_membrane_width_slider.valueChanged.connect(
+            self.cellpose_membrane_width_changed
+        )
         self.preview_segment_button = QPushButton("Preview Current FOV (CPU)")
         self.preview_segment_button.setToolTip(
             "Segment only the displayed field on CPU and show the result without "
@@ -1816,6 +1861,8 @@ class OrbitFOVViewer(QWidget):
         segmenting_layout.addSpacing(6)
         segmenting_layout.addWidget(QLabel("Membrane-guiding markers:"))
         segmenting_layout.addWidget(self.segmenting_marker_scroll, stretch=1)
+        segmenting_layout.addWidget(self.segmenting_membrane_width_label)
+        segmenting_layout.addWidget(self.segmenting_membrane_width_slider)
         segmenting_layout.addWidget(self.preview_segment_button)
         segmenting_layout.addLayout(preview_decision_layout)
         segmenting_layout.addWidget(self.segment_button)
@@ -2256,6 +2303,13 @@ class OrbitFOVViewer(QWidget):
             if checkbox.isChecked()
         ]
 
+    def selected_cellpose_membrane_width_um(self):
+        if not hasattr(self, "segmenting_membrane_width_slider"):
+            return DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM
+        return buffer_microns_from_slider(
+            self.segmenting_membrane_width_slider.value()
+        )
+
     def refresh_cellpose_marker_list(self):
         """Rebuild shared nuclear and membrane channel controls."""
         if not hasattr(self, "segmenting_marker_layout"):
@@ -2365,6 +2419,18 @@ class OrbitFOVViewer(QWidget):
         self.update_segmentation_controls()
         self.update_display()
 
+    def cellpose_membrane_width_changed(self, value):
+        self.cellpose_preview = None
+        self.segmenting_membrane_width_label.setText(
+            cellpose_membrane_width_label(value)
+        )
+        self.segmenting_status_label.setText(
+            "Membrane and nucleus measurements will use a "
+            f"{buffer_microns_from_slider(value):.1f} µm membrane width."
+        )
+        self.update_segmentation_controls()
+        self.update_display()
+
     def update_segmentation_controls(self):
         if not hasattr(self, "segment_button"):
             return
@@ -2416,6 +2482,11 @@ class OrbitFOVViewer(QWidget):
         self.segmenting_nuclear_channel_dropdown.setEnabled(
             marker_selection_ready and self.cellpose_worker is None
         )
+        self.segmenting_membrane_width_slider.setEnabled(
+            marker_selection_ready
+            and self.cellpose_worker is None
+            and self.cellpose_preview_worker is None
+        )
         for checkbox in self.segmenting_marker_checkboxes:
             checkbox.setEnabled(marker_selection_ready)
         self.segment_dapi_positive_fovs_checkbox.setEnabled(
@@ -2456,6 +2527,7 @@ class OrbitFOVViewer(QWidget):
             self.current_x0,
             height,
             width,
+            membrane_width_um=self.selected_cellpose_membrane_width_um(),
         )
         worker.signals.finished.connect(self.on_cellpose_fov_preview_finished)
         worker.signals.error.connect(self.on_cellpose_fov_preview_error)
@@ -2478,9 +2550,14 @@ class OrbitFOVViewer(QWidget):
         self.cellpose_preview = preview
         self.segmentation_checkbox.setChecked(True)
         self.segmentation_checkbox.setEnabled(True)
+        membrane_width_um = preview.get(
+            "membrane_width_um",
+            DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM,
+        )
         message = (
             f"Preview: {preview['cell_count']:,} cells in the current FOV. "
-            "Accept to replace this region, or discard it."
+            f"Compartments use a {membrane_width_um:.1f} µm "
+            "membrane width. Accept to replace this region, or discard it."
         )
         self.segmenting_status_label.setText(message)
         self.set_loading(False, message)
@@ -2536,6 +2613,10 @@ class OrbitFOVViewer(QWidget):
             metadata = {
                 "marker_names": list(preview.get("marker_names", ())),
                 "nuclear_channel_name": preview.get("nuclear_channel_name"),
+                "membrane_width_um": preview.get(
+                    "membrane_width_um",
+                    DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM,
+                ),
                 "model_name": preview.get("model_name", CELLPOSE_SAM_MODEL),
                 "scope": "accepted_current_fov_cpu",
                 "accepted_fov": {
@@ -2791,6 +2872,7 @@ class OrbitFOVViewer(QWidget):
             image_paths=[state["image_path"] for state in self.loaded_images],
             marker_names=marker_names,
             nuclear_channel_name=nuclear_channel_name,
+            membrane_width_um=self.selected_cellpose_membrane_width_um(),
             pixel_size_um=DEFAULT_PIXEL_SIZE_UM,
             fov_size=self.fov_size or DEFAULT_SEGMENTATION_FOV_SIZE,
             dapi_positive_only=(
@@ -2868,6 +2950,10 @@ class OrbitFOVViewer(QWidget):
                         "nuclear_channel_name": result.get(
                             "nuclear_channel_name"
                         ),
+                        "membrane_width_um": result.get(
+                            "membrane_width_um",
+                            DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM,
+                        ),
                         "model_name": result.get(
                             "model_name", CELLPOSE_SAM_MODEL
                         ),
@@ -2926,7 +3012,9 @@ class OrbitFOVViewer(QWidget):
             self.update_threshold_prediction_counts()
             message = (
                 f"Cellpose-SAM replaced segmentation for "
-                f"{len(results)} image(s), producing {total_cells:,} cells."
+                f"{len(results)} image(s), producing {total_cells:,} cells "
+                f"with a {self.selected_cellpose_membrane_width_um():.1f} µm "
+                "membrane measurement width."
             )
             self.segmenting_status_label.setText(message)
             self.cellpose_worker = None
@@ -3400,36 +3488,42 @@ class OrbitFOVViewer(QWidget):
         if not Path(image_path).exists():
             raise FileNotFoundError(f"Image path not found: {image_path}")
         image = QPTiffImage(image_path)
-        if cell_path or mask_path:
-            if not cell_path or not mask_path:
-                raise ValueError("Both cell data and annotation mask paths are required.")
-            cell_data, masks, cell_path, mask_path = self._read_segmentation(
-                cell_path, mask_path, image
-            )
-        else:
-            cell_data = masks = cell_path = mask_path = None
-        return {
-            "image_path": image_path,
-            "cell_data_path": cell_path,
-            "segmentation_mask_path": mask_path,
-            "img": image,
-            "fov_generator": RandomFOVGenerator(image),
-            "cell_data": cell_data,
-            "segmentation_masks": masks,
-            "cellpose_metadata": None,
-            "annotations": {},
-            "current_y0": None,
-            "current_x0": None,
-            "current_fov": None,
-            "current_dapi_fov": None,
-            "channel_index": 0,
-            "overview_cache": {},
-            "centroid_cache": None,
-            "mask_label_row_cache": None,
-            "model_predictions": None,
-            "threshold_predictions": None,
-            "automated_exclusions": set(),
-        }
+        try:
+            if cell_path or mask_path:
+                if not cell_path or not mask_path:
+                    raise ValueError(
+                        "Both cell data and annotation mask paths are required."
+                    )
+                cell_data, masks, cell_path, mask_path = (
+                    self._read_segmentation(cell_path, mask_path, image)
+                )
+            else:
+                cell_data = masks = cell_path = mask_path = None
+            return {
+                "image_path": image_path,
+                "cell_data_path": cell_path,
+                "segmentation_mask_path": mask_path,
+                "img": image,
+                "fov_generator": RandomFOVGenerator(image),
+                "cell_data": cell_data,
+                "segmentation_masks": masks,
+                "cellpose_metadata": None,
+                "annotations": {},
+                "current_y0": None,
+                "current_x0": None,
+                "current_fov": None,
+                "current_dapi_fov": None,
+                "channel_index": 0,
+                "overview_cache": {},
+                "centroid_cache": None,
+                "mask_label_row_cache": None,
+                "model_predictions": None,
+                "threshold_predictions": None,
+                "automated_exclusions": set(),
+            }
+        except Exception:
+            image.close()
+            raise
 
     def _read_mask(self, mask_path, image=None, description="Segmentation mask"):
         mask_path = str(Path(mask_path).expanduser().resolve())
@@ -5600,6 +5694,9 @@ class OrbitFOVViewer(QWidget):
                     "nuclear_channel_name": (
                         self.selected_cellpose_nuclear_channel()
                     ),
+                    "membrane_width_microns": (
+                        self.selected_cellpose_membrane_width_um()
+                    ),
                     "model": CELLPOSE_SAM_MODEL,
                     "nuclear_positive_fovs": (
                         self.segment_dapi_positive_fovs_checkbox.isChecked()
@@ -5661,6 +5758,148 @@ class OrbitFOVViewer(QWidget):
         except Exception:
             QMessageBox.critical(self, "Could not save project", traceback.format_exc())
 
+    @staticmethod
+    def _close_project_image_states(states):
+        for state in reversed(states):
+            masks = state.get("segmentation_masks")
+            mmap = getattr(masks, "_mmap", None)
+            if mmap is not None:
+                try:
+                    mmap.close()
+                except Exception:
+                    pass
+            try:
+                state["img"].close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _project_asset_exists(path, asset_kind, stored_reference):
+        candidate = Path(path)
+        expected_zarr = (
+            asset_kind == "image"
+            and str(stored_reference).strip().lower().endswith(".zarr")
+        )
+        return candidate.is_dir() if expected_zarr else candidate.is_file()
+
+    @staticmethod
+    def _nearest_existing_project_directory(missing_path):
+        directory = Path(missing_path).parent
+        while not directory.exists():
+            parent = directory.parent
+            if parent == directory:
+                return ""
+            directory = parent
+        return str(directory)
+
+    def _select_relocated_project_asset(
+        self,
+        missing_path,
+        asset_kind,
+        stored_reference,
+    ):
+        labels = {
+            "image": "image",
+            "cell_data": "cell-data table",
+            "segmentation_mask": "segmentation mask",
+        }
+        label = labels[asset_kind]
+        prompt = QMessageBox(self)
+        prompt.setIcon(QMessageBox.Warning)
+        prompt.setWindowTitle("Locate moved project file")
+        prompt.setText(f"The project's {label} cannot be found.")
+        prompt.setInformativeText(
+            f"Stored location:\n{missing_path}\n\n"
+            "Reselect its current location to continue opening the project. "
+            "Cancelling leaves the current project unchanged."
+        )
+        browse_button = prompt.addButton("Reselect…", QMessageBox.AcceptRole)
+        prompt.addButton(QMessageBox.Cancel)
+        prompt.exec()
+        if prompt.clickedButton() is not browse_button:
+            raise _ProjectOpenCancelled()
+
+        start_directory = self._nearest_existing_project_directory(
+            missing_path
+        )
+        expected_zarr = (
+            asset_kind == "image"
+            and str(stored_reference).strip().lower().endswith(".zarr")
+        )
+        if expected_zarr:
+            selected = QFileDialog.getExistingDirectory(
+                self,
+                f"Reselect moved {label}",
+                start_directory,
+                QFileDialog.ShowDirsOnly,
+            )
+        else:
+            filters = {
+                "image": (
+                    "TIFF images (*.qptiff *.tif *.tiff);;All files (*)"
+                ),
+                "cell_data": (
+                    "Cell data (*.tsv *.txt *.csv);;All files (*)"
+                ),
+                "segmentation_mask": (
+                    "TIFF masks (*.tif *.tiff);;All files (*)"
+                ),
+            }
+            selected, _ = QFileDialog.getOpenFileName(
+                self,
+                f"Reselect moved {label}",
+                start_directory,
+                filters[asset_kind],
+            )
+        if not selected:
+            raise _ProjectOpenCancelled()
+        if not self._project_asset_exists(
+            selected,
+            asset_kind,
+            stored_reference,
+        ):
+            raise ValueError(
+                f"The selected {label} is not a valid file or directory: "
+                f"{selected}"
+            )
+        return str(Path(selected).expanduser().resolve())
+
+    def _resolve_project_asset_path(
+        self,
+        stored_reference,
+        project_path,
+        asset_kind,
+        relocation_roots,
+        relocated_assets,
+    ):
+        if not stored_reference:
+            return None
+        resolved = resolve_reference(stored_reference, project_path)
+        if self._project_asset_exists(
+            resolved,
+            asset_kind,
+            stored_reference,
+        ):
+            return resolved
+
+        automatic = relocated_reference(resolved, relocation_roots)
+        if automatic and self._project_asset_exists(
+            automatic,
+            asset_kind,
+            stored_reference,
+        ):
+            relocated_assets.append((asset_kind, resolved, automatic))
+            return automatic
+
+        selected = self._select_relocated_project_asset(
+            resolved,
+            asset_kind,
+            stored_reference,
+        )
+        remember_relocation(resolved, selected, relocation_roots)
+        relocated_assets.append((asset_kind, resolved, selected))
+        return selected
+
     def open_project(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open ORBIT project", "", "ORBIT project (*.orbit.json *.json)"
@@ -5668,7 +5907,15 @@ class OrbitFOVViewer(QWidget):
         if not path:
             return
 
+        self._capture_current_image_state()
+        previous_states = self.loaded_images
+        previous_index = self.current_image_index
+        previous_project_path = self.project_path
         self.set_loading(True, "Opening project...")
+        loaded_states = []
+        relocation_roots = {}
+        relocated_assets = []
+        swapped_projects = False
         try:
             data = load_project_document(path)
             version = data.get("version")
@@ -5693,15 +5940,35 @@ class OrbitFOVViewer(QWidget):
             if not image_entries:
                 raise ValueError("The project does not contain any images.")
 
-            loaded_states = []
             for entry in image_entries:
                 paths = entry.get("paths", {})
                 if not paths.get("image"):
                     raise ValueError("A project image is missing its image path.")
+                image_path = self._resolve_project_asset_path(
+                    paths["image"],
+                    path,
+                    "image",
+                    relocation_roots,
+                    relocated_assets,
+                )
+                cell_path = self._resolve_project_asset_path(
+                    paths.get("cell_data"),
+                    path,
+                    "cell_data",
+                    relocation_roots,
+                    relocated_assets,
+                )
+                mask_path = self._resolve_project_asset_path(
+                    paths.get("segmentation_mask"),
+                    path,
+                    "segmentation_mask",
+                    relocation_roots,
+                    relocated_assets,
+                )
                 state = self._create_image_state(
-                    resolve_reference(paths["image"], path),
-                    resolve_reference(paths.get("cell_data"), path),
-                    resolve_reference(paths.get("segmentation_mask"), path),
+                    image_path,
+                    cell_path,
+                    mask_path,
                 )
                 state["annotations"] = {
                     str(annotation["cell_id"]): annotation
@@ -5737,12 +6004,8 @@ class OrbitFOVViewer(QWidget):
                 )
                 loaded_states.append(state)
 
-            for old_state in self.loaded_images:
-                try:
-                    old_state["img"].close()
-                except Exception:
-                    pass
             self.loaded_images = loaded_states
+            swapped_projects = True
             self.current_image_index = -1
             segmenting_settings = viewer.get("segmenting", {})
             self.segmenting_selected_markers = {
@@ -5763,6 +6026,26 @@ class OrbitFOVViewer(QWidget):
                         "nuclear_positive_fovs",
                         segmenting_settings.get("dapi_positive_fovs", True),
                     )
+                )
+            )
+            membrane_width_microns = float(
+                segmenting_settings.get(
+                    "membrane_width_microns",
+                    DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM,
+                )
+            )
+            membrane_width_slider_value = int(round(
+                membrane_width_microns
+                * THRESHOLD_BUFFER_SLIDER_STEPS_PER_UM
+            ))
+            self.segmenting_membrane_width_slider.blockSignals(True)
+            self.segmenting_membrane_width_slider.setValue(
+                membrane_width_slider_value
+            )
+            self.segmenting_membrane_width_slider.blockSignals(False)
+            self.segmenting_membrane_width_label.setText(
+                cellpose_membrane_width_label(
+                    self.segmenting_membrane_width_slider.value()
                 )
             )
             self.refresh_cellpose_marker_list()
@@ -5876,12 +6159,39 @@ class OrbitFOVViewer(QWidget):
             self.set_tool_mode(viewer.get("tool", "automated"))
             self.project_path = str(Path(path).resolve())
             has_fov = self.current_x0 is not None and self.current_y0 is not None
-            message = f"Opened project: {self.project_path}"
+            if relocated_assets:
+                message = (
+                    f"Opened project and re-linked "
+                    f"{len(relocated_assets)} moved asset(s). Save the project "
+                    "to retain the new locations."
+                )
+            else:
+                message = f"Opened project: {self.project_path}"
+        except _ProjectOpenCancelled:
+            self._close_project_image_states(loaded_states)
+            self.set_loading(
+                False,
+                "Project opening cancelled; the current project is unchanged.",
+            )
+            return
         except Exception:
+            if swapped_projects:
+                self._close_project_image_states(loaded_states)
+                self.loaded_images = previous_states
+                self.current_image_index = -1
+                self.project_path = previous_project_path
+                if previous_states:
+                    self._refresh_image_carousel()
+                    self._activate_image(
+                        min(max(previous_index, 0), len(previous_states) - 1)
+                    )
+            else:
+                self._close_project_image_states(loaded_states)
             self.set_loading(False)
             QMessageBox.critical(self, "Could not open project", traceback.format_exc())
             return
 
+        self._close_project_image_states(previous_states)
         self.set_loading(False, message)
         if has_fov:
             self.reload_current_fov()
