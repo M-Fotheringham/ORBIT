@@ -74,6 +74,8 @@ from orbit.project import (
     export_provenance,
     load_project_document,
     portable_reference,
+    relocated_reference,
+    remember_relocation,
     resolve_reference,
     write_provenance,
 )
@@ -93,7 +95,7 @@ COLOR_MAPS = {
 DEFAULT_PIXEL_SIZE_UM = 0.5064
 THRESHOLD_HISTOGRAM_BINS = 30
 THRESHOLD_BUFFER_SLIDER_STEPS_PER_UM = 10
-DEFAULT_INWARD_BUFFER_UM = 1.0
+DEFAULT_INWARD_BUFFER_UM = 2.0
 MAXIMUM_INWARD_BUFFER_UM = 5.0
 DEFAULT_INWARD_BUFFER_SLIDER_VALUE = int(
     DEFAULT_INWARD_BUFFER_UM * THRESHOLD_BUFFER_SLIDER_STEPS_PER_UM
@@ -131,6 +133,10 @@ TOOL_GUIDANCE = {
         "examples; use Edit to review or refine them."
     ),
 }
+
+
+class _ProjectOpenCancelled(Exception):
+    """Stop a transactional project load without replacing current state."""
 
 
 def buffer_microns_from_slider(value):
@@ -3482,36 +3488,42 @@ class OrbitFOVViewer(QWidget):
         if not Path(image_path).exists():
             raise FileNotFoundError(f"Image path not found: {image_path}")
         image = QPTiffImage(image_path)
-        if cell_path or mask_path:
-            if not cell_path or not mask_path:
-                raise ValueError("Both cell data and annotation mask paths are required.")
-            cell_data, masks, cell_path, mask_path = self._read_segmentation(
-                cell_path, mask_path, image
-            )
-        else:
-            cell_data = masks = cell_path = mask_path = None
-        return {
-            "image_path": image_path,
-            "cell_data_path": cell_path,
-            "segmentation_mask_path": mask_path,
-            "img": image,
-            "fov_generator": RandomFOVGenerator(image),
-            "cell_data": cell_data,
-            "segmentation_masks": masks,
-            "cellpose_metadata": None,
-            "annotations": {},
-            "current_y0": None,
-            "current_x0": None,
-            "current_fov": None,
-            "current_dapi_fov": None,
-            "channel_index": 0,
-            "overview_cache": {},
-            "centroid_cache": None,
-            "mask_label_row_cache": None,
-            "model_predictions": None,
-            "threshold_predictions": None,
-            "automated_exclusions": set(),
-        }
+        try:
+            if cell_path or mask_path:
+                if not cell_path or not mask_path:
+                    raise ValueError(
+                        "Both cell data and annotation mask paths are required."
+                    )
+                cell_data, masks, cell_path, mask_path = (
+                    self._read_segmentation(cell_path, mask_path, image)
+                )
+            else:
+                cell_data = masks = cell_path = mask_path = None
+            return {
+                "image_path": image_path,
+                "cell_data_path": cell_path,
+                "segmentation_mask_path": mask_path,
+                "img": image,
+                "fov_generator": RandomFOVGenerator(image),
+                "cell_data": cell_data,
+                "segmentation_masks": masks,
+                "cellpose_metadata": None,
+                "annotations": {},
+                "current_y0": None,
+                "current_x0": None,
+                "current_fov": None,
+                "current_dapi_fov": None,
+                "channel_index": 0,
+                "overview_cache": {},
+                "centroid_cache": None,
+                "mask_label_row_cache": None,
+                "model_predictions": None,
+                "threshold_predictions": None,
+                "automated_exclusions": set(),
+            }
+        except Exception:
+            image.close()
+            raise
 
     def _read_mask(self, mask_path, image=None, description="Segmentation mask"):
         mask_path = str(Path(mask_path).expanduser().resolve())
@@ -5746,6 +5758,148 @@ class OrbitFOVViewer(QWidget):
         except Exception:
             QMessageBox.critical(self, "Could not save project", traceback.format_exc())
 
+    @staticmethod
+    def _close_project_image_states(states):
+        for state in reversed(states):
+            masks = state.get("segmentation_masks")
+            mmap = getattr(masks, "_mmap", None)
+            if mmap is not None:
+                try:
+                    mmap.close()
+                except Exception:
+                    pass
+            try:
+                state["img"].close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _project_asset_exists(path, asset_kind, stored_reference):
+        candidate = Path(path)
+        expected_zarr = (
+            asset_kind == "image"
+            and str(stored_reference).strip().lower().endswith(".zarr")
+        )
+        return candidate.is_dir() if expected_zarr else candidate.is_file()
+
+    @staticmethod
+    def _nearest_existing_project_directory(missing_path):
+        directory = Path(missing_path).parent
+        while not directory.exists():
+            parent = directory.parent
+            if parent == directory:
+                return ""
+            directory = parent
+        return str(directory)
+
+    def _select_relocated_project_asset(
+        self,
+        missing_path,
+        asset_kind,
+        stored_reference,
+    ):
+        labels = {
+            "image": "image",
+            "cell_data": "cell-data table",
+            "segmentation_mask": "segmentation mask",
+        }
+        label = labels[asset_kind]
+        prompt = QMessageBox(self)
+        prompt.setIcon(QMessageBox.Warning)
+        prompt.setWindowTitle("Locate moved project file")
+        prompt.setText(f"The project's {label} cannot be found.")
+        prompt.setInformativeText(
+            f"Stored location:\n{missing_path}\n\n"
+            "Reselect its current location to continue opening the project. "
+            "Cancelling leaves the current project unchanged."
+        )
+        browse_button = prompt.addButton("Reselect…", QMessageBox.AcceptRole)
+        prompt.addButton(QMessageBox.Cancel)
+        prompt.exec()
+        if prompt.clickedButton() is not browse_button:
+            raise _ProjectOpenCancelled()
+
+        start_directory = self._nearest_existing_project_directory(
+            missing_path
+        )
+        expected_zarr = (
+            asset_kind == "image"
+            and str(stored_reference).strip().lower().endswith(".zarr")
+        )
+        if expected_zarr:
+            selected = QFileDialog.getExistingDirectory(
+                self,
+                f"Reselect moved {label}",
+                start_directory,
+                QFileDialog.ShowDirsOnly,
+            )
+        else:
+            filters = {
+                "image": (
+                    "TIFF images (*.qptiff *.tif *.tiff);;All files (*)"
+                ),
+                "cell_data": (
+                    "Cell data (*.tsv *.txt *.csv);;All files (*)"
+                ),
+                "segmentation_mask": (
+                    "TIFF masks (*.tif *.tiff);;All files (*)"
+                ),
+            }
+            selected, _ = QFileDialog.getOpenFileName(
+                self,
+                f"Reselect moved {label}",
+                start_directory,
+                filters[asset_kind],
+            )
+        if not selected:
+            raise _ProjectOpenCancelled()
+        if not self._project_asset_exists(
+            selected,
+            asset_kind,
+            stored_reference,
+        ):
+            raise ValueError(
+                f"The selected {label} is not a valid file or directory: "
+                f"{selected}"
+            )
+        return str(Path(selected).expanduser().resolve())
+
+    def _resolve_project_asset_path(
+        self,
+        stored_reference,
+        project_path,
+        asset_kind,
+        relocation_roots,
+        relocated_assets,
+    ):
+        if not stored_reference:
+            return None
+        resolved = resolve_reference(stored_reference, project_path)
+        if self._project_asset_exists(
+            resolved,
+            asset_kind,
+            stored_reference,
+        ):
+            return resolved
+
+        automatic = relocated_reference(resolved, relocation_roots)
+        if automatic and self._project_asset_exists(
+            automatic,
+            asset_kind,
+            stored_reference,
+        ):
+            relocated_assets.append((asset_kind, resolved, automatic))
+            return automatic
+
+        selected = self._select_relocated_project_asset(
+            resolved,
+            asset_kind,
+            stored_reference,
+        )
+        remember_relocation(resolved, selected, relocation_roots)
+        relocated_assets.append((asset_kind, resolved, selected))
+        return selected
+
     def open_project(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open ORBIT project", "", "ORBIT project (*.orbit.json *.json)"
@@ -5753,7 +5907,15 @@ class OrbitFOVViewer(QWidget):
         if not path:
             return
 
+        self._capture_current_image_state()
+        previous_states = self.loaded_images
+        previous_index = self.current_image_index
+        previous_project_path = self.project_path
         self.set_loading(True, "Opening project...")
+        loaded_states = []
+        relocation_roots = {}
+        relocated_assets = []
+        swapped_projects = False
         try:
             data = load_project_document(path)
             version = data.get("version")
@@ -5778,15 +5940,35 @@ class OrbitFOVViewer(QWidget):
             if not image_entries:
                 raise ValueError("The project does not contain any images.")
 
-            loaded_states = []
             for entry in image_entries:
                 paths = entry.get("paths", {})
                 if not paths.get("image"):
                     raise ValueError("A project image is missing its image path.")
+                image_path = self._resolve_project_asset_path(
+                    paths["image"],
+                    path,
+                    "image",
+                    relocation_roots,
+                    relocated_assets,
+                )
+                cell_path = self._resolve_project_asset_path(
+                    paths.get("cell_data"),
+                    path,
+                    "cell_data",
+                    relocation_roots,
+                    relocated_assets,
+                )
+                mask_path = self._resolve_project_asset_path(
+                    paths.get("segmentation_mask"),
+                    path,
+                    "segmentation_mask",
+                    relocation_roots,
+                    relocated_assets,
+                )
                 state = self._create_image_state(
-                    resolve_reference(paths["image"], path),
-                    resolve_reference(paths.get("cell_data"), path),
-                    resolve_reference(paths.get("segmentation_mask"), path),
+                    image_path,
+                    cell_path,
+                    mask_path,
                 )
                 state["annotations"] = {
                     str(annotation["cell_id"]): annotation
@@ -5822,12 +6004,8 @@ class OrbitFOVViewer(QWidget):
                 )
                 loaded_states.append(state)
 
-            for old_state in self.loaded_images:
-                try:
-                    old_state["img"].close()
-                except Exception:
-                    pass
             self.loaded_images = loaded_states
+            swapped_projects = True
             self.current_image_index = -1
             segmenting_settings = viewer.get("segmenting", {})
             self.segmenting_selected_markers = {
@@ -5981,12 +6159,39 @@ class OrbitFOVViewer(QWidget):
             self.set_tool_mode(viewer.get("tool", "automated"))
             self.project_path = str(Path(path).resolve())
             has_fov = self.current_x0 is not None and self.current_y0 is not None
-            message = f"Opened project: {self.project_path}"
+            if relocated_assets:
+                message = (
+                    f"Opened project and re-linked "
+                    f"{len(relocated_assets)} moved asset(s). Save the project "
+                    "to retain the new locations."
+                )
+            else:
+                message = f"Opened project: {self.project_path}"
+        except _ProjectOpenCancelled:
+            self._close_project_image_states(loaded_states)
+            self.set_loading(
+                False,
+                "Project opening cancelled; the current project is unchanged.",
+            )
+            return
         except Exception:
+            if swapped_projects:
+                self._close_project_image_states(loaded_states)
+                self.loaded_images = previous_states
+                self.current_image_index = -1
+                self.project_path = previous_project_path
+                if previous_states:
+                    self._refresh_image_carousel()
+                    self._activate_image(
+                        min(max(previous_index, 0), len(previous_states) - 1)
+                    )
+            else:
+                self._close_project_image_states(loaded_states)
             self.set_loading(False)
             QMessageBox.critical(self, "Could not open project", traceback.format_exc())
             return
 
+        self._close_project_image_states(previous_states)
         self.set_loading(False, message)
         if has_fov:
             self.reload_current_fov()
