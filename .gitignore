@@ -1,6 +1,6 @@
 .venv/
 __pycache__/
 *.py[cod]
-build_dist.bat
+build_windows_app.bat
 build/
 dist/
