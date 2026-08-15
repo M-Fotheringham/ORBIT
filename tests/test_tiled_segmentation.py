@@ -8,11 +8,22 @@ import tifffile
 
 from orbit.models.tiled_segmentation import (
     AstroPathMaskStitcher,
+    DEFAULT_SEGMENTATION_FOV_SIZE,
     tiled_segmentation_fovs,
 )
 
 
 class TiledSegmentationTests(unittest.TestCase):
+    def test_default_segmentation_fovs_are_1024_pixels(self):
+        self.assertEqual(DEFAULT_SEGMENTATION_FOV_SIZE, 1024)
+        fovs = tiled_segmentation_fovs((2200, 2400))
+        self.assertEqual(fovs[0].height, 1024)
+        self.assertEqual(fovs[0].width, 1024)
+        self.assertEqual(
+            sorted({fov.x0 for fov in fovs})[1],
+            round(1024 * 0.80),
+        )
+
     def test_fovs_cover_image_and_primary_regions_have_one_owner(self):
         fovs = tiled_segmentation_fovs((1000, 1100), fov_size=512, overlap=0.20)
         self.assertEqual(max(fov.y1 for fov in fovs), 1000)

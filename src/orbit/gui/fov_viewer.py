@@ -2869,8 +2869,9 @@ class OrbitFOVViewer(QWidget):
         )
         self._prepare_cellpose_progress()
         self.segmenting_status_label.setText(
-            "Planning 20%-overlapping FOVs. The model may be downloaded on "
-            "first use."
+            f"Planning {DEFAULT_SEGMENTATION_FOV_SIZE}×"
+            f"{DEFAULT_SEGMENTATION_FOV_SIZE} px FOVs with 20% overlap. "
+            "The model may be downloaded on first use."
         )
         worker = CellposeSegmentationWorker(
             image_paths=[state["image_path"] for state in self.loaded_images],
@@ -2878,7 +2879,7 @@ class OrbitFOVViewer(QWidget):
             nuclear_channel_name=nuclear_channel_name,
             membrane_width_um=self.selected_cellpose_membrane_width_um(),
             pixel_size_um=DEFAULT_PIXEL_SIZE_UM,
-            fov_size=self.fov_size or DEFAULT_SEGMENTATION_FOV_SIZE,
+            fov_size=DEFAULT_SEGMENTATION_FOV_SIZE,
             dapi_positive_only=(
                 self.segment_dapi_positive_fovs_checkbox.isChecked()
             ),
