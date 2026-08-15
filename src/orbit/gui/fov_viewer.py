@@ -1413,7 +1413,7 @@ class OrbitFOVViewer(QWidget):
 
         threshold_panel = QGroupBox("Threshold Phenotyping")
         threshold_panel.setMinimumWidth(220)
-        threshold_panel.setMaximumWidth(300)
+        threshold_panel.setMaximumWidth(480)
         threshold_layout = QVBoxLayout()
         threshold_name_layout = QFormLayout()
         threshold_name_layout.addRow(
@@ -1881,7 +1881,7 @@ class OrbitFOVViewer(QWidget):
 
         self.right_panel_stack = QStackedWidget()
         self.right_panel_stack.setMinimumWidth(220)
-        self.right_panel_stack.setMaximumWidth(330)
+        self.right_panel_stack.setMaximumWidth(500)
         self.right_panel_stack.addWidget(segmenting_page)
         self.right_panel_stack.addWidget(random_forest_page)
         self.right_panel_stack.addWidget(threshold_page)
