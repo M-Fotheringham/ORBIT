@@ -55,6 +55,7 @@ from orbit.models.automated import (
     select_automated_refinement_indices,
     select_automated_training_indices,
 )
+from orbit.models.phenotyping_features import is_pixel_unit_measurement
 from orbit.models.cellpose_segmentation import (
     CELLPOSE_SAM_MODEL,
     DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM,
@@ -111,6 +112,9 @@ CELL_PROBABILITY_HOVER_DELAY_MS = 2000
 OVERVIEW_MAXIMUM_SIZE = 768
 DEFAULT_MODEL_PROBABILITY_PERCENT = int(
     DEFAULT_POSITIVE_PROBABILITY_THRESHOLD * 100
+)
+DEFAULT_FEATURE_SELECTION_TEXT = (
+    "Features: all shared numeric columns; morphology uses µm only"
 )
 
 TOOL_GUIDANCE = {
@@ -1227,7 +1231,7 @@ class OrbitFOVViewer(QWidget):
         self.train_model_button.clicked.connect(self.train_model)
         self.feature_selection_button = QPushButton("Select Features…")
         self.feature_selection_button.clicked.connect(self.select_model_features)
-        self.feature_selection_summary = QLabel("Features: all shared numeric columns")
+        self.feature_selection_summary = QLabel(DEFAULT_FEATURE_SELECTION_TEXT)
         self.feature_selection_summary.setWordWrap(True)
         self.apply_model_button = QPushButton("Apply to Loaded Images")
         self.apply_model_button.clicked.connect(self.apply_model)
@@ -1469,7 +1473,7 @@ class OrbitFOVViewer(QWidget):
             self.select_model_features
         )
         self.automated_default_feature_selection_summary = QLabel(
-            "Features: all shared numeric columns"
+            DEFAULT_FEATURE_SELECTION_TEXT
         )
         self.automated_default_feature_selection_summary.setWordWrap(True)
         self.automated_edit_button = QPushButton("Edit")
@@ -1663,7 +1667,7 @@ class OrbitFOVViewer(QWidget):
             self.select_model_features
         )
         self.automated_feature_selection_summary = QLabel(
-            "Features: all shared numeric columns"
+            DEFAULT_FEATURE_SELECTION_TEXT
         )
         self.automated_feature_selection_summary.setWordWrap(True)
         automated_training_layout.addWidget(self.automated_feature_selection_button)
@@ -4293,7 +4297,10 @@ class OrbitFOVViewer(QWidget):
             "geometry", "polygon", "bounding", "bbox", "roi", "x min",
             "x max", "y min", "y max",
         )
-        return any(fragment in name for fragment in excluded)
+        return (
+            any(fragment in name for fragment in excluded)
+            or is_pixel_unit_measurement(column)
+        )
 
     def _shared_numeric_features(self):
         if not self.loaded_images:
@@ -4332,7 +4339,7 @@ class OrbitFOVViewer(QWidget):
         if self.selected_feature_columns:
             message = f"Features: {len(self.selected_feature_columns)} selected"
         else:
-            message = "Features: all shared numeric columns"
+            message = DEFAULT_FEATURE_SELECTION_TEXT
         for label_name in (
             "feature_selection_summary",
             "automated_feature_selection_summary",
@@ -4353,7 +4360,8 @@ class OrbitFOVViewer(QWidget):
         dialog.setWindowTitle("Random-forest features")
         layout = QVBoxLayout(dialog)
         guidance = QLabel(
-            "Choose the shared numeric columns used to train and apply the model."
+            "Choose the shared numeric columns used to train and apply the model. "
+            "Pixel-unit morphology is excluded in favour of micron equivalents."
         )
         guidance.setWordWrap(True)
         layout.addWidget(guidance)
