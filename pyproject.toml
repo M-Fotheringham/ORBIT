@@ -18,8 +18,8 @@ dependencies = [
     "napari",
     "ome-zarr>=0.12,<0.13",
     "qtpy",
-    "torch==2.10.0",
-    "torchvision==0.25.0",
+    "torch==2.12.1",
+    "torchvision==0.27.1",
     "pyside6",
     "qptifffile",
     "cellpose>=4.2.1.1,<5",
@@ -39,10 +39,10 @@ requires = ["uv_build>=0.12,<0.13"]
 build-backend = "uv_build"
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu126" }
-torchvision = { index = "pytorch-cu126" }
+torch = { index = "pytorch-cu132" }
+torchvision = { index = "pytorch-cu132" }
 
 [[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
 explicit = true

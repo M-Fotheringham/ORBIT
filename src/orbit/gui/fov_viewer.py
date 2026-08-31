@@ -61,7 +61,6 @@ from orbit.models.cellpose_segmentation import (
     DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM,
     DEFAULT_SEGMENTATION_FOV_OVERLAP,
     DEFAULT_SEGMENTATION_FOV_SIZE,
-    cuda_compatible_gpu_available,
     export_segmentation_outputs,
     merge_fov_segmentation,
     membrane_marker_names,
@@ -69,7 +68,10 @@ from orbit.models.cellpose_segmentation import (
     segmentation_export_paths,
     save_segmentation_outputs,
     segment_fov_preview,
-    segment_project_image_paths,
+)
+from orbit.models.cellpose_process import (
+    cuda_compatible_gpu_available_isolated,
+    segment_project_image_paths_isolated,
 )
 from orbit.project import (
     export_provenance,
@@ -407,7 +409,7 @@ class SegmentationWorkerSignals(QObject):
 
 
 class CellposeSegmentationWorker(QRunnable):
-    """Run Cellpose-SAM across all loaded images away from the UI thread."""
+    """Supervise Cellpose-SAM in a process isolated from Qt and OpenGL."""
 
     def __init__(
         self,
@@ -435,7 +437,7 @@ class CellposeSegmentationWorker(QRunnable):
 
     def run(self):
         try:
-            results = segment_project_image_paths(
+            results = segment_project_image_paths_isolated(
                 self.image_paths,
                 self.marker_names,
                 pixel_size_um=self.pixel_size_um,
@@ -503,7 +505,7 @@ class CellposeFOVPreviewWorker(QRunnable):
 
 
 class CudaDetectionWorker(QRunnable):
-    """Detect CUDA without delaying construction of the main window."""
+    """Detect CUDA outside the GUI process without delaying startup."""
 
     def __init__(self):
         super().__init__()
@@ -511,7 +513,7 @@ class CudaDetectionWorker(QRunnable):
 
     def run(self):
         try:
-            self.signals.finished.emit(cuda_compatible_gpu_available())
+            self.signals.finished.emit(cuda_compatible_gpu_available_isolated())
         except Exception:
             self.signals.error.emit(traceback.format_exc())
 

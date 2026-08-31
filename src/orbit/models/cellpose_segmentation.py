@@ -332,6 +332,7 @@ def create_cellpose_sam_model(gpu: bool = True):
             pretrained_model=(
                 str(model_path) if model_path is not None else CELLPOSE_SAM_MODEL
             ),
+            use_bfloat16=False,
         )
 
 
@@ -1143,7 +1144,7 @@ def segment_project_image_paths(
     dapi_positive_only: bool = True,
     minimum_dapi_fraction: float = DEFAULT_MINIMUM_DAPI_FRACTION,
 ) -> list[dict]:
-    """Open, segment, and close images in the calling worker thread.
+    """Open, segment, and close images in the calling execution context.
 
     The viewer keeps image readers alive for Napari. Reusing those same TIFF
     readers in a background worker lets the viewer and segmentation code access

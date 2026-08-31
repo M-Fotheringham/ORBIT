@@ -49,6 +49,7 @@ class CellposeModelLoadingTests(unittest.TestCase):
             self.assertEqual(model.kwargs, {
                 "gpu": False,
                 "pretrained_model": CELLPOSE_SAM_MODEL,
+                "use_bfloat16": False,
             })
             self.assertIsNone(sys.stdout)
             self.assertIsNone(sys.stderr)
@@ -73,6 +74,7 @@ class CellposeModelLoadingTests(unittest.TestCase):
         self.assertEqual(model.kwargs, {
             "gpu": False,
             "pretrained_model": str(model_path.resolve()),
+            "use_bfloat16": False,
         })
 
     def test_invalid_bundled_model_is_not_selected(self):

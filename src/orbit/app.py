@@ -2,9 +2,15 @@
 # nuitka-project: --include-package-data=orbit
 
 import ctypes
+import multiprocessing
 import sys
 import traceback
 from pathlib import Path
+
+# Frozen Windows children re-import this entry module. Let multiprocessing
+# intercept its worker command line before importing Qt and loading GUI DLLs.
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
 
 from PySide6.QtCore import QObject, QTimer, Slot
 from PySide6.QtGui import QIcon
@@ -90,6 +96,11 @@ class StartupController(QObject):
 
 
 def main():
+    # Required by Windows' spawn start method and frozen PyInstaller builds.
+    # Cellpose runs in a child process so CUDA never shares Napari's OpenGL
+    # process state.
+    multiprocessing.freeze_support()
+
     if sys.platform == "win32":
         # Gives Windows a stable taskbar identity for ORBIT.
         try:
