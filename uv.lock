@@ -1493,8 +1493,8 @@ requires-dist = [
     { name = "scikit-learn" },
     { name = "scipy" },
     { name = "tifffile" },
-    { name = "torch", specifier = "==2.12.1", index = "https://download.pytorch.org/whl/cu132" },
-    { name = "torchvision", specifier = "==0.27.1", index = "https://download.pytorch.org/whl/cu132" },
+    { name = "torch", specifier = "==2.10.0", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "torchvision", specifier = "==0.25.0", index = "https://download.pytorch.org/whl/cu128" },
 ]
 
 [package.metadata.requires-dev]
@@ -2392,8 +2392,8 @@ wheels = [
 
 [[package]]
 name = "torch"
-version = "2.12.1+cu132"
-source = { registry = "https://download.pytorch.org/whl/cu132" }
+version = "2.10.0+cu128"
+source = { registry = "https://download.pytorch.org/whl/cu128" }
 dependencies = [
     { name = "cuda-bindings", marker = "sys_platform == 'linux'" },
     { name = "cuda-toolkit", extra = ["cublas", "cudart", "cufft", "cufile", "cupti", "curand", "cusolver", "cusparse", "nvjitlink", "nvrtc", "nvtx"], marker = "sys_platform == 'linux'" },
@@ -2411,24 +2411,24 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu132/torch-2.12.1%2Bcu132-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:3ac59e3148b6ca976d766769115a2c579e457521774b2866c06d5d462d5a8655", upload-time = "2026-06-18T02:53:06Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu132/torch-2.12.1%2Bcu132-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:43e440e446add4ccb675bfdfd9b35bbb9ab61d22511f2ebe0749255040c2d6b9", upload-time = "2026-06-18T02:53:29Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu132/torch-2.12.1%2Bcu132-cp311-cp311-win_amd64.whl", hash = "sha256:28121b356e72b7f97128f6df552314c3439ab1b511fc876ddd2e6c0669d42b66", upload-time = "2026-06-18T02:54:30Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.10.0%2Bcu128-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:85ed7944655ea6fd69377692e9cbfd7bba28d99696ceae79985e7caa99cf0a95", upload-time = "2026-01-21T15:21:36Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.10.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:1d01ffaebf64715c0f507a39463149cb19e596ff702bd4bcf862601f2881dabc", upload-time = "2026-01-21T15:21:40Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.10.0%2Bcu128-cp311-cp311-win_amd64.whl", hash = "sha256:3523fda6e2cfab2b04ae09b1424681358e508bb3faa11ceb67004113d5e7acad", upload-time = "2026-01-21T15:22:00Z" },
 ]
 
 [[package]]
 name = "torchvision"
-version = "0.27.1+cu132"
-source = { registry = "https://download.pytorch.org/whl/cu132" }
+version = "0.25.0+cu128"
+source = { registry = "https://download.pytorch.org/whl/cu128" }
 dependencies = [
     { name = "numpy" },
     { name = "pillow" },
     { name = "torch" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu132/torchvision-0.27.1%2Bcu132-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:94f1a4a15ca82af0402c73f683eebb68cff258f918f836748d53ab79395be924", upload-time = "2026-06-17T15:44:45Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu132/torchvision-0.27.1%2Bcu132-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:2bf93a3b18ded415bf05fef26755c485808827ab54809dc786bbee5ec1930753", upload-time = "2026-06-17T15:44:45Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu132/torchvision-0.27.1%2Bcu132-cp311-cp311-win_amd64.whl", hash = "sha256:04fe699e4a937dc175ee929ea0e4f2acb3503801c5b43e4247db60b4fea159cc", upload-time = "2026-06-18T04:00:22Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.25.0%2Bcu128-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:5d576c65d40198627e0fad03bddeb0ef536371312f2bdfcc804c22fd28fa6018", upload-time = "2026-01-21T22:32:21Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.25.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:ebf2b495c76097796b9a2eac9290efbcae96e0fd9e5ae52c40eff188610bb440", upload-time = "2026-01-21T22:32:22Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.25.0%2Bcu128-cp311-cp311-win_amd64.whl", hash = "sha256:af00b4e0cdb3f490f4393e9a335b622fe1b92fd5afb181033256ccba03b9637c", upload-time = "2026-01-21T22:32:23Z" },
 ]
 
 [[package]]

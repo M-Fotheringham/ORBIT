@@ -70,7 +70,7 @@ from orbit.models.cellpose_segmentation import (
     segment_fov_preview,
 )
 from orbit.models.cellpose_process import (
-    cuda_compatible_gpu_available_isolated,
+    cuda_compatibility_details_isolated,
     segment_project_image_paths_isolated,
 )
 from orbit.project import (
@@ -513,7 +513,7 @@ class CudaDetectionWorker(QRunnable):
 
     def run(self):
         try:
-            self.signals.finished.emit(cuda_compatible_gpu_available_isolated())
+            self.signals.finished.emit(cuda_compatibility_details_isolated())
         except Exception:
             self.signals.error.emit(traceback.format_exc())
 
@@ -2238,12 +2238,20 @@ class OrbitFOVViewer(QWidget):
         self.cuda_detection_worker = worker
         self.thread_pool.start(worker)
 
-    def on_cuda_detection_finished(self, available):
+    def on_cuda_detection_finished(self, details):
         self.cuda_detection_worker = None
-        self.cuda_gpu_available = bool(available)
+        if isinstance(details, dict):
+            self.cuda_gpu_available = bool(details.get("available"))
+            device_name = details.get("device_name")
+            failure_reason = str(details.get("reason") or "").strip()
+        else:
+            self.cuda_gpu_available = bool(details)
+            device_name = None
+            failure_reason = ""
         if self.cuda_gpu_available:
             self.segmenting_gpu_status_label.setText(
                 "● CUDA-compatible GPU detected"
+                + (f": {device_name}" if device_name else "")
             )
             self.segmenting_gpu_status_label.setStyleSheet(
                 "color: #238636; font-weight: bold;"
@@ -2259,13 +2267,27 @@ class OrbitFOVViewer(QWidget):
                 "color: #c62828; font-weight: bold;"
             )
             self.segmenting_status_label.setText(
-                "Whole-project segmentation is unavailable, but current-FOV "
-                "CPU preview and acceptance remain available."
+                failure_reason
+                or (
+                    "Whole-project segmentation is unavailable, but current-FOV "
+                    "CPU preview and acceptance remain available."
+                )
             )
         self.update_segmentation_controls()
 
-    def on_cuda_detection_error(self, _error_message):
-        self.on_cuda_detection_finished(False)
+    def on_cuda_detection_error(self, error_message):
+        final_line = next(
+            (
+                line.strip()
+                for line in reversed(str(error_message).splitlines())
+                if line.strip()
+            ),
+            "Unknown CUDA detection error.",
+        )
+        self.on_cuda_detection_finished({
+            "available": False,
+            "reason": f"CUDA detection process failed: {final_line}",
+        })
 
     def _shared_channel_names(self):
         """Return channel names available in every loaded image."""

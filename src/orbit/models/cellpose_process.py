@@ -50,9 +50,9 @@ def _segmentation_process_main(connection, request: dict) -> None:
 def _cuda_detection_process_main(connection) -> None:
     """Detect CUDA in a child so the GUI never initializes the CUDA runtime."""
     try:
-        from orbit.models.cellpose_segmentation import cuda_compatible_gpu_available
+        from orbit.models.cellpose_segmentation import cuda_compatibility_details
 
-        _send_message(connection, "result", cuda_compatible_gpu_available())
+        _send_message(connection, "result", cuda_compatibility_details())
     except BaseException:
         _send_message(connection, "error", traceback.format_exc())
     finally:
@@ -113,9 +113,9 @@ def _run_process(target, args=(), progress_callback=None):
             process.join(timeout=_SHUTDOWN_TIMEOUT_SECONDS)
 
 
-def cuda_compatible_gpu_available_isolated() -> bool:
-    """Return CUDA availability without loading CUDA libraries in the GUI."""
-    return bool(_run_process(_cuda_detection_process_main))
+def cuda_compatibility_details_isolated() -> dict:
+    """Return CUDA diagnostics without loading CUDA libraries in the GUI."""
+    return dict(_run_process(_cuda_detection_process_main))
 
 
 def segment_project_image_paths_isolated(
@@ -154,6 +154,6 @@ def segment_project_image_paths_isolated(
 
 __all__ = [
     "CellposeProcessError",
-    "cuda_compatible_gpu_available_isolated",
+    "cuda_compatibility_details_isolated",
     "segment_project_image_paths_isolated",
 ]

@@ -31,6 +31,8 @@ CELLPOSE_MODEL_DIRECTORY = "cellpose_models"
 ORBIT_CELLPOSE_MODEL_ENV = "ORBIT_CPSAM_V2_PATH"
 DEFAULT_PIXEL_SIZE_UM = 0.5064
 DEFAULT_MEMBRANE_COMPARTMENT_WIDTH_UM = 1.0
+CUDA_BUILD_FAMILY = "12.8"
+CUDA_MINIMUM_WINDOWS_DRIVER = "570.65"
 
 
 def bundled_cellpose_sam_model_path() -> Path | None:
@@ -155,17 +157,64 @@ def resolve_nuclear_channel_name(
     return requested
 
 
-def cuda_compatible_gpu_available() -> bool:
-    """Return whether PyTorch can access an NVIDIA CUDA GPU."""
+def cuda_compatibility_details() -> dict:
+    """Describe whether this PyTorch build can use the installed NVIDIA GPU."""
     try:
         import torch
-    except (ImportError, OSError, RuntimeError):
-        return False
-    return bool(
-        torch.cuda.is_available()
-        and torch.cuda.device_count() > 0
-        and torch.version.cuda is not None
-    )
+    except (ImportError, OSError, RuntimeError) as error:
+        return {
+            "available": False,
+            "reason": f"PyTorch could not load: {error}",
+        }
+
+    details = {
+        "available": False,
+        "torch_version": str(torch.__version__),
+        "cuda_build": (
+            None if torch.version.cuda is None else str(torch.version.cuda)
+        ),
+        "device_count": 0,
+    }
+    try:
+        details["device_count"] = int(torch.cuda.device_count())
+        if not torch.cuda.is_available() or details["device_count"] < 1:
+            details["reason"] = (
+                f"PyTorch {details['torch_version']} was built for CUDA "
+                f"{details['cuda_build'] or 'CPU only'}, but CUDA could not be "
+                "initialized. On Windows, ORBIT's CUDA 12.8 build requires "
+                f"NVIDIA driver {CUDA_MINIMUM_WINDOWS_DRIVER} or newer."
+            )
+            return details
+
+        device_name = str(torch.cuda.get_device_name(0))
+        major, minor = torch.cuda.get_device_capability(0)
+        architecture = f"sm_{major}{minor}"
+        supported_architectures = [str(item) for item in torch.cuda.get_arch_list()]
+        details.update({
+            "device_name": device_name,
+            "compute_capability": f"{major}.{minor}",
+            "architecture": architecture,
+            "supported_architectures": supported_architectures,
+        })
+        if supported_architectures and architecture not in supported_architectures:
+            details["reason"] = (
+                f"{device_name} has CUDA compute capability {major}.{minor}, "
+                "which is not included in this PyTorch CUDA 12.8 build. "
+                "The shared ORBIT build supports TITAN V (7.0), TITAN RTX "
+                "(7.5), and newer GPUs, including Blackwell."
+            )
+            return details
+        details["available"] = True
+        details["reason"] = ""
+        return details
+    except (OSError, RuntimeError) as error:
+        details["reason"] = f"CUDA initialization failed: {error}"
+        return details
+
+
+def cuda_compatible_gpu_available() -> bool:
+    """Return whether PyTorch can access a GPU supported by this CUDA build."""
+    return bool(cuda_compatibility_details()["available"])
 
 
 def output_paths_for_image(image_path: str | Path) -> tuple[Path, Path]:
@@ -1189,6 +1238,7 @@ __all__ = [
     "build_cellpose_input",
     "bundled_cellpose_sam_model_path",
     "create_cellpose_sam_model",
+    "cuda_compatibility_details",
     "cuda_compatible_gpu_available",
     "dapi_channel_name",
     "export_segmentation_outputs",
