@@ -77,12 +77,15 @@ class CellposeChildProcessTests(unittest.TestCase):
     def test_cuda_detection_returns_result(self):
         connection = _RecordingConnection()
         with patch(
-            "orbit.models.cellpose_segmentation.cuda_compatible_gpu_available",
-            Mock(return_value=True),
+            "orbit.models.cellpose_segmentation.cuda_compatibility_details",
+            Mock(return_value={"available": True, "device_name": "TITAN RTX"}),
         ):
             cellpose_process._cuda_detection_process_main(connection)
 
-        self.assertEqual(connection.messages, [("result", True)])
+        self.assertEqual(
+            connection.messages,
+            [("result", {"available": True, "device_name": "TITAN RTX"})],
+        )
         self.assertTrue(connection.closed)
 
 

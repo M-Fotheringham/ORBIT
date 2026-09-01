@@ -37,7 +37,7 @@ Review segmentation quality, training labels, and phenotype calls before using e
 
 ### Running CellPoseSAM segmentation
 
-CellPoseSAM segmentation requires an NVIDIA GPU that PyTorch can access through CUDA. ORBIT reports GPU availability at the top of the **Segmenting > CellPoseSAM** panel and disables the segmentation controls when a compatible GPU is not detected. It would otherwise run for hours, if given a whole-slide image.
+CellPoseSAM segmentation requires an NVIDIA GPU that PyTorch can access through CUDA. ORBIT's shared CUDA 12.8 build supports TITAN V, TITAN RTX, and newer NVIDIA architectures, including Blackwell, and requires NVIDIA driver 570.65 or newer on Windows. ORBIT reports GPU availability and compatibility details at the top of the **Segmenting > CellPoseSAM** panel and disables the segmentation controls when a compatible GPU is not detected. It would otherwise run for hours, if given a whole-slide image.
 
 An AMD GPU is not CUDA-compatible; however, you can still load images, import existing segmentation, navigate FOVs, phenotype cells, and export results without a CUDA GPU.
 
@@ -256,7 +256,7 @@ git push -u origin feature/your-feature
 
 ### The CellPoseSAM panel is disabled
 
-ORBIT could not detect an NVIDIA CUDA GPU through PyTorch. Confirm that the NVIDIA driver is installed, then start ORBIT from the same uv environment in which its CUDA-enabled PyTorch build is installed. A CPU or AMD-only system can use imported segmentation but cannot run the current CellPoseSAM workflow.
+ORBIT could not detect an NVIDIA CUDA GPU through PyTorch. Read the compatibility explanation shown in the CellPoseSAM panel. The shared CUDA 12.8 build requires NVIDIA driver 570.65 or newer on Windows and supports TITAN V (compute capability 7.0), TITAN RTX (7.5), and newer GPUs. Older TITAN models require a separate legacy CUDA build and cannot share the Blackwell-compatible PyTorch wheel. A CPU or AMD-only system can use imported segmentation but cannot run the current CellPoseSAM workflow.
 
 ### A project no longer opens its data
 
