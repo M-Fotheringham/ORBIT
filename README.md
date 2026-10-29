@@ -174,7 +174,7 @@ Change the image displayed using the carousel arrows or by selecting an image fr
 
 ### 3.b Training machine-learning phenotyping model
 
-Choose 'Select Features...' to control which shared numeric cell measurements are used. Once positive and negative labels have been selected, click 'Train Model' to train a random forest classifier. Use the 'Probability positive' slider (default 50%) to adjust the positive-call decision threshold.
+Choose 'Select Features...' to control which shared numeric cell measurements are used. Once positive and negative labels have been selected, click 'Train Model' to train a YDF random forest classifier. Use the 'Probability positive' slider (default 50%) to adjust the positive-call decision threshold.
 
 ### 3.c Quality-checking model performance and training labels
 
@@ -198,6 +198,8 @@ Select Phenotyping > Automated and click 'Auto Phenotype' to reproducibly genera
 ### 4.b Saving a phenotyping model
 
 1. Click File > Export Model... to save a phenotyping model.
+
+New models use YDF, with 300 trees, balanced class weights, and median imputation fitted on the training cells. Manual and automated training share this implementation. The `.orbitmodel` format, probability slider, and batch commands are unchanged. Existing scikit-learn models remain importable; retrain to use YDF. Predictions from a newly trained YDF forest can differ from those of the previous classifier.
 
 ### 4.c Exporting phenotyping data
 
@@ -228,6 +230,8 @@ Synchronize the locked environment and run the application from the checkout:
 uv sync --locked
 uv run orbit
 ```
+
+YDF is pinned to 0.8.0 because it provides a Windows x86-64 wheel. SciPy remains necessary for image processing, and scikit-learn is retained for importing older model exports. New random-forest training and inference use YDF.
 
 If dependencies in `pyproject.toml` change, refresh and verify the lockfile:
 
