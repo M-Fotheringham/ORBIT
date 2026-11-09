@@ -85,6 +85,8 @@ from orbit.project import (
 from orbit.threshold import (
     cell_statistics_by_threshold,
     intensity_threshold_from_slider,
+    intensity_threshold_from_range,
+    pooled_image_intensity_range,
     phenotype_cells_by_threshold,
 )
 
@@ -528,6 +530,26 @@ class ThresholdHistogramSignals(QObject):
     error = Signal(object)
 
 
+class AutomatedThresholdRangeWorker(QRunnable):
+    """Calibrate the selected marker across every loaded image off the GUI thread."""
+
+    def __init__(self, key, images, channel_name):
+        super().__init__()
+        self.key = key
+        self.images = images
+        self.channel_name = channel_name
+        self.signals = ThresholdHistogramSignals()
+
+    def run(self):
+        try:
+            intensity_range = pooled_image_intensity_range(
+                self.images, self.channel_name
+            )
+            self.signals.finished.emit({"key": self.key, "range": intensity_range})
+        except Exception:
+            self.signals.error.emit({"key": self.key, "error": traceback.format_exc()})
+
+
 class ThresholdHistogramWorker(QRunnable):
     def __init__(
         self,
@@ -949,6 +971,7 @@ class AutomatedPhenotypeWorker(QRunnable):
                 "automated": {
                     "channel_name": self.channel_name,
                     "intensity_threshold": self.intensity_threshold,
+                    "intensity_threshold_scope": "all_loaded_images",
                     "positive_pixel_fraction": self.positive_pixel_fraction,
                     "compartment": self.compartment,
                     "inward_buffer_pixels": self.inward_buffer_pixels,
@@ -1055,6 +1078,9 @@ class OrbitFOVViewer(QWidget):
         self.selected_feature_columns = []
         self.released_generated_segmentations = {}
         self.automated_worker = None
+        self.automated_threshold_ranges = {}
+        self.automated_threshold_errors = {}
+        self.automated_threshold_range_worker = None
         self.automated_edit_mode = False
         self.threshold_intensity_value = None
         self.threshold_channel_name = None
@@ -1521,7 +1547,7 @@ class OrbitFOVViewer(QWidget):
         automated_default_page_layout.addWidget(automated_default_panel)
 
         self.automated_intensity_label = QLabel(
-            "Intensity threshold: 66% of display range"
+            "Intensity threshold: 66% of all loaded images' range"
         )
         self.automated_intensity_slider = QSlider(Qt.Horizontal)
         self.automated_intensity_slider.setRange(0, 1000)
@@ -2142,7 +2168,7 @@ class OrbitFOVViewer(QWidget):
             )
         else:
             self.automated_intensity_label.setText(
-                f"Intensity threshold: {value / 10:.1f}% of display range"
+                f"Intensity threshold: {value / 10:.1f}% of all loaded images' range"
             )
         self.automated_edit_status_label.setText(
             "Threshold settings changed. Click Re-Phenotype to apply."
@@ -3071,6 +3097,9 @@ class OrbitFOVViewer(QWidget):
             "cellpose_sam", "random_forest", "threshold", "automated"
         }:
             tool = "random_forest"
+        if tool != self.active_tool and "automated" in {tool, self.active_tool}:
+            self.threshold_intensity_value = None
+            self.threshold_channel_name = None
         self.active_tool = tool
         segmenting_mode = tool == "cellpose_sam"
         threshold_mode = tool == "threshold"
@@ -3269,7 +3298,91 @@ class OrbitFOVViewer(QWidget):
         )
         self.status_label.setText(payload["error"])
 
+    def _automated_threshold_key(self):
+        return (
+            self.channel_dropdown.currentText(),
+            tuple(id(state["img"]) for state in self.loaded_images),
+        )
+
+    def _request_automated_threshold_range(self):
+        key = self._automated_threshold_key()
+        if (
+            not self.loaded_images
+            or key in self.automated_threshold_ranges
+            or key in self.automated_threshold_errors
+            or self.automated_threshold_range_worker is not None
+        ):
+            return
+        worker = AutomatedThresholdRangeWorker(
+            key, [state["img"] for state in self.loaded_images], key[0]
+        )
+        worker.signals.finished.connect(self.on_automated_threshold_range_ready)
+        worker.signals.error.connect(self.on_automated_threshold_range_error)
+        self.automated_threshold_range_worker = worker
+        self.automated_status_label.setText(
+            "Calibrating intensity across all loaded images…"
+        )
+        self.thread_pool.start(worker)
+
+    def on_automated_threshold_range_ready(self, result):
+        self.automated_threshold_range_worker = None
+        if result["key"] == self._automated_threshold_key():
+            self.automated_threshold_ranges[result["key"]] = result["range"]
+            if not self.is_loading:
+                self.automated_status_label.setText(
+                    "Intensity calibrated across all loaded images."
+                )
+        if self.active_tool == "automated":
+            self._update_threshold_value(invalidate=False)
+            self.update_automated_controls()
+            self.update_display()
+
+    def on_automated_threshold_range_error(self, result):
+        self.automated_threshold_range_worker = None
+        if result["key"] == self._automated_threshold_key():
+            self.automated_threshold_errors[result["key"]] = result["error"]
+            self.status_label.setText(result["error"])
+            self.automated_status_label.setText(
+                "Could not calibrate intensity across all loaded images."
+            )
+        if self.active_tool == "automated":
+            self._update_threshold_value(invalidate=False)
+            self.update_automated_controls()
+
     def _update_threshold_value(self, invalidate=True):
+        if self.active_tool == "automated" and self.loaded_images:
+            key = self._automated_threshold_key()
+            intensity_range = self.automated_threshold_ranges.get(key)
+            self.threshold_channel_name = key[0]
+            if intensity_range is None:
+                self.threshold_intensity_value = None
+                message = (
+                    "Intensity threshold: unavailable for the loaded images"
+                    if key in self.automated_threshold_errors else
+                    "Intensity threshold: calculating across all loaded images…"
+                )
+                self.threshold_intensity_label.setText(message)
+                self.automated_intensity_label.setText(message)
+                self._request_automated_threshold_range()
+            else:
+                self.threshold_intensity_value = intensity_threshold_from_range(
+                    intensity_range,
+                    self.threshold_intensity_slider.value(),
+                    self.threshold_intensity_slider.maximum(),
+                )
+                position = (
+                    100 * self.threshold_intensity_slider.value()
+                    / self.threshold_intensity_slider.maximum()
+                )
+                message = (
+                    f"Intensity threshold: {self.threshold_intensity_value:.6g} "
+                    f"({position:.1f}% of all loaded images' range)"
+                )
+                self.threshold_intensity_label.setText(message)
+                self.automated_intensity_label.setText(message)
+            if invalidate:
+                self._invalidate_threshold_predictions()
+            return
         if self.current_fov is None:
             self.threshold_intensity_value = None
             self.threshold_channel_name = None
@@ -3371,6 +3484,8 @@ class OrbitFOVViewer(QWidget):
             self._update_threshold_value(
                 invalidate=self.threshold_channel_name is not None
             )
+        if self.threshold_intensity_value is None:
+            return None
         return np.asarray(self.current_fov) > self.threshold_intensity_value
 
     def set_loading(self, loading: bool, message: str = ""):
@@ -4792,6 +4907,11 @@ class OrbitFOVViewer(QWidget):
             or self.threshold_channel_name != channel_name
         ):
             self._update_threshold_value(invalidate=True)
+        if self._automated_threshold_key() not in self.automated_threshold_ranges:
+            self.automated_status_label.setText(
+                "Wait for intensity calibration across all loaded images."
+            )
+            return
         try:
             features = self._training_feature_columns()
             if not features:
@@ -4939,6 +5059,9 @@ class OrbitFOVViewer(QWidget):
         )
         has_fov = self.current_fov is not None
         ready = all_have_segmentation and has_fov and not self.is_loading
+        if ready and self.active_tool == "automated":
+            self._update_threshold_value(invalidate=False)
+            ready = self._automated_threshold_key() in self.automated_threshold_ranges
         has_predictions = any(
             state.get("model_predictions") is not None
             for state in self.loaded_images
@@ -5562,6 +5685,8 @@ class OrbitFOVViewer(QWidget):
         )
         self.released_generated_segmentations = {}
         self.automated_edit_mode = False
+        self.automated_threshold_ranges.clear()
+        self.automated_threshold_errors.clear()
         self.threshold_intensity_value = None
         self.threshold_channel_name = None
         self.threshold_histogram_request_id += 1
@@ -6038,6 +6163,8 @@ class OrbitFOVViewer(QWidget):
                 loaded_states.append(state)
 
             self.loaded_images = loaded_states
+            self.automated_threshold_ranges.clear()
+            self.automated_threshold_errors.clear()
             swapped_projects = True
             self.current_image_index = -1
             segmenting_settings = viewer.get("segmenting", {})

@@ -174,7 +174,7 @@ Change the image displayed using the carousel arrows or by selecting an image fr
 
 ### 3.b Training machine-learning phenotyping model
 
-Choose 'Select Features...' to control which shared numeric cell measurements are used. Once positive and negative labels have been selected, click 'Train Model' to train a random forest classifier. Use the 'Probability positive' slider (default 50%) to adjust the positive-call decision threshold.
+Choose 'Select Features...' to control which shared numeric cell measurements are used. Once positive and negative labels have been selected, click 'Train Model' to train a YDF random forest classifier. Use the 'Probability positive' slider (default 50%) to adjust the positive-call decision threshold.
 
 ### 3.c Quality-checking model performance and training labels
 
@@ -189,6 +189,10 @@ Select Phenotyping > Threshold Slider to set a fluorescence-intensity threshold 
 
 Select Phenotyping > Automated and click 'Auto Phenotype' to reproducibly generate training labels, train a random forest, and apply it to all loaded images. Feature selection and the positive-probability threshold can be adjusted before training. Click 'Edit' to review labels and threshold settings, then 'Re-Phenotype' to apply changes.
 
+The automated intensity slider uses one shared 1st-to-99th-percentile intensity range for the selected marker across **all loaded images**. Calibration runs in the background and is reused while the images and marker are unchanged. Changing the displayed image or FOV does not change the automated threshold. Adding or replacing an image, or selecting another marker, recalculates the range. The default slider position remains 66%, and the positive-pixel percentage and compartment settings work as before.
+
+Small projects use every source pixel for calibration. Large projects estimate the pooled percentiles from a deterministic grid across each full-resolution image, with approximately one million pixels allocated in proportion to image area and at least one sample per image. Calibration ignores non-finite values. The separate **Threshold Slider** tool retains its FOV-based intensity range.
+
 ## 4. Saving and Exporting
 
 ### 4.a Saving a project
@@ -198,6 +202,8 @@ Select Phenotyping > Automated and click 'Auto Phenotype' to reproducibly genera
 ### 4.b Saving a phenotyping model
 
 1. Click File > Export Model... to save a phenotyping model.
+
+New models use YDF, with 300 trees, balanced class weights, and median imputation fitted on the training cells. Manual and automated training share this implementation. The `.orbitmodel` format, probability slider, and batch commands are unchanged. Existing scikit-learn models remain importable; retrain to use YDF. Predictions from a newly trained YDF forest can differ from those of the previous classifier.
 
 ### 4.c Exporting phenotyping data
 
@@ -228,6 +234,8 @@ Synchronize the locked environment and run the application from the checkout:
 uv sync --locked
 uv run orbit
 ```
+
+YDF is pinned to 0.8.0 because it provides a Windows x86-64 wheel. SciPy remains necessary for image processing, and scikit-learn is retained for importing older model exports. New random-forest training and inference use YDF.
 
 If dependencies in `pyproject.toml` change, refresh and verify the lockfile:
 

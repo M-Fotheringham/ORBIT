@@ -13,8 +13,13 @@ datas = [
     ),
 ]
 binaries = []
-hiddenimports = []
+# Keep pre-YDF .orbitmodel files importable in the standalone application.
+hiddenimports = ['sklearn.ensemble._forest', 'sklearn.impute._base', 'sklearn.pipeline']
 datas += collect_data_files('orbit')
+datas += copy_metadata('ydf')
+binaries += collect_dynamic_libs('ydf')
+hiddenimports += ['ydf.cc.ydf']
+
 datas += copy_metadata('torch')
 datas += copy_metadata('torchvision')
 datas += copy_metadata('cellpose')

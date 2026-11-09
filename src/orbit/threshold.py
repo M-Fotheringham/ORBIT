@@ -13,6 +13,73 @@ from orbit.models.automated import (
 
 
 DEFAULT_INWARD_BUFFER_PIXELS = 4
+AUTOMATED_THRESHOLD_MAX_SAMPLES = 1_000_000
+
+
+def pooled_image_intensity_range(
+    images,
+    channel_name: str,
+    max_samples: int = AUTOMATED_THRESHOLD_MAX_SAMPLES,
+) -> tuple[float, float]:
+    """Estimate pooled 1st/99th pixel percentiles across all source images.
+
+    Small projects use every pixel. Large projects use a deterministic grid
+    over each full-resolution image, allocating the sample budget in proportion
+    to image area. Slice before materializing to keep TIFF/Zarr channels lazy.
+    Every image contributes, regardless of the displayed image or field of view.
+    """
+    if max_samples <= 0:
+        raise ValueError("The pixel sample budget must be positive.")
+    sources = []
+    for image in images:
+        names = list(image.get_channel_names())
+        if channel_name not in names:
+            raise ValueError(
+                f"{getattr(image, 'path', 'An image')} does not contain "
+                f"channel '{channel_name}'."
+            )
+        _, height, width = image.get_shape()
+        if height <= 0 or width <= 0:
+            raise ValueError("Threshold calibration requires non-empty images.")
+        sources.append((image, names.index(channel_name), int(height), int(width)))
+    total_pixels = sum(height * width for _, _, height, width in sources)
+    if not total_pixels:
+        raise ValueError("Load at least one image to calculate a threshold.")
+    samples = []
+    for image, channel_index, height, width in sources:
+        budget = max(
+            1, min(height * width, max_samples * height * width // total_pixels)
+        )
+        sample_rows = min(
+            height, budget, max(1, int(np.sqrt(budget * height / width)))
+        )
+        sample_columns = min(width, max(1, budget // sample_rows))
+        row_step = (height + sample_rows - 1) // sample_rows
+        column_step = (width + sample_columns - 1) // sample_columns
+        channel = image.get_channel(channel_index)
+        values = np.asarray(channel[::row_step, ::column_step])
+        finite_values = values[np.isfinite(values)]
+        if finite_values.size:
+            samples.append(finite_values)
+    if not samples:
+        raise ValueError(
+            "The selected channel contains no finite pixel values across the loaded images."
+        )
+    low, high = np.percentile(np.concatenate(samples), (1, 99))
+    return float(low), float(high)
+
+
+def intensity_threshold_from_range(
+    intensity_range: tuple[float, float],
+    slider_value: int,
+    slider_maximum: int = 1000,
+) -> float:
+    """Map a slider position onto an already calculated intensity range."""
+    if slider_maximum <= 0:
+        raise ValueError("The threshold slider maximum must be positive.")
+    low, high = intensity_range
+    position = np.clip(float(slider_value) / slider_maximum, 0.0, 1.0)
+    return float(low + position * (high - low))
 
 
 def intensity_threshold_from_slider(
@@ -30,8 +97,7 @@ def intensity_threshold_from_slider(
         raise ValueError("The displayed channel contains no finite pixel values.")
 
     low, high = np.percentile(finite_values, (1, 99))
-    position = np.clip(float(slider_value) / slider_maximum, 0.0, 1.0)
-    return float(low + position * (high - low))
+    return intensity_threshold_from_range((low, high), slider_value, slider_maximum)
 
 
 def _grow_counts(counts: np.ndarray, required_size: int) -> np.ndarray:
